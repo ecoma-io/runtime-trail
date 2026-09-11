@@ -6,9 +6,17 @@
 //! any ended value, events and links in emitter order, a two-field status
 //! preserved even when unset, and the emitter-reported dropped counts kept
 //! as data.
+//!
+//! OTLP attaches resource and scope at the envelope level; the model
+//! flattens them onto every span because contract rule 2 makes resource and
+//! scope identity first-class for correlation (the metric side already
+//! carries them via its stream identity). Both ride in an `Arc` so the many
+//! records of one batch share one allocation.
 
 use crate::context::{SpanId, TraceContext, TraceId};
+use crate::resources::{InstrumentationScope, Resource};
 use crate::values::Attributes;
+use std::sync::Arc;
 
 /// The span kind — all six OTLP values, distinct, never collapsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -83,8 +91,8 @@ pub struct SpanLink {
 }
 
 /// A span: trace context, optional parent, name, kind, emitter-clock
-/// nanosecond timestamps, attributes, events, links, status and the
-/// emitter-reported dropped counts.
+/// nanosecond timestamps, resource and scope identity, attributes, events,
+/// links, status and the emitter-reported dropped counts.
 ///
 /// `end_time_unix_nano == None` means the emitter never ended the span; it
 /// is distinct from any ended value, including `Some(t)` where
@@ -108,6 +116,11 @@ pub struct Span {
     /// End time in nanoseconds on the emitter's clock; `None` while the
     /// span is unfinished.
     pub end_time_unix_nano: Option<u64>,
+    /// The resource the span was emitted under, shared with the batch.
+    pub resource: Arc<Resource>,
+    /// The instrumentation scope the span was emitted under, shared with
+    /// the batch.
+    pub scope: Arc<InstrumentationScope>,
     /// The span's attributes.
     pub attributes: Attributes,
     /// The dropped counts the emitter reported for this span.
@@ -137,15 +150,33 @@ impl Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{SpanId, TraceFlags, TraceId, TraceState};
+    use crate::context::{SpanId as SpanIdT, TraceFlags, TraceId, TraceState};
 
     fn span_context() -> TraceContext {
         TraceContext {
             trace_id: TraceId::from_bytes([1; 16]),
-            span_id: SpanId::from_bytes([2; 8]),
+            span_id: SpanIdT::from_bytes([2; 8]),
             flags: TraceFlags::new(1),
             tracestate: TraceState::default(),
         }
+    }
+
+    fn empty_resource() -> Arc<Resource> {
+        Arc::new(Resource {
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        })
+    }
+
+    fn empty_scope() -> Arc<InstrumentationScope> {
+        Arc::new(InstrumentationScope {
+            name: "scope".to_owned(),
+            version: None,
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        })
     }
 
     fn span(kind: SpanKind) -> Span {
@@ -156,6 +187,8 @@ mod tests {
             kind,
             start_time_unix_nano: 100,
             end_time_unix_nano: Some(200),
+            resource: empty_resource(),
+            scope: empty_scope(),
             attributes: Attributes::default(),
             emitter_dropped: EmitterDroppedCounts::default(),
             events: Vec::new(),
@@ -210,14 +243,29 @@ mod tests {
         let root = span(SpanKind::Server);
         assert!(root.parent_span_id.is_none(), "absent parent");
         let zero_parent = Span {
-            parent_span_id: Some(SpanId::from_bytes([0; 8])),
+            parent_span_id: Some(SpanIdT::from_bytes([0; 8])),
             ..root.clone()
         };
         assert_ne!(root, zero_parent);
         assert_eq!(
-            zero_parent.parent_span_id.map(SpanId::as_bytes),
+            zero_parent.parent_span_id.map(SpanIdT::as_bytes),
             Some([0; 8]),
             "the zero parent is preserved as sent"
+        );
+    }
+
+    #[test]
+    fn resource_and_scope_are_first_class_on_the_record() {
+        let recorded = span(SpanKind::Server);
+        assert!(
+            Arc::ptr_eq(&recorded.resource, &recorded.resource),
+            "the resource rides in an Arc shared with the batch"
+        );
+        let cloned = recorded.clone();
+        assert!(
+            Arc::ptr_eq(&recorded.resource, &cloned.resource)
+                && Arc::ptr_eq(&recorded.scope, &cloned.scope),
+            "cloning a span shares the resource and scope allocations"
         );
     }
 
@@ -276,11 +324,11 @@ mod tests {
         let valid = span(SpanKind::Consumer);
         assert_eq!(
             valid.natural_identity(),
-            Some((TraceId::from_bytes([1; 16]), SpanId::from_bytes([2; 8])))
+            Some((TraceId::from_bytes([1; 16]), SpanIdT::from_bytes([2; 8])))
         );
         let zero_span_id = Span {
             context: TraceContext {
-                span_id: SpanId::from_bytes([0; 8]),
+                span_id: SpanIdT::from_bytes([0; 8]),
                 ..span_context()
             },
             ..valid.clone()

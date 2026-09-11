@@ -11,6 +11,7 @@
 
 pub use crate::budgets::BudgetRejection;
 use crate::context::{SpanId, TraceId};
+use crate::metrics::StreamShapeError;
 use std::num::NonZeroU64;
 
 /// An admission-assigned, opaque entity id.
@@ -105,11 +106,13 @@ pub struct Admitted<R> {
 
 /// What admission did with one delivery.
 ///
-/// There is no truncation outcome anywhere: a record is admitted complete,
-/// refused by a named budget, collapsed onto its already-admitted self, or
-/// recorded as a conflict (ADR 0006). Budget rejections carry
-/// non-retryable semantics — retrying an over-cap payload cannot shrink
-/// it.
+/// There is no truncation outcome anywhere. A delivery has exactly five
+/// fates: admitted complete, collapsed onto its already-admitted self,
+/// recorded as a conflict, refused by a named budget, or refused as
+/// unrepresentable — a shape the contract cannot carry (ADR 0006). Budget
+/// rejections carry non-retryable semantics — retrying an over-cap payload
+/// cannot shrink it — and so does a shape rejection: retrying the same
+/// bytes reproduces the same unrepresentable shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionOutcome {
     /// A new record entered the runtime; the id names it for this session.
@@ -138,6 +141,13 @@ pub enum AdmissionOutcome {
         /// The budget, its limit and the observed spend.
         rejection: BudgetRejection,
     },
+    /// Refused because the record's shape is one the contract cannot
+    /// represent — for a metric point, an identity whose kind disagrees
+    /// with the point's shape. Non-retryable: the payload is the problem.
+    Invalid {
+        /// The shape law the record broke.
+        error: StreamShapeError,
+    },
 }
 
 impl AdmissionOutcome {
@@ -148,7 +158,7 @@ impl AdmissionOutcome {
             Self::Admitted { entity } | Self::Collapsed { entity } | Self::Conflict { entity } => {
                 Some(*entity)
             }
-            Self::Rejected { .. } => None,
+            Self::Rejected { .. } | Self::Invalid { .. } => None,
         }
     }
 }
@@ -156,7 +166,8 @@ impl AdmissionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budgets::{BudgetName, limits};
+    use crate::budgets::{BudgetLimits, BudgetName};
+    use crate::metrics::PointShape;
 
     #[test]
     fn assigned_ids_are_opaque_nonzero_session_serials() {
@@ -200,21 +211,37 @@ mod tests {
     }
 
     #[test]
-    fn outcomes_carry_no_truncation_case() {
-        let admitted = AdmissionOutcome::Admitted {
-            entity: EntityId::Assigned(AssignedId::from_serial(
-                NonZeroU64::new(1).expect("1 is nonzero"),
-            )),
-        };
+    fn refusals_name_no_entity_and_name_a_reason() {
+        let limits = BudgetLimits::default();
         let rejected = AdmissionOutcome::Rejected {
             rejection: BudgetRejection {
                 budget: BudgetName::EventsPerSpan,
-                limit: limits::SPAN_EVENTS_PER_SPAN,
-                observed: limits::SPAN_EVENTS_PER_SPAN + 1,
+                limit: limits.span_events_per_span,
+                observed: limits.span_events_per_span + 1,
             },
         };
-        assert!(admitted.entity().is_some());
+        let invalid = AdmissionOutcome::Invalid {
+            error: StreamShapeError::KindShapeMismatch {
+                index: 0,
+                expected: PointShape::Number,
+                found: PointShape::Histogram,
+            },
+        };
         assert_eq!(rejected.entity(), None);
-        assert_ne!(admitted, rejected);
+        assert_eq!(invalid.entity(), None);
+        assert_ne!(rejected, invalid);
+    }
+
+    #[test]
+    fn entity_bearing_outcomes_name_exactly_one_entity() {
+        let entity = EntityId::Assigned(AssignedId::from_serial(
+            NonZeroU64::new(3).expect("3 is nonzero"),
+        ));
+        assert_eq!(AdmissionOutcome::Admitted { entity }.entity(), Some(entity));
+        assert_eq!(
+            AdmissionOutcome::Collapsed { entity }.entity(),
+            Some(entity)
+        );
+        assert_eq!(AdmissionOutcome::Conflict { entity }.entity(), Some(entity));
     }
 }

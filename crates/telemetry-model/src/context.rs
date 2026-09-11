@@ -2,9 +2,9 @@
 //!
 //! `docs/architecture/telemetry-model.md`, "Trace context": 16-byte trace
 //! ids, 8-byte span ids, the all-zero encoding invalid but preserved as
-//! sent, one flag byte of which only the sampled bit is interpreted, and an
-//! ordered tracestate whose entries are never merged, deduplicated or
-//! sorted.
+//! sent, a 32-bit flags field of which only the sampled bit is interpreted,
+//! and an ordered tracestate whose entries are never merged, deduplicated
+//! or sorted.
 
 /// A 16-byte trace id, preserved verbatim as the emitter sent it.
 ///
@@ -82,29 +82,35 @@ impl SpanId {
     }
 }
 
-/// The one flag byte, preserved verbatim; only the sampled bit is
-/// interpreted. Every other bit is carried as sent and never read as
+/// The wire flags field, preserved verbatim; only the sampled bit is
+/// interpreted.
+///
+/// OTLP carries flags as a 32-bit field. Bits 0–7 are the W3C trace flags
+/// (bit 0 is [`TraceFlags::SAMPLED_BIT`], the only bit the model reads);
+/// bits 8 and 9 carry OTLP's remote-parent signalling and MUST survive a
+/// round trip; readers MUST NOT assume bits 10–31 are zero. Every bit is
+/// carried exactly as sent and none but the sampled bit is ever read as
 /// meaning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct TraceFlags(u8);
+pub struct TraceFlags(u32);
 
 impl TraceFlags {
     /// The sampled bit — the only bit the model interprets.
-    pub const SAMPLED_BIT: u8 = 0b0000_0001;
+    pub const SAMPLED_BIT: u32 = 0b1;
 
-    /// Wraps the raw flag byte, verbatim.
+    /// Wraps the raw flags field, verbatim.
     #[must_use]
-    pub const fn new(bits: u8) -> Self {
+    pub const fn new(bits: u32) -> Self {
         Self(bits)
     }
 
-    /// The raw flag byte, exactly as wrapped.
+    /// The raw flags field, exactly as wrapped.
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u32 {
         self.0
     }
 
-    /// Whether the sampled bit is set. The other seven bits do not
+    /// Whether the sampled bit is set. The other 31 bits do not
     /// participate in any interpretation.
     #[must_use]
     pub const fn sampled(self) -> bool {
@@ -165,16 +171,17 @@ impl<'a> IntoIterator for &'a TraceState {
 /// The trace context a signal carries: its trace, its span, the flags and
 /// the ordered tracestate.
 ///
-/// On exemplars — where OTLP defines no tracestate field — an empty
-/// [`TraceState`] means "no entries sent"; the list itself is never
-/// invented.
+/// Spans and span links carry the full context. Log records and metric
+/// exemplars carry only the fields OTLP defines for them — see
+/// [`crate::logs::LogRecord`] and [`crate::metrics::Exemplar`] — which is
+/// why this struct exists only where the whole of it is on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TraceContext {
     /// The 16-byte trace id, as sent.
     pub trace_id: TraceId,
     /// The 8-byte span id, as sent.
     pub span_id: SpanId,
-    /// The flag byte, as sent.
+    /// The 32-bit flags field, as sent.
     pub flags: TraceFlags,
     /// The ordered tracestate, as sent.
     pub tracestate: TraceState,
@@ -214,19 +221,42 @@ mod tests {
 
     #[test]
     fn only_the_sampled_bit_is_interpreted() {
-        assert!(TraceFlags::new(0b0000_0001).sampled());
-        assert!(!TraceFlags::new(0b0000_0000).sampled());
+        assert!(TraceFlags::new(0b1).sampled());
+        assert!(!TraceFlags::new(0b0).sampled());
         assert!(
-            !TraceFlags::new(0b1111_1110).sampled(),
+            !TraceFlags::new(0xFFFF_FFFE).sampled(),
             "other bits carry no meaning"
         );
     }
 
     #[test]
-    fn every_flag_bit_is_preserved_verbatim() {
-        let flags = TraceFlags::new(0b1111_1110);
-        assert_eq!(flags.bits(), 0b1111_1110);
-        assert_eq!(TraceFlags::new(0xFF).bits(), 0xFF);
+    fn every_flag_bit_is_preserved_verbatim_across_the_full_width() {
+        let flags = TraceFlags::new(0xFFFF_FFFE);
+        assert_eq!(flags.bits(), 0xFFFF_FFFE);
+        assert_eq!(TraceFlags::new(u32::MAX).bits(), u32::MAX);
+    }
+
+    #[test]
+    fn remote_parent_bits_eight_and_nine_survive_a_round_trip() {
+        // Bits 8 and 9 carry OTLP's remote-parent signalling; a model that
+        // narrowed the field to one byte would destroy them.
+        let remote_parent = TraceFlags::new((1 << 8) | (1 << 9) | TraceFlags::SAMPLED_BIT);
+        assert_eq!(remote_parent.bits(), 0b11_0000_0001);
+        assert!(remote_parent.sampled(), "the sampled bit still reads");
+        let context = TraceContext {
+            trace_id: TraceId::from_bytes(VALID_TRACE),
+            span_id: SpanId::from_bytes(VALID_SPAN),
+            flags: remote_parent,
+            tracestate: TraceState::default(),
+        };
+        assert_eq!(context.flags.bits(), 0b11_0000_0001, "round-trips verbatim");
+    }
+
+    #[test]
+    fn readers_may_not_assume_the_upper_bits_are_zero() {
+        let high = TraceFlags::new(1 << 31);
+        assert_eq!(high.bits(), 1 << 31, "bit 31 is preserved, not masked");
+        assert!(!high.sampled());
     }
 
     #[test]
@@ -264,7 +294,7 @@ mod tests {
         let context = TraceContext {
             trace_id: TraceId::from_bytes(VALID_TRACE),
             span_id: SpanId::from_bytes(VALID_SPAN),
-            flags: TraceFlags::new(0b0000_0011),
+            flags: TraceFlags::new(0b11),
             tracestate: TraceState::from_entries(vec![TraceStateEntry {
                 vendor: "vendor".to_owned(),
                 value: "opaque".to_owned(),
@@ -272,7 +302,7 @@ mod tests {
         };
         assert_eq!(context.trace_id.as_bytes(), VALID_TRACE);
         assert_eq!(context.span_id.as_bytes(), VALID_SPAN);
-        assert_eq!(context.flags.bits(), 0b0000_0011);
+        assert_eq!(context.flags.bits(), 0b11);
         assert_eq!(context.tracestate.len(), 1);
     }
 }

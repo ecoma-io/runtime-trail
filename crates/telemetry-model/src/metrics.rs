@@ -3,15 +3,22 @@
 //! `docs/architecture/telemetry-model.md`, "Metrics": five OTLP kinds as
 //! five distinct model-level shapes, the monotonicity flag preserved,
 //! temporality per stream with delta and cumulative never merged or
-//! converted, per-point attribute sets with `start_time` (absent for
-//! gauges) and `time`, and exemplars carrying value, timestamp, filtered
-//! attributes and trace context. Histogram layouts are preserved exactly —
-//! never re-bucketed.
+//! converted, per-point attribute sets with `start_time` and `time`, the
+//! OTLP staleness flags preserved per point, and exemplars carrying value,
+//! timestamp, filtered attributes and the trace ids they were sent with.
+//! Histogram layouts are preserved exactly — never re-bucketed.
+//!
+//! A gauge's `start_time_unix_nano` is ignored by the spec's semantics but
+//! producers are encouraged to set it, so the model preserves it when sent
+//! and keeps it out of gauge point identity: gauge identity is
+//! `(stream, time)`, and two gauges differing only in `start_time` are the
+//! same point.
 
-use crate::context::TraceContext;
+use crate::context::{SpanId, TraceId};
 use crate::resources::{InstrumentationScope, Resource};
 use crate::values::{Attributes, Float};
 use std::fmt;
+use std::sync::Arc;
 
 /// A metric number: 64-bit integer or 64-bit float, distinct and never
 /// interconverted. Doubles compare by bit pattern (see [`Float`]).
@@ -34,6 +41,12 @@ impl MetricNumber {
         Self::Double(Float::new(value))
     }
 }
+
+/// The one interpreted bit of a data point's flags: OTLP's
+/// `DATA_POINT_FLAG_NO_RECORDED_VALUE`, the staleness marker (a
+/// Prometheus-style "no value recorded" tombstone). All 32 bits are
+/// preserved verbatim on every point; no other bit is interpreted.
+pub const DATA_POINT_FLAG_NO_RECORDED_VALUE: u32 = 1;
 
 /// The stream kind — the five OTLP kinds are five distinct shapes.
 ///
@@ -62,6 +75,14 @@ impl StreamKind {
             Self::Summary => PointShape::Summary,
         }
     }
+
+    /// Whether this kind carries an interval start on every point. Gauges
+    /// do not require one — but a gauge that sends one has it preserved
+    /// (outside identity), never refused.
+    #[must_use]
+    pub const fn requires_start_time(self) -> bool {
+        !matches!(self, Self::Gauge)
+    }
 }
 
 /// The shape of a data point, paired one-to-one with a [`StreamKind`].
@@ -85,9 +106,13 @@ pub enum Temporality {
     Cumulative,
 }
 
-/// One metric exemplar: value, timestamp, filtered attributes and trace
-/// context — the model-level hook for metrics↔trace correlation,
-/// preserved whenever sent.
+/// One metric exemplar: value, timestamp, filtered attributes, and the
+/// trace ids the emitter attached — the model-level hook for
+/// metrics↔trace correlation, preserved exactly as sent.
+///
+/// OTLP's exemplar carries `trace_id` and `span_id` as independently
+/// optional fields, and nothing else (no flags, no tracestate): so does
+/// this model. Neither id is ever fabricated when absent.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Exemplar {
     /// The exemplar's value, as sent.
@@ -96,34 +121,55 @@ pub struct Exemplar {
     pub time_unix_nano: u64,
     /// The attributes filtered out of the measurement, as sent.
     pub filtered_attributes: Attributes,
-    /// The trace context the exemplar carries, when the emitter sent one.
-    pub trace_context: Option<TraceContext>,
+    /// The exemplar's trace id, when the emitter sent one.
+    pub trace_id: Option<TraceId>,
+    /// The exemplar's span id, when the emitter sent one.
+    pub span_id: Option<SpanId>,
 }
 
-/// A gauge or sum data point: an attribute set, `start_time` (absent for
-/// gauges), `time`, a number, and exemplars.
+impl Exemplar {
+    /// The correlation pair, only when the exemplar carries both ids.
+    #[must_use]
+    pub fn correlation_pair(&self) -> Option<(TraceId, SpanId)> {
+        match (self.trace_id, self.span_id) {
+            (Some(trace_id), Some(span_id)) => Some((trace_id, span_id)),
+            _ => None,
+        }
+    }
+}
+
+/// A gauge or sum data point: an attribute set, `start_time`, `time`, a
+/// number, the point's flags, and exemplars.
 ///
-/// Build gauge points with [`NumberPoint::measurement`] and interval points
-/// with [`NumberPoint::interval`]; the constructors keep "absent" and
-/// "present" start times unconfusable.
+/// Build gauge points with [`NumberPoint::measurement`] (start absent) or
+/// [`NumberPoint::measurement_with_start`] (start sent and preserved,
+/// outside gauge identity), and interval points with
+/// [`NumberPoint::interval`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NumberPoint {
     /// The point's attribute set.
     pub attributes: Attributes,
-    /// Interval start; `None` for a gauge measurement.
+    /// Interval start as sent; `None` when the emitter sent none. For a
+    /// gauge this is preserved metadata outside identity; for an interval
+    /// kind it is part of the point's identity.
     pub start_time_unix_nano: Option<u64>,
     /// Interval end or measurement time, in nanoseconds on the emitter's
     /// clock.
     pub time_unix_nano: u64,
     /// The number, int or double as sent.
     pub value: MetricNumber,
+    /// The point's flags as sent (OTLP `DataPointFlags`); bit 0 is
+    /// [`DATA_POINT_FLAG_NO_RECORDED_VALUE`], the staleness marker. All 32
+    /// bits preserved; a flagged point and an unflagged zero are different
+    /// points.
+    pub flags: u32,
     /// Exemplars attached to this point, in the order the emitter sent
     /// them.
     pub exemplars: Vec<Exemplar>,
 }
 
 impl NumberPoint {
-    /// A gauge measurement: `time` only, `start_time` absent.
+    /// A gauge measurement with no start time sent.
     #[must_use]
     pub fn measurement(
         time_unix_nano: u64,
@@ -136,6 +182,27 @@ impl NumberPoint {
             start_time_unix_nano: None,
             time_unix_nano,
             value,
+            flags: 0,
+            exemplars,
+        }
+    }
+
+    /// A gauge measurement that *did* send a start time: preserved
+    /// verbatim, never refused, and never part of gauge identity.
+    #[must_use]
+    pub fn measurement_with_start(
+        start_time_unix_nano: u64,
+        time_unix_nano: u64,
+        value: MetricNumber,
+        attributes: Attributes,
+        exemplars: Vec<Exemplar>,
+    ) -> Self {
+        Self {
+            attributes,
+            start_time_unix_nano: Some(start_time_unix_nano),
+            time_unix_nano,
+            value,
+            flags: 0,
             exemplars,
         }
     }
@@ -155,6 +222,7 @@ impl NumberPoint {
             start_time_unix_nano: Some(start_time_unix_nano),
             time_unix_nano,
             value,
+            flags: 0,
             exemplars,
         }
     }
@@ -182,6 +250,8 @@ pub struct HistogramPoint {
     pub min: Option<Float>,
     /// The interval maximum, when the emitter sent one.
     pub max: Option<Float>,
+    /// The point's flags as sent; see [`NumberPoint::flags`].
+    pub flags: u32,
     /// Exemplars attached to this point, in the order the emitter sent
     /// them.
     pub exemplars: Vec<Exemplar>,
@@ -225,6 +295,8 @@ pub struct ExponentialHistogramPoint {
     pub min: Option<Float>,
     /// The interval maximum, when the emitter sent one.
     pub max: Option<Float>,
+    /// The point's flags as sent; see [`NumberPoint::flags`].
+    pub flags: u32,
     /// Exemplars attached to this point, in the order the emitter sent
     /// them.
     pub exemplars: Vec<Exemplar>,
@@ -254,6 +326,8 @@ pub struct SummaryPoint {
     pub sum: Option<Float>,
     /// The quantiles, in the order the emitter sent them.
     pub quantiles: Vec<QuantileValue>,
+    /// The point's flags as sent; see [`NumberPoint::flags`].
+    pub flags: u32,
     /// Exemplars attached to this point, in the order the emitter sent
     /// them.
     pub exemplars: Vec<Exemplar>,
@@ -293,7 +367,9 @@ impl MetricPoint {
         }
     }
 
-    /// The interval start, absent for gauge measurements.
+    /// The interval start. For a gauge measurement this is whatever the
+    /// emitter sent (`None` when none) — identity reads a gauge's start
+    /// time as absent regardless; see [`PointIdentity`].
     #[must_use]
     pub const fn start_time_unix_nano(&self) -> Option<u64> {
         match self {
@@ -315,6 +391,20 @@ impl MetricPoint {
         }
     }
 
+    /// The point's flags as sent (OTLP `DataPointFlags`); bit 0 is
+    /// [`DATA_POINT_FLAG_NO_RECORDED_VALUE`]. The flags participate in the
+    /// point's identity: a staleness-marker point and a real zero are
+    /// different points.
+    #[must_use]
+    pub const fn flags(&self) -> u32 {
+        match self {
+            Self::Number(point) => point.flags,
+            Self::Histogram(point) => point.flags,
+            Self::ExponentialHistogram(point) => point.flags,
+            Self::Summary(point) => point.flags,
+        }
+    }
+
     /// The point's exemplars, whichever shape it carries.
     #[must_use]
     pub fn exemplars(&self) -> &[Exemplar] {
@@ -325,12 +415,34 @@ impl MetricPoint {
             Self::Summary(point) => &point.exemplars,
         }
     }
+
+    /// Byte-exact equality over the fields the point's *identity* reads,
+    /// under `kind`.
+    ///
+    /// This is the comparison duplicate detection uses, not plain `==`: a
+    /// gauge's `start_time` is outside gauge identity (the spec's
+    /// semantics ignore it), so two gauges differing only there are the
+    /// same point and must collapse, not conflict. For every other kind
+    /// this is plain byte equality.
+    #[must_use]
+    pub fn identity_payload_eq(&self, other: &Self, kind: StreamKind) -> bool {
+        if kind == StreamKind::Gauge {
+            let (Self::Number(a), Self::Number(b)) = (self, other) else {
+                return false; // unreachable under the shape law
+            };
+            return a.attributes == b.attributes
+                && a.time_unix_nano == b.time_unix_nano
+                && a.value == b.value
+                && a.flags == b.flags
+                && a.exemplars == b.exemplars;
+        }
+        self == other
+    }
 }
 
 /// A stream was offered whose kind and point shapes do not agree, whose
-/// gauge/interval start times do not agree with the kind, or whose
-/// temporality does not agree with the kind. Invalid input: rejected, not
-/// coerced.
+/// interval start times do not agree with the kind, or whose temporality
+/// does not agree with the kind. Invalid input: rejected, not coerced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamShapeError {
     /// A point does not carry the shape the stream kind requires.
@@ -342,12 +454,9 @@ pub enum StreamShapeError {
         /// The shape the point carries.
         found: PointShape,
     },
-    /// A gauge measurement was offered with an interval start.
-    GaugeWithStartTime {
-        /// Position of the offending point.
-        index: usize,
-    },
-    /// An interval-kind point was offered without an interval start.
+    /// An interval-kind point was offered without an interval start. (A
+    /// gauge point with a start time is *not* an error: it is preserved
+    /// metadata outside gauge identity.)
     IntervalKindMissingStartTime {
         /// Position of the offending point.
         index: usize,
@@ -372,9 +481,6 @@ impl fmt::Display for StreamShapeError {
                 f,
                 "point {index} carries {found:?} where the stream kind requires {expected:?}"
             ),
-            Self::GaugeWithStartTime { index } => {
-                write!(f, "gauge measurement {index} carries a start_time")
-            }
             Self::IntervalKindMissingStartTime { index } => {
                 write!(f, "interval point {index} is missing its start_time")
             }
@@ -393,6 +499,9 @@ impl std::error::Error for StreamShapeError {}
 /// The identity of a data point stream: resource, scope, name, kind,
 /// temporality. A delta stream and a cumulative stream with the same name
 /// have different identities; so do two kinds, two resources, two scopes.
+///
+/// The resource's identity is its attribute map: `schema_url` is preserved
+/// metadata and never participates (see [`crate::resources::Resource`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamIdentity {
     /// The stream's resource.
@@ -408,24 +517,69 @@ pub struct StreamIdentity {
 }
 
 /// The collapse identity of one data point: the stream it belongs to, the
-/// point's own attribute set, and its interval — `start_time` (absent for
-/// gauges) and `time`. A re-delivered point under one of these keys is the
+/// point's own attribute set, its interval — `start_time` and `time` — and
+/// the point's flags. A re-delivered point under one of these keys is the
 /// same data point, whatever entity id it was assigned on first delivery.
+///
+/// The flags participate: a staleness-marker point and a real zero are
+/// wire-byte-different, so they are identity-different points. A gauge's
+/// `start_time` does *not* participate — gauge identity is
+/// `(stream, time)` per the spec's semantics, so this key carries a
+/// gauge's start as `None` however the point was sent.
+///
+/// The stream is shared through an `Arc` (ADR 0008): one stream payload,
+/// one copy, every point key referencing it. Equality and hashing run
+/// through the `Arc` byte-exactly — sharing changes nothing about what
+/// makes two keys equal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PointIdentity {
-    /// The stream the point belongs to.
-    pub stream: StreamIdentity,
+    /// The stream the point belongs to, shared with the ledger's stream
+    /// table and with storage.
+    pub stream: Arc<StreamIdentity>,
     /// The point's attribute set.
     pub point_attributes: Attributes,
-    /// The interval start; absent for gauge measurements.
+    /// The interval start; `None` for gauge points (and for gauges it is
+    /// `None` however the point was sent).
     pub start_time_unix_nano: Option<u64>,
     /// The interval end or measurement time.
     pub time_unix_nano: u64,
+    /// The point's flags as sent; part of the identity.
+    pub flags: u32,
 }
 
-/// One metric stream: its identity (name, description and unit verbatim —
-/// absent is not empty — resource, scope, kind, temporality) and its
-/// points.
+impl PointIdentity {
+    /// Builds the identity of `point` in `stream`.
+    ///
+    /// A gauge point's start time is normalised away here: two gauges
+    /// differing only in `start_time` carry the same identity key.
+    #[must_use]
+    pub fn of(stream: &StreamIdentity, point: &MetricPoint) -> Self {
+        Self::of_interned(&Arc::new(stream.clone()), point)
+    }
+
+    /// Builds the identity of `point` under an already-interned stream —
+    /// the same law as [`PointIdentity::of`], sharing the stream payload
+    /// instead of copying it.
+    #[must_use]
+    pub fn of_interned(stream: &Arc<StreamIdentity>, point: &MetricPoint) -> Self {
+        let start = if stream.kind.requires_start_time() {
+            point.start_time_unix_nano()
+        } else {
+            None
+        };
+        Self {
+            stream: Arc::clone(stream),
+            point_attributes: point.attributes().clone(),
+            start_time_unix_nano: start,
+            time_unix_nano: point.time_unix_nano(),
+            flags: point.flags(),
+        }
+    }
+}
+
+/// One metric stream: its identity (name, description, unit and metadata
+/// verbatim — absent is not empty — resource, scope, kind, temporality)
+/// and its points.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MetricStream {
     /// The stream identity: name, resource, scope, kind, temporality.
@@ -435,15 +589,18 @@ pub struct MetricStream {
     /// The unit, opaque at the model level — no unit grammar is
     /// interpreted here; `None` is absent and distinct from empty.
     pub unit: Option<String>,
+    /// The metric's metadata (OTLP `Metric.metadata`), as sent: an
+    /// attribute map whose duplicate keys were refused at construction
+    /// like every other keyed container.
+    pub metadata: Attributes,
     /// The stream's points, in the order the emitter sent them.
     pub points: Vec<MetricPoint>,
 }
 
 impl MetricStream {
     /// Builds a stream, rejecting a shape the contract cannot represent:
-    /// points whose shape disagrees with the kind, gauge points with a
-    /// start time, interval points without one, and temporalities the kind
-    /// cannot carry.
+    /// points whose shape disagrees with the kind, interval points without
+    /// a start time, and temporalities the kind cannot carry.
     ///
     /// # Errors
     ///
@@ -453,6 +610,7 @@ impl MetricStream {
         identity: StreamIdentity,
         description: Option<String>,
         unit: Option<String>,
+        metadata: Attributes,
         points: Vec<MetricPoint>,
     ) -> Result<Self, StreamShapeError> {
         let kind = identity.kind;
@@ -469,37 +627,66 @@ impl MetricStream {
             });
         }
         for (index, point) in points.iter().enumerate() {
-            let expected = kind.point_shape();
-            let found = point.shape();
-            if expected != found {
-                return Err(StreamShapeError::KindShapeMismatch {
-                    index,
-                    expected,
-                    found,
-                });
-            }
-            match (point.start_time_unix_nano(), kind) {
-                (Some(_), StreamKind::Gauge) => {
-                    return Err(StreamShapeError::GaugeWithStartTime { index });
-                }
-                (
-                    None,
-                    StreamKind::Sum { .. }
-                    | StreamKind::Histogram
-                    | StreamKind::ExponentialHistogram
-                    | StreamKind::Summary,
-                ) => {
-                    return Err(StreamShapeError::IntervalKindMissingStartTime { index });
-                }
-                _ => {}
-            }
+            Self::check_point_coherence(&identity, point, index)?;
         }
         Ok(Self {
             identity,
             description,
             unit,
+            metadata,
             points,
         })
+    }
+
+    /// The shape law for one `(identity, point)` pair — the same law
+    /// [`MetricStream::new`] enforces, exposed for the admission ledger so
+    /// a point cannot bypass it by arriving without its stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamShapeError`] naming the violation.
+    pub fn check_point_coherence(
+        identity: &StreamIdentity,
+        point: &MetricPoint,
+        index: usize,
+    ) -> Result<(), StreamShapeError> {
+        let kind = identity.kind;
+        let expected = kind.point_shape();
+        let found = point.shape();
+        if expected != found {
+            return Err(StreamShapeError::KindShapeMismatch {
+                index,
+                expected,
+                found,
+            });
+        }
+        if kind.requires_start_time() && point.start_time_unix_nano().is_none() {
+            return Err(StreamShapeError::IntervalKindMissingStartTime { index });
+        }
+        Ok(())
+    }
+
+    /// The kind/temporality law for one identity — part of the same shape
+    /// law, exposed for the admission ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamShapeError::TemporalityMismatch`] when the kind
+    /// cannot carry the identity's temporality.
+    pub fn check_identity_coherence(identity: &StreamIdentity) -> Result<(), StreamShapeError> {
+        let expected_temporality = match identity.kind {
+            StreamKind::Gauge | StreamKind::Summary => None,
+            StreamKind::Sum { .. } | StreamKind::Histogram | StreamKind::ExponentialHistogram => {
+                Some(())
+            }
+        };
+        if expected_temporality.is_some() != identity.temporality.is_some() {
+            return Err(StreamShapeError::TemporalityMismatch {
+                kind: identity.kind,
+                temporality: identity.temporality,
+            });
+        }
+        Ok(())
     }
 
     /// The stream identity — the collapse key every one of its points
@@ -519,7 +706,6 @@ impl MetricStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{SpanId, TraceFlags, TraceId, TraceState};
     use crate::values::Value;
 
     fn resource() -> Resource {
@@ -527,8 +713,10 @@ mod tests {
             attributes: Attributes::from_pairs(vec![(
                 "service.name".to_owned(),
                 Value::String("checkout".to_owned()),
-            )]),
+            )])
+            .expect("ok"),
             schema_url: None,
+            dropped_attributes_count: 0,
         }
     }
 
@@ -538,6 +726,7 @@ mod tests {
             version: None,
             attributes: Attributes::default(),
             schema_url: None,
+            dropped_attributes_count: 0,
         }
     }
 
@@ -550,12 +739,8 @@ mod tests {
             value: MetricNumber::int(3),
             time_unix_nano: 12,
             filtered_attributes: attributes(),
-            trace_context: Some(TraceContext {
-                trace_id: TraceId::from_bytes([4; 16]),
-                span_id: SpanId::from_bytes([5; 8]),
-                flags: TraceFlags::new(1),
-                tracestate: TraceState::default(),
-            }),
+            trace_id: Some(TraceId::from_bytes([4; 16])),
+            span_id: Some(SpanId::from_bytes([5; 8])),
         }
     }
 
@@ -576,8 +761,14 @@ mod tests {
     ) -> MetricStream {
         let mut id = identity(kind, temporality);
         id.name = "requests".to_owned();
-        MetricStream::new(id, Some(String::new()), Some("ms".to_owned()), points)
-            .expect("a coherent stream")
+        MetricStream::new(
+            id,
+            Some(String::new()),
+            Some("ms".to_owned()),
+            Attributes::default(),
+            points,
+        )
+        .expect("a coherent stream")
     }
 
     #[test]
@@ -637,18 +828,138 @@ mod tests {
     }
 
     #[test]
-    fn a_gauge_point_has_no_start_time_an_interval_point_has_one() {
-        let gauge = NumberPoint::measurement(50, MetricNumber::int(1), attributes(), Vec::new());
-        assert_eq!(gauge.start_time_unix_nano, None);
-        assert_eq!(gauge.time_unix_nano, 50);
-        let interval =
-            NumberPoint::interval(10, 50, MetricNumber::int(1), attributes(), Vec::new());
-        assert_eq!(interval.start_time_unix_nano, Some(10));
-        assert_ne!(
-            MetricPoint::Number(gauge),
-            MetricPoint::Number(interval),
-            "absent ≠ present start time"
+    fn a_gauge_point_may_carry_no_start_time_or_a_preserved_one() {
+        let bare = NumberPoint::measurement(50, MetricNumber::int(1), attributes(), Vec::new());
+        assert_eq!(bare.start_time_unix_nano, None);
+        let sent = NumberPoint::measurement_with_start(
+            10,
+            50,
+            MetricNumber::int(1),
+            attributes(),
+            Vec::new(),
         );
+        assert_eq!(
+            sent.start_time_unix_nano,
+            Some(10),
+            "a gauge's start_time is preserved when sent, never refused"
+        );
+        // Out of gauge identity: the same point for collapse purposes.
+        assert!(
+            MetricPoint::Number(bare)
+                .identity_payload_eq(&MetricPoint::Number(sent), StreamKind::Gauge),
+            "start_time is outside gauge identity"
+        );
+        assert_eq!(
+            MetricPoint::Number(NumberPoint::interval(
+                10,
+                50,
+                MetricNumber::int(1),
+                attributes(),
+                Vec::new()
+            )),
+            MetricPoint::Number(NumberPoint::measurement_with_start(
+                10,
+                50,
+                MetricNumber::int(1),
+                attributes(),
+                Vec::new()
+            )),
+            "a number point carries no kind: the stream identity does"
+        );
+    }
+
+    #[test]
+    fn gauge_identity_is_stream_and_time_by_the_point_identity() {
+        let kind = StreamKind::Gauge;
+        let bare = NumberPoint::measurement(50, MetricNumber::int(1), attributes(), Vec::new());
+        let with_start = NumberPoint::measurement_with_start(
+            10,
+            50,
+            MetricNumber::int(1),
+            attributes(),
+            Vec::new(),
+        );
+        let stream_id = identity(kind, None);
+        let bare_key = PointIdentity::of(&stream_id, &MetricPoint::Number(bare));
+        let started_key = PointIdentity::of(&stream_id, &MetricPoint::Number(with_start));
+        assert_eq!(
+            bare_key, started_key,
+            "gauge identity is (stream, time): start_time is normalised out"
+        );
+        assert_eq!(bare_key.start_time_unix_nano, None);
+    }
+
+    #[test]
+    fn staleness_flags_are_part_of_point_identity() {
+        let zero = NumberPoint::measurement(50, MetricNumber::int(0), attributes(), Vec::new());
+        let stale = NumberPoint {
+            flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            ..zero.clone()
+        };
+        assert_eq!(zero.flags, 0);
+        assert_eq!(stale.flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+        let stream_id = identity(StreamKind::Gauge, None);
+        let zero_key = PointIdentity::of(&stream_id, &MetricPoint::Number(zero));
+        let stale_key = PointIdentity::of(&stream_id, &MetricPoint::Number(stale));
+        assert_ne!(
+            zero_key, stale_key,
+            "a staleness marker and a real zero are different points"
+        );
+    }
+
+    #[test]
+    fn all_four_point_shapes_carry_flags_verbatim() {
+        let histogram = HistogramPoint {
+            attributes: attributes(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 1,
+            sum: None,
+            bucket_counts: vec![1],
+            explicit_bounds: vec![Float::new(1.0)],
+            min: None,
+            max: None,
+            flags: u32::MAX,
+            exemplars: Vec::new(),
+        };
+        let exponential = ExponentialHistogramPoint {
+            attributes: attributes(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 1,
+            sum: None,
+            scale: 0,
+            zero_count: 0,
+            zero_threshold: Float::new(0.0),
+            positive: ExponentialBuckets {
+                offset: 0,
+                bucket_counts: vec![1],
+            },
+            negative: ExponentialBuckets {
+                offset: 0,
+                bucket_counts: vec![],
+            },
+            min: None,
+            max: None,
+            flags: 1 << 20,
+            exemplars: Vec::new(),
+        };
+        let summary = SummaryPoint {
+            attributes: attributes(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 1,
+            sum: None,
+            quantiles: Vec::new(),
+            flags: 3,
+            exemplars: Vec::new(),
+        };
+        assert_eq!(MetricPoint::Histogram(histogram).flags(), u32::MAX);
+        assert_eq!(
+            MetricPoint::ExponentialHistogram(exponential).flags(),
+            1 << 20
+        );
+        assert_eq!(MetricPoint::Summary(summary).flags(), 3);
     }
 
     #[test]
@@ -672,6 +983,7 @@ mod tests {
             },
             min: None,
             max: None,
+            flags: 0,
             exemplars: vec![exemplar()],
         };
         assert_eq!(point.scale, -2);
@@ -693,6 +1005,7 @@ mod tests {
             explicit_bounds: vec![Float::new(1.0), Float::new(5.0), Float::new(10.0)],
             min: None,
             max: None,
+            flags: 0,
             exemplars: Vec::new(),
         };
         assert_eq!(point.bucket_counts, vec![0, 2, 2, 0]);
@@ -720,6 +1033,7 @@ mod tests {
                     value: Float::new(21.0),
                 },
             ],
+            flags: 0,
             exemplars: Vec::new(),
         };
         assert_eq!(point.count, 100);
@@ -728,19 +1042,26 @@ mod tests {
     }
 
     #[test]
-    fn exemplars_carry_value_timestamp_filtered_attributes_and_trace_context() {
+    fn exemplars_carry_the_trace_ids_exactly_as_sent() {
         let exemplar = exemplar();
         assert_eq!(exemplar.value, MetricNumber::int(3));
         assert_eq!(exemplar.time_unix_nano, 12);
         assert!(exemplar.filtered_attributes.is_empty());
-        let context = exemplar.trace_context.clone().expect("correlation hook");
-        assert!(context.trace_id.is_valid());
-        assert!(context.span_id.is_valid());
-        let without_context = Exemplar {
-            trace_context: None,
+        assert_eq!(
+            exemplar.correlation_pair(),
+            Some((TraceId::from_bytes([4; 16]), SpanId::from_bytes([5; 8])))
+        );
+        let half = Exemplar {
+            trace_id: Some(TraceId::from_bytes([4; 16])),
+            span_id: None,
             ..exemplar
         };
-        assert!(without_context.trace_context.is_none(), "absent is a fact");
+        assert_eq!(
+            half.correlation_pair(),
+            None,
+            "one id alone is not a pair; nothing is fabricated"
+        );
+        assert!(half.span_id.is_none(), "absent stays absent");
     }
 
     #[test]
@@ -755,6 +1076,7 @@ mod tests {
             identity(StreamKind::Histogram, Some(Temporality::Cumulative)),
             None,
             None,
+            Attributes::default(),
             vec![number.clone()],
         )
         .expect_err("a histogram stream cannot carry a number point");
@@ -766,21 +1088,22 @@ mod tests {
                 found: PointShape::Number,
             }
         );
-        let with_start = MetricPoint::Number(NumberPoint::interval(
+    }
+
+    #[test]
+    fn a_gauge_stream_admits_a_point_that_sent_a_start_time() {
+        // The spec ignores a gauge's start_time; the model preserves it
+        // instead of refusing it — the old GaugeWithStartTime rejection is
+        // gone.
+        let gauge_with_start = MetricPoint::Number(NumberPoint::measurement_with_start(
             0,
             1,
             MetricNumber::int(1),
             attributes(),
             Vec::new(),
         ));
-        let error = MetricStream::new(
-            identity(StreamKind::Gauge, None),
-            None,
-            None,
-            vec![with_start],
-        )
-        .expect_err("a gauge measurement cannot carry a start_time");
-        assert_eq!(error, StreamShapeError::GaugeWithStartTime { index: 0 });
+        let stream = stream(StreamKind::Gauge, None, vec![gauge_with_start]);
+        assert_eq!(stream.points.len(), 1);
     }
 
     #[test]
@@ -789,6 +1112,7 @@ mod tests {
             identity(StreamKind::Gauge, Some(Temporality::Delta)),
             None,
             None,
+            Attributes::default(),
             Vec::new(),
         )
         .expect_err("a gauge carries no temporality");
@@ -803,6 +1127,7 @@ mod tests {
             identity(StreamKind::Sum { monotonic: true }, None),
             None,
             None,
+            Attributes::default(),
             Vec::new(),
         )
         .expect_err("a sum carries a temporality");
@@ -812,6 +1137,92 @@ mod tests {
                 kind: StreamKind::Sum { monotonic: true },
                 temporality: None,
             }
+        );
+    }
+
+    #[test]
+    fn interval_kinds_require_start_times_on_every_point() {
+        // A gauge-built measurement carries no start time; offering it
+        // under an interval kind is invalid input.
+        let number = MetricPoint::Number(NumberPoint::measurement(
+            5,
+            MetricNumber::int(1),
+            attributes(),
+            Vec::new(),
+        ));
+        let error = MetricStream::new(
+            identity(
+                StreamKind::Sum { monotonic: false },
+                Some(Temporality::Delta),
+            ),
+            None,
+            None,
+            Attributes::default(),
+            vec![number],
+        )
+        .expect_err("a sum point must carry its interval start");
+        assert_eq!(
+            error,
+            StreamShapeError::IntervalKindMissingStartTime { index: 0 }
+        );
+    }
+
+    #[test]
+    fn the_shape_law_checks_one_pair_without_a_stream() {
+        let gauge_id = identity(StreamKind::Gauge, None);
+        let sum_id = identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let gauge_point = MetricPoint::Number(NumberPoint::measurement(
+            1,
+            MetricNumber::int(1),
+            attributes(),
+            Vec::new(),
+        ));
+        assert!(MetricStream::check_point_coherence(&gauge_id, &gauge_point, 0).is_ok());
+        assert_eq!(
+            MetricStream::check_point_coherence(&sum_id, &gauge_point, 3),
+            Err(StreamShapeError::IntervalKindMissingStartTime { index: 3 }),
+            "the ledger reuses the same law a stream enforces"
+        );
+        assert!(MetricStream::check_identity_coherence(&gauge_id).is_ok());
+        assert!(MetricStream::check_identity_coherence(&sum_id).is_ok());
+        let naked_sum = identity(StreamKind::Sum { monotonic: true }, None);
+        assert!(
+            MetricStream::check_identity_coherence(&naked_sum).is_err(),
+            "a sum without a temporality is incoherent"
+        );
+        let temporality_gauge = identity(StreamKind::Gauge, Some(Temporality::Delta));
+        assert!(
+            MetricStream::check_identity_coherence(&temporality_gauge).is_err(),
+            "a gauge cannot carry a temporality"
+        );
+    }
+
+    #[test]
+    fn metadata_is_preserved_as_an_attribute_map() {
+        let metadata = Attributes::from_pairs(vec![
+            (
+                "prometheus.io/type".to_owned(),
+                Value::String("gauge".to_owned()),
+            ),
+            ("tier".to_owned(), Value::Int(2)),
+        ])
+        .expect("ok");
+        let stream = MetricStream::new(
+            identity(StreamKind::Gauge, None),
+            None,
+            None,
+            metadata.clone(),
+            Vec::new(),
+        )
+        .expect("a coherent stream");
+        assert_eq!(stream.metadata, metadata);
+        assert_eq!(
+            stream.metadata.get("tier"),
+            Some(&Value::Int(2)),
+            "metadata rides on the stream verbatim"
         );
     }
 
@@ -836,28 +1247,18 @@ mod tests {
     }
 
     #[test]
-    fn interval_kinds_require_start_times_on_every_point() {
-        // A gauge-built measurement carries no start time; offering it
-        // under an interval kind is invalid input.
-        let number = MetricPoint::Number(NumberPoint::measurement(
-            5,
-            MetricNumber::int(1),
-            attributes(),
-            Vec::new(),
-        ));
-        let error = MetricStream::new(
-            identity(
-                StreamKind::Sum { monotonic: false },
-                Some(Temporality::Delta),
-            ),
-            None,
-            None,
-            vec![number],
-        )
-        .expect_err("a sum point must carry its interval start");
+    fn resource_schema_url_is_not_stream_identity() {
+        let plain = identity(StreamKind::Gauge, None);
+        let with_url = StreamIdentity {
+            resource: Resource {
+                schema_url: Some("https://schema/v2".to_owned()),
+                ..plain.resource.clone()
+            },
+            ..plain.clone()
+        };
         assert_eq!(
-            error,
-            StreamShapeError::IntervalKindMissingStartTime { index: 0 }
+            plain, with_url,
+            "resource identity is the attribute map; schema_url is metadata"
         );
     }
 }
