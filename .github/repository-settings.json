@@ -1,10 +1,11 @@
 {
   "$comment": "The repository settings that are NOT code — branch rules and merge policy — written down because nothing else can hold them. A clone carries every gate in this tree, and none of these: delete the repository and they are gone, recreate it and they come back as GitHub's defaults, which are not these. This is a record, not an enforcer: no gate compares it to reality, because doing so needs an admin token this repository's sessions do not hold. Apply it with `gh api --method POST repos/ecoma-io/runtime-trail/rulesets --input <a ruleset entry>` once `main` exists (ruleset conditions name `~DEFAULT_BRANCH`, which does not resolve until the first push), and read live state back with `GET /repos/ecoma-io/runtime-trail/rulesets` to diff it against this file. The full tier-by-tier arithmetic this shape was derived from — Scorecard's `Branch-Protection` check, what each rule buys and what each deliberately forfeits — lives in `ecoma`'s `.github/repository-settings.json` and is not restated here; this file records the decisions and points there for the derivations.",
   "repository": {
-    "$comment": "Merge policy. Exactly one method stays enabled, so the strategy is a mechanism rather than whichever button someone clicked. Merge commits, matching every product repository in this organisation: a branch's commits land on main as the SAME objects, which is what makes `delete_branch_on_merge` safe (it removes a pointer, not history) and `git revert -m 1` the one undo that works.",
+    "$comment": "Merge policy. Exactly one method stays enabled, so the strategy is a mechanism rather than whichever button someone clicked. Merge commits, matching every product repository in this organisation: a branch's commits land on main as the SAME objects, which is what makes `delete_branch_on_merge` safe (it removes a pointer, not history) and `git revert -m 1` the one undo that works. `allow_auto_merge` is on because the merge queue below rides on it: with the queue required on `main`, enabling auto-merge is how a pull request enters the queue (API and UI alike) — without it the queue is declared but unenterable.",
     "allow_merge_commit": true,
     "allow_squash_merge": false,
     "allow_rebase_merge": false,
+    "allow_auto_merge": true,
     "delete_branch_on_merge": true
   },
   "rulesets": [
@@ -13,14 +14,19 @@
       "target": "branch",
       "enforcement": "active",
       "conditions": {
-        "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }
+        "ref_name": {
+          "include": ["~DEFAULT_BRANCH"],
+          "exclude": []
+        }
       },
       "rules": [
         {
           "$comment": "The default branch cannot be deleted outright, and cannot be force-pushed, which would rewrite landed history and silently invalidate every commit pinned off it — the merge queue's would-be-trunk runs included. These two are Scorecard `Branch-Protection` Tier 1; that check awards nothing above them until BOTH are present.",
           "type": "deletion"
         },
-        { "type": "non_fast_forward" },
+        {
+          "type": "non_fast_forward"
+        },
         {
           "$comment": "required_approving_review_count is 0 — see `notAppliedYet.reviewApprovalNeedsASecondHuman` in ecoma's copy of this file: GitHub does not let an author approve their own pull request, this repository has one maintainer, and the required checks plus the merge queue are the actual gate. `require_code_owner_review: true` covers the three legal files `.github/CODEOWNERS` names. `allowed_merge_methods` must stay `['merge']` and must agree with the merge_queue rule below — a queue configured to squash would quietly undo this decision.",
           "type": "pull_request",
@@ -29,7 +35,10 @@
             "dismiss_stale_reviews_on_push": false,
             "required_reviewers": [],
             "require_code_owner_review": true,
-            "dismissal_restriction": { "enabled": false, "allowed_actors": [] },
+            "dismissal_restriction": {
+              "enabled": false,
+              "allowed_actors": []
+            },
             "require_last_push_approval": false,
             "required_review_thread_resolution": false,
             "allowed_merge_methods": ["merge"]
@@ -42,8 +51,14 @@
             "strict_required_status_checks_policy": true,
             "do_not_enforce_on_create": false,
             "required_status_checks": [
-              { "context": "ci-gate", "integration_id": 15368 },
-              { "context": "analysis-gate", "integration_id": 15368 }
+              {
+                "context": "ci-gate",
+                "integration_id": 15368
+              },
+              {
+                "context": "analysis-gate",
+                "integration_id": 15368
+              }
             ]
           }
         },
