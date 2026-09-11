@@ -159,27 +159,41 @@ here), its scope and resource (below), and its points.
 
 ## Record identity and duplicate delivery
 
-OTLP delivery is at-least-once by design: emitters retry on the retryable
-admission failure [runtime-constraints.md](runtime-constraints.md) requires.
+OTLP delivery is at-least-once in practice: SDKs retry on transport timeouts
+and transient saturation
+([runtime-constraints.md](runtime-constraints.md) contracts exactly which
+admission signal is retryable).
 Idempotent admission is therefore a model requirement, not an optimisation.
 
-- **Admission assigns every record an entity id** — an opaque, typed,
-  session-unique identifier. Spans keep their natural identity
-  (`trace_id`, `span_id`) as their entity id; log records and metric points
-  receive one at admission. Entity ids are added metadata: they never replace
+- **Admission assigns every record an entity id** — an opaque, typed
+  identifier, unique within the runtime's session (one process lifetime; ids
+  are not persisted — a reopened file-backed session reassigns them, and no
+  handle built on them survives a restart). A span whose `trace_id` and
+  `span_id` are both valid keeps its natural identity (`trace_id`,
+  `span_id`) as its entity id; every other record — log records, metric
+  points, and spans carrying an invalid (all-zero) id — receives an
+  admission-assigned id, because nothing in its wire data distinguishes it
+  from any other record. Entity ids are added metadata: they never replace
   or rewrite emitter data. Cursors, relation endpoints and investigation
   references name entity ids — nothing else does.
-- **Duplicate-delivery identity is separate and content-based.** Span identity
-  is (trace_id, span_id). Metric point identity is (stream identity —
-  resource, scope, name, kind, temporality, point attribute set — plus
-  `start_time` and `time`). OTLP defines no log-record identity, so this
-  model defines one: (resource, scope, trace context when present,
-  timestamp, observed_timestamp, body, attributes) — chosen so that exact
-  re-delivery collapses, and only exact re-delivery does.
-- Exact duplicates collapse to one record. Conflicting payloads under the
-  same identity are an anomaly: they are resolved deterministically (the
-  later delivery wins) and recorded — never silently merged, which would
-  rewrite emitter data.
+- **Collapse happens only where the OTel data model itself defines
+  identity.** A re-delivered span (same `trace_id` + `span_id`) is the same
+  span: it collapses onto the one already admitted. A re-delivered metric
+  point (same stream identity — resource, scope, name, kind, temporality,
+  point attribute set — plus `start_time` and `time`; for gauges
+  `start_time` is absent and (stream, `time`) is the point) is the same
+  data point: it collapses.
+- **Log records are never collapsed.** OTLP defines no log-record identity,
+  and this model refuses to invent a destructive one: two byte-identical log
+  records are two admitted records — the emitter sent two. Duplicate
+  suppression at the source is the emitter SDK's job, not admission's.
+- **Admitted data is immutable.** A delivery that conflicts with an
+  already-admitted record under the same natural identity (a span re-sent
+  with a different payload) does not overwrite it — the first admitted
+  record stands, and the conflict is **recorded** as an admission anomaly:
+  an observable runtime counter surfaced in investigation
+  [coverage](investigation-model.md). No collapse or conflict resolution
+  ever silently destroys or rewrites a record.
 - **Record identity is a model concern; adjacency is not.** That two signals
   are related is a derived, strategy-owned fact
   ([correlation-model.md](correlation-model.md)), which is built on the
@@ -188,24 +202,30 @@ Idempotent admission is therefore a model requirement, not an optimisation.
 ## Information budgets
 
 - The model owns the budget **taxonomy**: attribute count per span, log
-  record and data point; attribute value size; events per span; links per
-  span; data points per metric stream; exemplars per point; key-value-list
-  depth; resource attribute count. The numbers live in
+  record, data point and resource; attribute count per span event, link and
+  exemplar; attribute value size — with attribute keys and structure names
+  counted; events per span; links per span; exemplars per point; data points
+  per export; key-value-list depth. The numbers live in
   [runtime-constraints.md](runtime-constraints.md).
-- The model defines every record's **accounted size** — the sum of its value
-  payload sizes plus a fixed per-structure overhead — so that byte ceilings
-  downstream have a single definition no matter which storage mode enforces
-  them.
+- The model defines every record's **accounted size** — the bytes of its
+  value payloads, its attribute keys and structure names, plus a fixed
+  per-structure overhead — so that everything variable-length is counted and
+  byte ceilings have a single definition no matter which storage mode
+  enforces them.
 - **Budgets are admission gates, not mutation triggers.** A record that
-  exceeds a budget is refused at admission — as a retryable failure or as a
-  partial-success rejection naming the budget
-  ([runtime-constraints.md](runtime-constraints.md)) — never truncated into
-  something the emitter did not send. Everything admitted is complete and
+  exceeds a budget is refused at admission — as a **non-retryable**
+  rejection or a `partial_success` naming the budget
+  ([runtime-constraints.md](runtime-constraints.md) contracts which wire
+  signal each case carries; an over-cap payload cannot be fixed by
+  retrying) — never truncated into something the emitter did not send.
+  Everything admitted is complete and
   immutable. This is how rule 1 and rule 5 are reconciled: a span with ten
   thousand attributes cannot be both faithfully kept and bounded, so it is
   refused, observably.
 - Whose loss it was is always visible: emitter-side loss through the
-  preserved dropped-counts, runtime-side refusal through budget errors, and
+  preserved dropped-counts, runtime-side refusal through budget errors,
+  identity conflicts through admission-anomaly counters
+  ([recorded](#record-identity-and-duplicate-delivery) in coverage), and
   post-admission shrinking only through eviction
   ([storage-model.md](storage-model.md)).
 

@@ -6,45 +6,31 @@
 ## Component map
 
 ```text
-                      ┌──────────────────┐
-                      │     Loom UI      │
-                      └────────┬─────────┐
-                               │ HTTP via the server
-                    ┌──────────▼─────────┐
-                    │  Investigation API │
-                    │     (layer-api)    │
-                    └──────────┬─────────┘
-              ┌────────────────┴────────────────┐
-              ▼                                 ▼
-    ┌───────────────────┐             ┌───────────────────┐
-    │    Query Engine   │             │ Correlation Engine│
-    │   (layer-query)   │             │(layer-correlation)│
-    └─────────┬─────────┘             └─────────┬─────────┘
-              │                                 │
-              └────────────────┬────────────────┘
-                               ▼
-                     ┌──────────────────┐
-                     │ Telemetry Model  │
-                     │  (layer-model)   │
-                     └────────┬─────────┘
-                              ▼
-                 ┌──────────────────────┐
-                 │ Storage Abstraction  │
-                 └──────┬────────┬──────┘
-                        │        │
-                     Memory    SQLite
-                        ▲        ▲
-                        └───┬────┘
-                            │
-                 ┌──────────▼──────────┐
-                 │   OTLP Ingestion    │
-                 └─────────────────────┘
+ Dependency directions (A → B: "A may depend on B"). The executable law:
+ docs/architecture/boundaries.md + module-boundaries.config.mjs.
 
-                      ┌─────────────────┐
-                      │   MCP Server    │
-                      └────────┬────────┘
-                               └──► Investigation API (in-process)
+ surfaces (Loom UI over HTTP via layer-app · MCP in-process)
+   └─► Investigation API (layer-api)
+         ├─► Query Engine (layer-query)
+         │     ├─► Telemetry Model (layer-model)
+         │     └─► Storage Abstraction (layer-storage)
+         └─► Correlation Engine (layer-correlation)
+               ├─► Telemetry Model (layer-model)
+               └─► Storage Abstraction (layer-storage)
+
+ Telemetry Model (layer-model)           → nothing internal (leaf)
+ Storage Abstraction (layer-storage)     → model
+ Memory / SQLite (layer-storage-driver)  → storage, model   named only by layer-app
+ OTLP Ingestion (layer-ingest)           → model, storage   writes through the abstraction
+ Server / Desktop (layer-app)            → api, storage-driver, ingest, app
 ```
+
+The map above states the dependency directions; the law they obey is
+[boundaries.md](boundaries.md) (and its executable form,
+`module-boundaries.config.mjs`) — when this map and that law disagree, the
+law wins and this map is wrong. Reading direction is deliberate: ingestion
+writes _down_ through the abstraction; surfaces read _through_
+investigation; nothing reads sideways past a layer.
 
 Components, top to bottom:
 
@@ -59,9 +45,6 @@ Components, top to bottom:
 | **Memory / SQLite**     | Concrete storage modes                                            | one mode each; swappable behind the abstraction                                                                            |
 | **OTLP Ingestion**      | Receiving OpenTelemetry data                                      | OTLP transport decoding, admission control mechanism; **policy** lives in [runtime-constraints.md](runtime-constraints.md) |
 | **MCP Server**          | Agent-facing surface                                              | MCP protocol framing; a client of the Investigation API                                                                    |
-
-Reading direction is deliberate: ingestion writes _down_ into the model;
-surfaces read _through_ investigation; nothing reads sideways past a layer.
 
 ## Runtime modes
 
@@ -107,6 +90,10 @@ grow along boundaries documented here — not by accretion.
 
 ### Lifecycle
 
+**Target state.** The smoke core's shutdown is a plain graceful exit; the
+drain semantics below land with the runtime that admits telemetry
+([roadmap](../roadmap/phases.md)). The contract:
+
 The process shuts down honestly:
 
 - **SIGTERM** → stop admitting immediately: emitters get the
@@ -125,6 +112,6 @@ The process shuts down honestly:
 
 **Bootstrap.** Mode selection and the full topology are target state; the
 smoke core (`/healthz`, `/version`) is real and gated. The component map
-above is the composition law for when those land: any PR that would give a
-distribution its own telemetry, query or storage code violates
-[boundaries.md](boundaries.md).
+above states the dependency directions; the composition law itself is
+[boundaries.md](boundaries.md), and any PR that would give a distribution
+its own telemetry, query or storage code violates it.

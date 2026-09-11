@@ -54,8 +54,8 @@ Registered by their phases, not before:
   against the idle target.
 - `workload-rss` (Phase 2) — a scripted investigation session against a
   generated OTLP stream; measures RSS against the workload target.
-- `startup` (Phase 1) — cold start to a answered health probe; measures
-  against the 1 s target.
+- `startup` (Phase 1) — cold start to an answered health probe; measures
+  against the startup target.
 - `retention-bound` (Phase 1) — sustained overload; asserts bounded memory
   and backpressure signalling, not a number.
 - `query-budget` (Phase 2) — a query forced past its budget; asserts the

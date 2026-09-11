@@ -21,8 +21,10 @@ the honesty is not inspectable.
 ## Decision
 
 1. **Model-level budgets are admission gates, not mutation triggers.** A
-   record over its caps is refused at admission — retryable backpressure or
-   an OTLP `partial_success` naming the budget
+   record over its caps is refused at admission — by a non-retryable
+   rejection or an OTLP `partial_success` naming the budget (retrying an
+   over-cap payload cannot shrink it; only transient saturation carries the
+   retryable signal — [runtime-constraints.md](../architecture/runtime-constraints.md))
    (wire signals in
    [runtime-constraints.md](../architecture/runtime-constraints.md)) — never
    truncated into something the emitter did not send.
@@ -53,7 +55,9 @@ the honesty is not inspectable.
 - Storage eviction is the only force that shrinks data after admission; no
   query or surface may shrink what storage keeps.
 - Both storage drivers implement the refuse-or-degrade law identically —
-  mode symmetry includes budget law, per
-  [ADR 0003](0003-storage-strategy.md).
+  mode symmetry is a field-path guarantee
+  ([investigation-model.md](../architecture/investigation-model.md)) and it
+  includes budget law: no field path exists in one mode's answers that the
+  other cannot produce, per [ADR 0003](0003-storage-strategy.md).
 - Phase 2 engines must implement per-dimension policy exactly; "we truncate
   everything a bit" is not an implementation of this decision.

@@ -32,7 +32,8 @@
  *   layer-agent           →  layer-api              ❌  the MCP surface reads the one door, never beneath it
  *   layer-api             →  query/correlation/model ✅ the Investigation API composes the engines
  *   layer-query           →  model, storage         ✅  the query engine reads through the abstraction
- *   layer-correlation     →  model                  ✅  the correlation engine reasons over the model only
+ *   layer-correlation     →  model, storage        ✅  the correlation engine reads stored signals
+ *                                                       through the abstraction, like query (ADR 0007)
  *   layer-model           →  layer-model only       ❌  the telemetry model depends on nothing internal
  *   layer-storage         →  layer-model            ✅  the storage abstraction knows the model, no driver
  *   layer-storage-driver  →  storage, model         ✅  a driver implements the abstraction it belongs under
@@ -83,9 +84,17 @@ export const depConstraints = [
     onlyDependOnLibsWithTags: ["layer-model", "layer-storage"],
   },
 
-  // The correlation engine reasons over the telemetry model and nothing
-  // below it: correlation is model-shaped, not storage-shaped.
-  { sourceTag: "layer-correlation", onlyDependOnLibsWithTags: ["layer-model"] },
+  // The correlation engine reads the resident set through the storage
+  // abstraction — the same access the query engine has — because its
+  // contract (docs/architecture/correlation-model.md) is a derived read over
+  // stored signals; with `model` alone it had no legal input path at all.
+  // Its output stays model-shaped: it never writes back into storage, never
+  // names a driver, and only layer-api composes its results with query's.
+  // (ADR 0007.)
+  {
+    sourceTag: "layer-correlation",
+    onlyDependOnLibsWithTags: ["layer-model", "layer-storage"],
+  },
 
   // The telemetry model is the bottom of the internal graph: it imports no
   // other workspace project. OpenTelemetry fidelity is a data property, not

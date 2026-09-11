@@ -58,7 +58,10 @@ observable where it happens (dropped-record counters) **and** downstream,
 because [query responses report gaps](query-model.md) and
 [the Investigation envelope](investigation-model.md) carries them in its
 coverage — an investigator must be able to see what has been evicted from
-the window they are looking at.
+the window they are looking at. "Oldest" is by **admission time** — the
+model's added metadata ([telemetry-model.md](telemetry-model.md)) — never
+by emitter event time, which out-of-order emitters would make
+unpredictable.
 
 When the file-backed store's disk is full, the runtime degrades durability
 and observability — it never blocks admission and never blocks the hot path

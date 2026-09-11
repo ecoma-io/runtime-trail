@@ -23,17 +23,31 @@ its result. That is what makes one contract serve both
 Every query admits with a budget. A query without a budget is invalid — not
 "unbudgeted", invalid. The budget has five dimensions:
 
-| Dimension                | Meaning                                                                                   | On expiry                                                        |
-| ------------------------ | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | Traversal degrades with truthful truncation; aggregation refuses |
-| `max_results`            | Cap on entities returned                                                                  | Degrade with a cursor for the rest                               |
-| `max_bytes`              | Cap on the API-owned canonical encoding of the result                                     | Degrade with a response that names what was omitted              |
-| `max_scan`               | Cap on scan work (below)                                                                  | Degrade with coverage; cursor where a total order exists         |
-| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | Refuse                                                           |
+| Dimension                | Meaning                                                                                   | On expiry (by the shape of the work in flight)                                                    |
+| ------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | traversal degrades truthfully; aggregation refuses                                                |
+| `max_results`            | Cap on entities returned                                                                  | degrade with a cursor for the rest                                                                |
+| `max_bytes`              | Cap on the canonical encoding of the answer's evidence (below)                            | degrade with a cursor for the rest; the omission is named by count and position, never enumerated |
+| `max_scan`               | Cap on scan work (below)                                                                  | traversal degrades with coverage (cursor where a total order exists); aggregation refuses         |
+| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | refuse                                                                                            |
 
-(`max_bytes` counts the API's canonical encoding, not any transport's
-encoding: the API names its own canonical byte accounting so neither the UI
-nor MCP can move the goalposts by choosing an encoding.)
+**Every expiry follows the shape of the work in flight when the dimension
+expired** — traversal-shaped work degrades truthfully, aggregation-shaped
+work refuses ([Refuse or degrade](#refuse-or-degrade)); the table names each
+dimension's default shape. A query that mixes shapes expires per part: each
+part of the answer follows its own shape's rule, and the
+[envelope](investigation-model.md) reports each part's outcome (complete /
+degraded / refused) in its execution block. A flow fails outright only when
+its subject itself cannot be resolved within the budget — never merely
+because one aggregating part expired.
+
+`max_bytes` bounds the **evidence** part of the answer — the record views'
+canonical encoding, not any transport's encoding (the API names its own
+canonical byte accounting so neither the UI nor MCP can move the goalposts
+by choosing an encoding). The envelope's execution, coverage and limits
+parts are the answer's truth-telling and sit **outside** `max_bytes`; they
+are themselves bounded by a small fixed allowance, so honesty never crowds
+out data and data never crowds out honesty.
 
 ## Scan work is driver-symmetric
 
@@ -56,9 +70,7 @@ by accepting made-up units.
 The `deadline` dimension is a monotonic duration captured **at admission**
 — not a wall-clock expiry. The engine works against the remaining time of a
 monotonic reading taken when the query admitted; a wall-clock deadline
-would let a paused VM or a long page-in eat the budget invisibly. (House
-pattern: monotonic-acquired deadlines, per
-[ADR 0001](../decisions/0001-runtime-language.md) decision 5.)
+would let a paused VM or a long page-in eat the budget invisibly.
 
 ## Ordering, cursors and pagination
 
@@ -70,15 +82,22 @@ pagination, and an investigator paging through results would see records
 appear twice or vanish between pages.
 
 A **cursor** is opaque to callers. It encodes (position in the total order,
-last entity id, query fingerprint). The engine validates the fingerprint
-against the query that produced the cursor and **rejects a cursor whose
-fingerprint no longer matches** — a cursor is a position in one query's
-result set, not a general resume token.
+last entity id, query fingerprint). The engine **rejects a cursor whose
+embedded fingerprint differs from the query it is presented to** — a cursor
+belongs to one query's result set (same shape and parameters), and
+presenting it anywhere else is an error. The fingerprint tracks the query,
+not residency; gaps from later eviction are coverage's job.
 
 When [eviction](storage-model.md) has removed records the cursor points
 into, the response still returns what remains resident, ordered as before,
 and names the gap in coverage: an evicted record is a hole in the result
 with a name, never a silent skip.
+
+A cursor continues **within the snapshot its first page evaluated**: the
+result set is fixed at that page's admission, and records admitted after it
+are outside every later page of the same continuation — a declared boundary
+(the snapshot point is part of coverage), not a silent skip. A caller
+wanting newer data issues a new query.
 
 Pagination never discards the order for speed; there is no
 "fast approximate page N".
@@ -114,8 +133,9 @@ not for slowness.
   so neither surface gets a fatter default. Surface-specific overrides are
   flow parameters, not new defaults.
 - **Correlation** spends a share of the flow budget, decomposed by
-  layer-api into the scan-work and relation caps
-  ([correlation-model.md](correlation-model.md) details the decomposition).
+  layer-api into a scan-work share and the correlation flow parameters
+  (`max_hops`, `max_relations` — caps of the
+  [correlation contract](correlation-model.md), not budget dimensions).
 - **No disk spill, ever.** A query that exceeds `max_aggregation_memory` is
   refused; it never spills to disk to keep going. (Consistent with the
   runtime's zero-external-services posture and
@@ -134,7 +154,11 @@ not for slowness.
 5. Scan accounting means the same thing in both storage modes.
 6. A refused query names the dimension, the limit and the observed spend.
 7. No query path ever writes to disk.
-8. Identical query + identical resident set ⇒ identical first page.
+8. Identical query + identical resident set + identical budget, evaluated
+   by the same driver ⇒ identical first page. Cross-driver page content is
+   not promised (a driver may use an index — see scan accounting);
+   cross-mode equality is the [envelope's shape](investigation-model.md),
+   not page bytes.
 
 ## Status
 

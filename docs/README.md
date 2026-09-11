@@ -14,7 +14,7 @@ documents disagree, the authoritative home wins and the divergence is a bug.
 | [roadmap/README.md](roadmap/README.md)                                     | Current status, 1.0 scope vs future direction                           |
 | [roadmap/phases.md](roadmap/phases.md)                                     | Delivery phases and their acceptance criteria                           |
 | [architecture/README.md](architecture/README.md)                           | Index into the architecture documents                                   |
-| [architecture/system.md](architecture/system.md)                           | Components, runtime modes, distribution surfaces                        |
+| [architecture/system.md](architecture/system.md)                           | Components, runtime modes, lifecycle, distribution surfaces             |
 | [architecture/boundaries.md](architecture/boundaries.md)                   | Allowed dependency directions, forbidden edges, enforcement mapping     |
 | [architecture/telemetry-model.md](architecture/telemetry-model.md)         | The internal telemetry model (OTLP-faithful)                            |
 | [architecture/investigation-model.md](architecture/investigation-model.md) | Investigation API and the `Investigation` envelope                      |

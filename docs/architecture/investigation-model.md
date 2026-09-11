@@ -31,25 +31,31 @@ or storage modes.
 ## The three engines
 
 ```text
-                 ┌──────────────────┐   ┌───────────────────┐
- surfaces ──────►│ Investigation API│──►│    Query Engine   │
- (UI, MCP)       │    (layer-api)   │   │   (layer-query)   │
-                 │                  │   └───────────────────┘
-                 │ composes both    │   ┌───────────────────┐
-                 │ engines          │──►│ Correlation Engine│
-                 └──────────────────┘   │ (layer-correlation)│
-                                        └───────────────────┘
-                         both engines read only──►┌────────────────┐
-                                                  │ Telemetry Model│
-                                                  │  (layer-model) │
-                                                  └────────────────┘
+                ┌──────────────────┐
+ surfaces ─────►│ Investigation API│   (layer-api)
+ (UI, MCP)      │  composes both   │
+                └───────┬──────────┘
+              ┌─────────┴──────────┐
+    ┌─────────▼────────┐ ┌─────────▼───────────┐
+    │   Query Engine   │ │ Correlation Engine  │
+    │  (layer-query)   │ │ (layer-correlation) │
+    └────────┬─────────┘ └──────────┬──────────┘
+             │        reads         │
+             └──────────┬───────────┘
+                        ▼
+    ┌────────────────────────────────────────┐
+    │ Telemetry Model        (layer-model)   │
+    │ Storage Abstraction    (layer-storage) │
+    └────────────────────────────────────────┘
 ```
 
 The API **composes** the two engines as siblings — the dependency direction
 [boundaries.md](boundaries.md) enforces is `layer-api → {layer-query,
-layer-correlation}`, and neither engine depends on the other. (The earlier
-stacked diagram in this document implied a Query → Correlation edge that the
-boundary law forbids; fixed here.)
+layer-correlation}`, and neither engine depends on the other. Both engines
+read the [telemetry model](telemetry-model.md) and the
+[storage abstraction](storage-model.md) and nothing else; drivers are named
+only by layer-app. (The earlier stacked diagram in this document implied a
+Query → Correlation edge that the boundary law forbids; fixed here.)
 
 - **Query Engine** (`crates/query`, `layer-query`) — answers questions over
   the [telemetry model](telemetry-model.md) through the
@@ -62,9 +68,10 @@ boundary law forbids; fixed here.)
 - **Correlation Engine** (`crates/correlation`, `layer-correlation`) — owns
   cross-signal identity as [typed, evidenced relations](correlation-model.md):
   which log records belong to which trace, which metric points attach to
-  which spans, which records share a resource. Every correlation strategy
-  (name, version) lives here and nowhere else; the UI never "just filters by
-  trace_id" on its own data because it holds no data.
+  which spans, which records share a resource. It reads the resident set
+  through the storage abstraction, exactly as the Query Engine does. Every
+  correlation strategy (name, version) lives here and nowhere else; the UI
+  never "just filters by trace_id" on its own data because it holds no data.
 - **Investigation API** (`crates/investigation`, `layer-api`) — composes the
   two engines into the named investigation flows the surfaces need (trace
   waterfall + related logs + surrounding metrics as one response), defines
@@ -89,8 +96,11 @@ Every response is an **`Investigation`** — one envelope with five parts:
   — what was and was not covered (residency gaps under
   [eviction](storage-model.md), suppressed relation evidence under
   [strongest-evidence-wins](correlation-model.md), relation shrinkage under
-  eviction, incomplete coverage of a metric's window). Coverage is what
-  makes truncation truthful.
+  eviction, **admission anomalies** — identity conflicts under the model's
+  [duplicate-delivery rules](telemetry-model.md) — and the metric-window
+  statement: the window asked against the window the resident points
+  actually span, so "incomplete" is a fact with its bounds, not an
+  adjective). Coverage is what makes truncation truthful.
 - **correlated** — the [Relations](correlation-model.md) discovered between
   the subject and the resident signals: typed, tiered, evidenced
   ([correlation-model.md](correlation-model.md)), ordered deterministically,
@@ -125,11 +135,19 @@ Every response is an **`Investigation`** — one envelope with five parts:
 5. A response never contains a partial aggregate presented as complete
    ([query-model.md](query-model.md) pins this at the engine; the envelope
    reports it).
-6. Same resident set + same request + same strategy versions ⇒ byte-identical response (deterministic
-   output is what makes pagination stable and reproduction possible).
-7. Same investigation on the memory mode and the SQLite mode produces the
-   same envelope shape (mode symmetry): the contract contains no mode
-   vocabulary, so the envelope cannot differ by mode.
+6. Same resident set + same request + same strategy versions ⇒ the answer's
+   content parts — subject, correlated, evidence — are byte-identical. The
+   execution and limits parts are **run facts** (observed spend, coverage,
+   strategy state at run time): they are compared by meaning, not bytes.
+   Deterministic content is what makes pagination stable and reproduction
+   possible; the run-fact parts exist precisely because runs differ in what
+   they spent and what had been evicted.
+7. Mode symmetry is a **field-path** statement: every field path valid in
+   the memory mode's envelope is valid in the SQLite mode's, with the same
+   meaning — no field path exists that one mode can produce and the other
+   cannot. Values legitimately differ with the resident set (spend,
+   coverage, eviction state differ because the sessions differ — reporting
+   that difference is the envelope's job); the shape never does.
 
 ### The investigation-shaped line
 
