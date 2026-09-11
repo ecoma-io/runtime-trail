@@ -61,10 +61,10 @@ once, in the `telemetry-model` crate (tag `layer-model`), which — per
   all-zero encoding is _invalid_, and an invalid value is preserved as what
   the emitter sent — never regenerated, hashed, or coerced. An absent parent
   is distinct from a zero parent.
-- `trace_flags` is the full 32-bit value OTLP carries (`fixed32`). Only the
-  sampled bit is interpreted; every other bit is preserved verbatim — bits 8
-  and 9 (remote presence, parent/link remote) carry emitter facts, and
-  readers may not assume bits 10–31 are zero.
+- `trace_flags` is the full 32-bit field the wire carries (`fixed32`). Only
+  the sampled bit (bit 0) is interpreted; every other bit is preserved
+  verbatim — including bits 8 and 9, OTLP's remote-parent signalling, and
+  everything above them. A reader must not assume the high bits are zero.
 - `tracestate` is an ordered list of (vendor, opaque value) entries. The order
   is semantic; entries are never merged, deduplicated, or sorted.
 
@@ -107,13 +107,15 @@ same object is shared, not copied, between records from one batch
   text) are independent preserved fields. No coercion happens in either
   direction; displaying a mapped severity name is a view concern (rule 3).
 - The body is a full [value](#values-and-attributes) — not necessarily a
-  string. Attributes are a value map. Trace context is carried exactly as
-  the emitter sent it: `trace_id`, `span_id` and `flags` are **independently
-  optional** — a record with a span id but no trace id is preserved as sent,
-  never fabricated into a complete context and never stripped to drop a
-  sent field.
-- `event_name` (when the emitter sent one) is preserved — the event/record
-  distinction is wire data.
+  string. Attributes are a value map. Trace context is optional and comes as
+  **three independent fields** — `trace_id`, `span_id`, `flags` — each
+  present or absent on its own, exactly as the emitter sent them: a record
+  that sent a span id without a trace id keeps exactly that. Nothing
+  fabricates a zero id to fill an absent half; the
+  `(trace_id, span_id)` correlation pair exists only when both are present.
+- The event name (OTLP `LogRecord.event_name`) is a preserved field, present
+  or absent. A record also carries the resource and instrumentation scope it
+  was emitted under, flattened exactly as on spans.
 - The dropped-attribute count is preserved, as on spans. The
   [depth budget](#information-budgets) applies to the body like to any
   value the record carries.
@@ -130,34 +132,41 @@ as everywhere), its scope and resource (below), and its points.
   is never inferred); histogram; exponential histogram (scale, zero count and
   threshold, bucket layout preserved exactly — never re-bucketed); summary
   (quantiles, count, sum). No kind is collapsed into another.
+- **The kind imposes a shape law.** A point offered under a kind whose shape
+  it does not carry — a histogram-shaped point under a sum, an interval
+  point without a `start_time` — is refused at admission as invalid, never
+  coerced. Admission re-applies the same law a stream construction enforces,
+  so a point cannot bypass it by arriving without its stream.
 - **Temporality is per data point stream.** A delta stream and a cumulative
   stream with the same name are different series — never merged, split, or
   converted. Conversion is a transformation pipeline, which
   [non-goals](../product/non-goals.md) excludes.
-- A data point carries its attribute set, its OTLP **flags** (the staleness
-  marker — a point with the no-recorded-value flag is a different point from
-  a real zero, on the wire and in
-  [identity](#record-identity-and-duplicate-delivery)), plus `start_time`
-  (interval start) and `time` (interval end or measurement time). A gauge
-  point that carries a `start_time` has it **preserved but ignored**: OTLP
-  defines the field as ignored for gauges, so it never participates in
-  gauge point identity — a producer encouraged to always set it must not
-  have its points refused.
-- **Exemplars** carry their value, timestamp, filtered attributes, and the
-  (trace id, span id) pair exactly as OTLP sends it — exemplars carry no
-  flags or tracestate on the wire, and the model fabricates neither. The
-  exemplar pair is the model-level hook for metrics↔trace correlation — a
-  committed capability ([scope](../product/scope.md)).
+- A data point carries its attribute set plus `start_time` (interval start)
+  and `time` (interval end or measurement time). A gauge point that _did_
+  send a `start_time` has it preserved verbatim — outside gauge identity,
+  never refused, and never a conflict when a re-delivery differs only there
+  — because the spec's gauge semantics ignore it while producers are
+  encouraged to send it. Every data point also carries its flags as sent;
+  the staleness marker (`DATA_POINT_FLAG_NO_RECORDED_VALUE`) is the one
+  interpreted bit, all 32 bits are preserved, and a flagged point is a
+  different point from an unflagged one.
+- **Exemplars** carry their value, timestamp, filtered attributes, and two
+  independently optional trace ids — `trace_id` and `span_id`, exactly as
+  the wire carries them (no flags, no tracestate). The exemplar's ids are
+  the model-level hook for metrics↔trace correlation — a committed
+  capability ([scope](../product/scope.md)) — and neither is ever
+  fabricated when absent.
 
 ## Values and attributes
 
 - A value is exactly one of: string, boolean, 64-bit integer, 64-bit float,
   bytes, array, or key-value list (an ordered map). Integers and floats are
   never interconverted; NaN and the infinities are preserved values.
-- Array elements share one element kind — and that kind may be **any value
-  kind**, key-value lists and arrays included, exactly as OTLP's `ArrayValue`
-  (repeated `AnyValue`) permits. A mixed-kind array is invalid input: it is
-  rejected, not coerced.
+- Array elements are of one value kind — **any single one of the seven
+  kinds**, including arrays of arrays and arrays of key-value lists, which
+  OTLP carries (`ArrayValue` is repeated `AnyValue`) and structured log
+  bodies use. A mixed-kind array is invalid input: it is rejected, not
+  coerced.
 - **Duplicate keys are refused.** A key repeated within one key-value list —
   attributes, metric metadata, exemplar filtered attributes — is invalid
   input: the record is rejected at admission. Silent keep-first or keep-last
@@ -175,17 +184,24 @@ as everywhere), its scope and resource (below), and its points.
 
 - A resource is an attribute map. Two records share a resource exactly when
   their attribute maps are equal under this model's comparison — regardless
-  of how the emitter batched its exports. The resource's `schema_url` is
-  preserved but **not part of identity**: it is provenance about the schema
-  the attributes were sent under, and two records differing only in it still
-  share the resource. Resources are never merged; resource merging is a
-  collector processor feature, and this runtime is a destination, not a
-  relay.
-- A scope is identified by (name, version, attributes). The same name with a
-  different version is a different scope. An empty scope name is valid.
+  of how the emitter batched its exports, and regardless of `schema_url`,
+  which never participates in resource identity (it is preserved
+  provenance). The comparison is over the whole map — full-field, never
+  hash-based. Resources are never merged; resource merging is a collector
+  processor feature, and this runtime is a destination, not a relay.
+- A scope is identified by (name, version, attributes, schema URL) — the
+  full field set. The same name with a different version is a different
+  scope. An empty scope name is valid. The resource keeps OTel's own
+  identity rule (the attribute map); the scope's wider key is this model's
+  choice — it is the identity metric stream identity is built from, so no
+  two scopes a stream could distinguish are ever equalised. Both levels
+  carry an emitter-reported `dropped_attributes_count`: preserved data
+  outside identity at the resource level, part of the scope's full-field
+  identity at the scope level.
 - `schema_url` exists at two levels — resource and scope — and both are
-  preserved as distinct fields. Neither participates in identity: identity
-  is attribute content, the URL is provenance, kept for fidelity.
+  preserved as distinct fields. At the resource level it is provenance
+  outside identity; at the scope level it participates in the scope's
+  full-field identity.
 - OTLP attaches resources and scopes at the envelope level
   (`ResourceSpans`/`ScopeSpans`, `ResourceLogs`/`ScopeLogs`,
   `ResourceMetrics`/`ScopeMetrics`). The model flattens them onto every
@@ -219,10 +235,10 @@ Idempotent admission is therefore a model requirement, not an optimisation.
 - **Collapse happens only where the OTel data model itself defines
   identity.** A re-delivered span (same `trace_id` + `span_id`) is the same
   span: it collapses onto the one already admitted. A re-delivered metric
-  point (same stream identity — resource, scope, name, kind, temporality,
-  point attribute set — plus `start_time`, `time`, and the point's flags;
-  for gauges `start_time` is ignored and (stream, `time`, flags) is the
-  point) is the same data point: it collapses.
+  point (same stream identity — resource, scope, name, kind, temporality —
+  plus the point's attribute set, `start_time`, `time`, and flags; for
+  gauges the point is (stream, `time`, flags) and a sent `start_time` is
+  normalised out of the identity) is the same data point: it collapses.
 - **Log records are never collapsed.** OTLP defines no log-record identity,
   and this model refuses to invent a destructive one: two byte-identical log
   records are two admitted records — the emitter sent two. Duplicate
@@ -256,25 +272,34 @@ Idempotent admission is therefore a model requirement, not an optimisation.
 ## Information budgets
 
 - The model owns the budget **taxonomy**: attribute count per span, log
-  record, data point and resource; attribute count per span event, link and
-  exemplar; attribute value size — with attribute keys and structure names
-  counted; events per span; links per span; exemplars per point; data points
-  per export; key-value-list depth. The numbers live in
-  [runtime-constraints.md](runtime-constraints.md).
-- **Depth is scoped to every value a record carries** — attribute values,
-  the log body, exemplar filtered attributes, metric metadata. No
-  distinguished field is exempt: a record any of whose values exceeds the
-  depth budget is refused at admission. The post-admission invariant —
-  every value in every admitted record is within budget — is what makes
+  record, data point, resource and scope; attribute count per span event,
+  link and exemplar; attribute value size — with attribute keys and
+  structure names counted; events per span; links per span; exemplars per
+  point; data points per export; key-value-list depth. The numbers live in
+  [runtime-constraints.md](runtime-constraints.md), which owns them; the
+  model carries them as one startup-configurable limit set that every
+  admission gate consumes.
+- **The nesting budget is about every recursive structure a record
+  carries.** Key-value lists and arrays alike count toward the depth, at
+  every level, in every value a record holds — attribute values, log
+  bodies, event, link and exemplar attributes included. No distinguished
+  field is exempt: a record any of whose values exceeds the depth budget is
+  refused at admission. The check is an iterative walk that stops at the
+  first level past the limit, so an arbitrarily deep payload is refused
+  without ever recursing through it — and the post-admission invariant,
+  every value in every admitted record within budget, is what makes
   traversal of admitted data safe without depth tricks.
 - The model defines every record's **accounted size** — the bytes of its
-  value payloads, its attribute keys and structure names, plus a fixed
-  per-structure overhead — so that everything variable-length is counted and
-  byte ceilings have a single definition no matter which storage mode
-  enforces them. The formula deliberately **over-counts**: per-container
-  structure costs are charged so the accounted number stays an upper bound
-  on the record's real heap cost. How tight that bound is (real ÷ accounted)
-  is a measured fact for [docs/benchmarks/README.md](../benchmarks/README.md)
+  value payloads, its attribute keys and structure names, plus measured
+  per-container and per-structure overhead — so that everything
+  variable-length is counted and byte ceilings have a single definition no
+  matter which storage mode enforces them. Accounted size is a deliberate
+  **over-approximation** of real heap cost, sized from a counting-allocator
+  measurement over the legal adversarial shapes (many tiny attributes
+  dominate: their B-tree nodes, not their payloads, are the cost).
+  Over-counting is the honest direction; a ceiling that under-counts would
+  be a lie about the machine. How tight the bound is (real ÷ accounted) is
+  a measured fact for [docs/benchmarks/README.md](../benchmarks/README.md)
   when measurements land — never a claim made here.
 - **Budgets are admission gates, not mutation triggers.** A record that
   exceeds a budget is refused at admission — as a **non-retryable**
