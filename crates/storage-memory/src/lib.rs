@@ -2,21 +2,62 @@
 //! `runtime-trail` runs.
 //!
 //! Memory mode is first-class, not a fallback —
-//! `docs/architecture/storage-model.md` owns that rule and the bounded
-//! retention this driver must enforce once it keeps real telemetry. This
-//! crate is a [`layer-storage-driver`]: it implements the storage
-//! abstraction and depends on nothing above it.
+//! [`docs/architecture/storage-model.md`](../../docs/architecture/storage-model.md)
+//! owns that rule and the bounded retention this driver enforces: the
+//! memory-mode ceilings of
+//! [`docs/architecture/runtime-constraints.md`](../../docs/architecture/runtime-constraints.md)
+//! (2,000,000 records, 256 MiB accounted, a 24 h window by default;
+//! [`MemoryConfig`] starts a store with them or with what an operator
+//! tuned — never changed afterwards), enforced in-process after every keep
+//! and on every retention pass. This crate is a [`layer-storage-driver`]:
+//! it implements the storage abstraction and depends on nothing above it.
 //!
 //! [`layer-storage-driver`]: ../../docs/architecture/boundaries.md
 //!
-//! # Bootstrap status
+//! # What this driver promises
 //!
-//! Scaffolding only; real keeping lands with Phase 1 —
-//! `docs/roadmap/phases.md`.
+//! - **Oldest is admission time**, never emitter event time: the record
+//!   with the smallest [`AdmissionKey`](runtime_trail_storage::AdmissionKey)
+//!   is evicted first, and scans walk the same order. Ties break by entity
+//!   id — the order is total and documented there.
+//! - **First ceiling hit wins**: whichever ceiling is exceeded first drives
+//!   eviction, one record at a time until every ceiling is satisfied again,
+//!   each eviction attributed to the ceiling that triggered it and counted
+//!   in [`StoreStats`](runtime_trail_storage::StoreStats).
+//! - **Eviction ends identity**: for each evicted record the wired
+//!   [`EvictionHook`](runtime_trail_storage::EvictionHook) fires with the
+//!   entity id — the composition root's hook calls the admission ledger's
+//!   `forget`, so a re-delivery after eviction is admitted fresh (ADR 0008).
+//!   This crate never names the ledger's type; the inversion is the hook.
+//! - **Admission never blocks on I/O** — trivially, in memory mode: a keep
+//!   is map inserts plus the retention pass, no filesystem, no network, no
+//!   locks beyond the caller's own.
+//! - **Records are shared, never copied**: a record is stored exactly as
+//!   the `Arc` the admission ledger handed over, and retrieval hands the
+//!   same allocation back (ADR 0008).
+//!
+//! The stream identity of a metric point is kept as the interned
+//! allocation admission resolved; it is interning overhead outside the
+//! accounted ceilings (ADR 0008), not per-point content.
+//!
+//! [`layer-storage-driver`]: ../../docs/architecture/boundaries.md
 
-use runtime_trail_storage::StorageBackend;
+mod config;
+mod shelf;
+mod store;
 
-/// The in-memory backend.
+pub use config::{
+    DEFAULT_ADMISSION_WINDOW, DEFAULT_MAX_ACCOUNTED_BYTES, DEFAULT_MAX_RECORDS, MemoryConfig,
+};
+pub use store::InMemoryStore;
+
+/// The bootstrap mode marker, kept from the foundation commit.
+///
+/// This unit struct is what the smoke surfaces (`crates/server`) still hold
+/// while no telemetry flows; it is **not** the memory-mode driver — the
+/// driver is [`InMemoryStore`]. The marker disappears when the composition
+/// root is wired to hold a real `Box<dyn TelemetryStore>`; nothing new may
+/// depend on it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MemoryStore;
 
@@ -32,7 +73,7 @@ impl MemoryStore {
     }
 }
 
-impl StorageBackend for MemoryStore {}
+impl runtime_trail_storage::StorageBackend for MemoryStore {}
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -53,5 +94,18 @@ mod tests {
     #[test]
     fn depends_on_the_storage_contract() {
         assert!(!runtime_trail_storage::VERSION.is_empty());
+    }
+
+    /// The real driver implements the real contract, through the trait —
+    /// the same path every consumer above the abstraction takes.
+    #[test]
+    fn the_in_memory_store_implements_the_contract() {
+        use runtime_trail_storage::TelemetryStore;
+
+        let mut store = super::InMemoryStore::new(super::MemoryConfig::default(), None);
+        store.observe_admission_anomalies(0);
+        assert_eq!(store.stats().resident_records, 0);
+        assert_eq!(store.config().max_records, 2_000_000);
+        assert_eq!(store.mode_name(), "memory");
     }
 }
