@@ -126,7 +126,8 @@ and enforced mechanically by [Archkeep](https://github.com/ecoma-io/archkeep).
 architecture contracts (mechanically enforced, with canary fixtures proving
 the enforcement bites), agent workflow, CI, documentation, governance — and
 the core skeleton boots: one binary that binds loopback by default, answers
-`/healthz` and `/version`, and runs against its in-memory store. There is **no
+`/healthz` and `/version`, serves the bootstrap web app statically, and runs
+against its in-memory store. There is **no
 telemetry capability yet**: no OTLP ingestion, no telemetry model beyond the
 skeleton's own types, no query or correlation engine, and no MCP server. The
 web and desktop apps are bootstrap shells around a status page, not the
