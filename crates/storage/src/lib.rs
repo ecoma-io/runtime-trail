@@ -2,31 +2,86 @@
 //! the query engine against it.
 //!
 //! This crate owns the *contract only* — it knows the telemetry model and
-//! nothing else in this repository ([`layer-storage`]). Concrete modes live
-//! behind it, one crate each (`storage-memory`, `storage-sqlite`); only the
-//! composition root may name a driver. The rules this contract must honour —
-//! bounded retention in every mode, persistence never on the ingestion
-//! critical path, memory mode first-class — are
-//! `docs/architecture/storage-model.md`; the dependency law is
-//! `docs/architecture/boundaries.md`.
+//! nothing else in this repository ([`layer-storage`]): no concrete backend,
+//! no UI type, no wire format, no admission-ledger type (the eviction
+//! lifecycle reaches the ledger through an inverted hook instead —
+//! [`EvictionHook`]). Concrete modes live behind it, one crate each
+//! (`storage-memory`, `storage-sqlite`); only the composition root may name
+//! a driver (ADR 0003). The rules this contract honours are
+//! [`docs/architecture/storage-model.md`](../../docs/architecture/storage-model.md);
+//! the dependency law is
+//! [`docs/architecture/boundaries.md`](../../docs/architecture/boundaries.md).
 //!
 //! [`layer-storage`]: ../../docs/architecture/boundaries.md
 //!
-//! # Bootstrap status
+//! # Storage stays storage
 //!
-//! The trait below is the placeholder shape of the contract, present so the
-//! drivers and the boundary law have something real to bind to. Its real
-//! surface lands with Phase 1 (memory mode) — see `docs/roadmap/phases.md`.
+//! The contract's retrieval surface is exactly three shapes, and every one
+//! of them is a *location* fact, not a *question*:
+//!
+//! - **get by entity id** — one resident record, by the id admission gave
+//!   it;
+//! - **ordered scans** — the resident set in residency order, cursor
+//!   continued ([`AdmissionKey`], [`ScanPage`]);
+//! - **count and size introspection** — [`StoreStats`].
+//!
+//! There is no find-the-slow-trace, no related-logs, no service-error
+//! search, no time-window analytics, no relation building here. Anything
+//! that asks a question about the data is query or correlation work
+//! (`docs/architecture/investigation-model.md`), reading these primitives
+//! through the abstraction — never a method on a store.
+//!
+//! # What a store promises
+//!
+//! - **Bounded retention** in every mode: the ceilings of
+//!   `docs/architecture/runtime-constraints.md`, enforced by the store,
+//!   evicting the oldest record — oldest by admission time, never emitter
+//!   event time — until every ceiling is satisfied again. First ceiling hit
+//!   wins; the cause is counted per record ([`EvictionCause`],
+//!   [`StoreStats`]).
+//! - **The admitted-then-kept pipeline**: keeps are plain calls that never
+//!   wait on durable I/O; a slow disk degrades durability, never the hot
+//!   path.
+//! - **One deterministic order** ([`AdmissionKey`]): eviction order and
+//!   scan order are the same sequence — admission time, entity id as
+//!   tie-break.
+//! - **Identity ends with residency** (ADR 0008): the store's removal hook
+//!   fires per evicted record so the composition root can drop the
+//!   record's ledger identity; a re-delivery afterwards is admitted fresh.
+//!
+//! # The shape of the contract
+//!
+//! - [`store`] — [`TelemetryStore`], the trait every mode implements, and
+//!   [`PointView`].
+//! - [`keep`] — [`KeepOutcome`], [`EvictionCause`], and [`EvictionHook`],
+//!   the inverted dependency that ends a record's ledger identity on
+//!   eviction.
+//! - [`order`] — [`AdmissionKey`] and [`ScanPage`], the residency order
+//!   eviction and scans share.
+//! - [`stats`] — [`StoreStats`], the observability counters.
 
-/// The storage contract every backend implements.
-///
-/// Deliberately empty at bootstrap: each capability added here (put, window
-/// scans, eviction visibility) must be specified in
-/// `docs/architecture/storage-model.md` before it is coded.
-pub trait StorageBackend {}
+pub mod keep;
+pub mod order;
+pub mod stats;
+pub mod store;
+
+pub use keep::{EvictionCause, EvictionHook, KeepOutcome};
+pub use order::{AdmissionKey, ScanPage};
+pub use stats::StoreStats;
+pub use store::{PointView, TelemetryStore};
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The bootstrap binding surface, kept from the foundation commit.
+///
+/// This empty trait is what the Phase 3 scaffolding (`storage-sqlite`) and
+/// the smoke surfaces still bind to, so the declared boundaries stay real
+/// before their drivers exist. It is **not** the storage contract — the
+/// contract is [`TelemetryStore`]. The placeholder disappears when the
+/// file-backed driver lands against the real contract (Phase 3,
+/// `docs/roadmap/phases.md`); nothing new may implement it.
+pub trait StorageBackend {}
 
 #[cfg(test)]
 mod tests {
@@ -42,5 +97,38 @@ mod tests {
     #[test]
     fn depends_on_the_telemetry_model() {
         assert!(!runtime_trail_telemetry_model::VERSION.is_empty());
+    }
+
+    /// The residency order is a contract fact drivers and scans share, so
+    /// the ordering types are part of the public surface this crate owns.
+    #[test]
+    fn the_residency_order_is_reachable_from_the_crate_root() {
+        use std::num::NonZeroU64;
+
+        use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, EntityId};
+        let entity = EntityId::Assigned(AssignedId::from_serial(
+            NonZeroU64::new(1).expect("1 is nonzero"),
+        ));
+        let key = super::AdmissionKey::new(AdmissionTime::from_unix_nano(7), entity);
+        let page = super::ScanPage::<EntityId> {
+            items: vec![entity],
+            cursor: Some(key),
+        };
+        assert_eq!(page.cursor, Some(key));
+        assert_eq!(key.admitted_at(), AdmissionTime::from_unix_nano(7));
+    }
+
+    /// The counters and the keep outcomes are what observability and the
+    /// hand-off are typed by; both must stay value types a composition root
+    /// can report without reaching into a driver.
+    #[test]
+    fn the_observability_and_handoff_types_are_reachable_from_the_crate_root() {
+        assert_eq!(super::StoreStats::default().total_evictions(), 0);
+        assert_eq!(super::KeepOutcome::Oversized.evicted(), 0);
+        assert_eq!(super::KeepOutcome::Kept { evicted: 3 }.evicted(), 3);
+        assert_eq!(
+            super::EvictionCause::AdmissionWindow,
+            super::EvictionCause::AdmissionWindow
+        );
     }
 }
