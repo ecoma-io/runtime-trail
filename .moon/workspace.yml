@@ -2,9 +2,10 @@
 # inferred from globs, so a new module must be added here, to
 # module-boundaries.config.mjs, and to commitlint.config.mjs in one commit.
 #
-# `toolchains.yml` is deliberately absent: the Rust toolchain is the ambient
-# stable toolchain (no rust-toolchain.toml by org convention), and Node/pnpm
-# are pinned by .node-version and package.json#packageManager.
+# `toolchains.yml` pins Node and pnpm for moon tasks and CI; the Rust
+# toolchain is the ambient stable toolchain (no rust-toolchain.toml by org
+# convention), and Node/pnpm are pinned by .node-version and
+# package.json#packageManager.
 vcs:
   client: git
   defaultBranch: main

@@ -18,7 +18,8 @@ platform", it is a change to those documents first and code second.
 
 **The repository is currently at Bootstrap.** The foundation commit holds the
 toolchain, the architecture law, the gates and a smoke-only core
-(`/healthz`, `/version`). No telemetry is ingested, queried, or rendered.
+(a health surface, a version surface, and static UI serving when supplied).
+No telemetry is ingested, queried, or rendered.
 `docs/roadmap/phases.md` owns what lands when; do not pull a future phase's
 work into the present one, and do not ship a capability whose phase has not
 started.
@@ -28,22 +29,24 @@ started.
 One fact, one owner. When documents disagree, the owner wins; fix the other
 document in the same commit.
 
-| Fact                                             | Owner                                         |
-| ------------------------------------------------ | --------------------------------------------- |
-| What the product is / is not                     | `docs/product/`                               |
-| What lands in which phase                        | `docs/roadmap/phases.md`                      |
-| Component map and runtime modes                  | `docs/architecture/system.md`                 |
-| The dependency law (allowed and forbidden edges) | `docs/architecture/boundaries.md`             |
-| Telemetry data shapes                            | `docs/architecture/telemetry-model.md`        |
-| The Investigation API's contract                 | `docs/architecture/investigation-model.md`    |
-| Storage modes and retention                      | `docs/architecture/storage-model.md`          |
-| MCP surface rules                                | `docs/architecture/mcp-model.md`              |
-| Resource targets and backpressure                | `docs/architecture/runtime-constraints.md`    |
-| Recorded decisions (the "why")                   | `docs/decisions/`                             |
-| Performance targets vs. measurements             | `docs/benchmarks/README.md`                   |
-| Executable form of the boundary law              | `module-boundaries.config.mjs`                |
-| Project map, tags, tasks                         | `.moon/workspace.yml`, per-project `moon.yml` |
-| The scopes a commit may carry                    | `commitlint.config.mjs`                       |
+| Fact                                                                                              | Owner                                         |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| What the product is / is not                                                                      | `docs/product/`                               |
+| What lands in which phase                                                                         | `docs/roadmap/phases.md`                      |
+| Component map and runtime modes                                                                   | `docs/architecture/system.md`                 |
+| The dependency law (allowed and forbidden edges)                                                  | `docs/architecture/boundaries.md`             |
+| Telemetry data shapes                                                                             | `docs/architecture/telemetry-model.md`        |
+| The Investigation API's contract                                                                  | `docs/architecture/investigation-model.md`    |
+| The query budget and search contract                                                              | `docs/architecture/query-model.md`            |
+| Relation types, evidence and provenance                                                           | `docs/architecture/correlation-model.md`      |
+| Storage modes and retention                                                                       | `docs/architecture/storage-model.md`          |
+| MCP surface rules                                                                                 | `docs/architecture/mcp-model.md`              |
+| Resource targets and backpressure                                                                 | `docs/architecture/runtime-constraints.md`    |
+| Recorded decisions (the "why")                                                                    | `docs/decisions/`                             |
+| Which performance measurements exist (targets live in `docs/architecture/runtime-constraints.md`) | `docs/benchmarks/README.md`                   |
+| Executable form of the boundary law                                                               | `module-boundaries.config.mjs`                |
+| Project map, tags, tasks                                                                          | `.moon/workspace.yml`, per-project `moon.yml` |
+| The scopes a commit may carry                                                                     | `commitlint.config.mjs`                       |
 
 Architecture facts are verified from the repository, not from memory: re-read
 the owner document before relying on one, because the file you remember may
@@ -107,8 +110,8 @@ package — never vendored. Formatting is prettier's job alone;
 
 **Tests are not optional at any layer.** Every crate carries at least one
 real test (the test task fails a suite that runs zero tests); every moon
-project has `lint`, `typecheck`, `test` and — where it produces an artifact —
-`build`. `scripts/cargo-test.sh` is the test entry for Rust crates and fails
+project has `lint`, `typecheck`, `test` and — where it produces an artifact
+(desktop `build` lands with Phase 5) — `build`. `scripts/cargo-test.sh` is the test entry for Rust crates and fails
 loudly on a vacuous run. Do not write a test that asserts what the compiler
 already enforces unless the assertion is the point (see the desktop shell's
 `shells_the_same_core`).
@@ -150,7 +153,8 @@ hand-picking checks, because hand-picking is how a red gate gets shipped.
 Conventional Commits with the scopes in `commitlint.config.mjs`; a new module
 brings its scope in the same commit. Hooks run the fast gates per commit and
 the full suite on push; the merge queue requires `ci-gate` and
-`analysis-gate` (see `.github/workflows/`) — never bypass them, never push to
+`analysis-gate` (see `.github/workflows/`; the required-checks ruleset is
+recorded in `.github/repository-settings.json`) — never bypass them, never push to
 `main` directly. Keep PRs small enough to review in one sitting; a PR that
 changes the architecture law links the architecture document diff beside the
 code diff.

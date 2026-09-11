@@ -8,11 +8,13 @@
 
 [runtime-constraints.md](../architecture/runtime-constraints.md) publishes
 engineering **targets** (idle RSS, workload RSS, startup, bounded
-retention/query memory). Nothing on this page, and nothing produced by the
-harness until Phase 6, is evidence that a target is met. A number only
-becomes a **result** when it is produced by a registered scenario below, on
-a named machine, at a named commit — and until then the only honest status is
-"not yet measured".
+retention/query memory). Nothing on this page is evidence that a target is
+met. A number only becomes a **result** when it is produced by a registered
+scenario below, on a named machine, at a named commit — and until then the
+only honest status is "not yet measured". A result becomes a **gated
+regression check** only from Phase 6 ([roadmap](../roadmap/phases.md));
+before that, per-phase case assertions are advisory evidence produced by the
+harness and checked by hand — never a CI gate.
 
 ## The harness
 
@@ -52,8 +54,8 @@ Registered by their phases, not before:
   against the idle target.
 - `workload-rss` (Phase 2) — a scripted investigation session against a
   generated OTLP stream; measures RSS against the workload target.
-- `startup` (Phase 1) — cold start to a answered health probe; measures
-  against the 1 s target.
+- `startup` (Phase 1) — cold start to an answered health probe; measures
+  against the startup target.
 - `retention-bound` (Phase 1) — sustained overload; asserts bounded memory
   and backpressure signalling, not a number.
 - `query-budget` (Phase 2) — a query forced past its budget; asserts the

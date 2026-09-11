@@ -50,8 +50,9 @@ protocol layer.
 5. **tokio + axum live only in the `server` crate.** HTTP is a
    distribution/transport concern ([boundaries.md](../architecture/boundaries.md):
    the server and desktop are `layer-app`, the only projects allowed to know
-   how the core reaches a network). No other crate may take an HTTP, gRPC or
-   Tauri dependency; that is what keeps the core embeddable in the desktop
+   how the core reaches a network). No crate outside `layer-app` may take an
+   HTTP, gRPC or Tauri dependency; that is what keeps the core embeddable in
+   the desktop
    shell and testable without sockets.
 
 ## Consequences

@@ -40,9 +40,9 @@ layer-storage          → model
 layer-storage-driver   → storage, model
 layer-ingest           → model, storage
 layer-query            → model, storage
-layer-correlation      → model
+layer-correlation      → model, storage
 layer-api              → query, correlation, model
-layer-view             → (nothing internal)             # talks to the API over HTTP
+layer-view             → (nothing internal)             # HTTP via the server (layer-app)
 layer-agent            → api
 layer-app              → api, storage-driver, ingest, app
 ```
@@ -57,6 +57,13 @@ Notes on the two rows that look unusual:
   `server` and `desktop` may depend on each other: the desktop shell starts the
   same server core in-process (the same-core invariant in
   [system.md](system.md)).
+- **`layer-correlation` reads storage like `layer-query`.** Correlation's
+  contract is a derived read over the resident telemetry
+  ([correlation-model.md](correlation-model.md)): its strategies must see
+  stored signals to build relations over them, so it takes the same read
+  access the query engine has. The read-only rule stands: correlation never
+  writes back into storage, never names a driver, and only layer-api
+  composes its output with query's ([ADR 0007](../decisions/0007-correlation-reads-storage.md)).
 
 ## Forbidden edges
 
@@ -68,9 +75,10 @@ naming, because they are the invariants this architecture exists to keep:
 - `agent → storage`, `agent → query`, `agent → correlation`,
   `agent → model`, `agent → ingest` — MCP has exactly one upstream: the
   Investigation API, the same one the UI uses.
-- `api → storage-driver`, `api → ingest`, `api → view`, `api → agent`,
-  `api → app` — the Investigation layer never depends on concrete storage,
-  ingestion, or any presentation/distribution surface.
+- `api → storage`, `api → storage-driver`, `api → ingest`, `api → view`,
+  `api → agent`, `api → app` — the Investigation layer never depends on
+  storage (concrete or abstract), ingestion, or any presentation/distribution
+  surface.
 - `model → anything` — the telemetry model stays independent of storage,
   presentation and transport.
 - `storage-driver → query`, `storage-driver → correlation`, … — a driver

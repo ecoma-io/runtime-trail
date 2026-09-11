@@ -45,11 +45,29 @@ running, and it never turns memory mode into file-backed mode.
 ## Bounded retention in every mode
 
 Both modes are bounded by explicit budgets — record counts, byte ceilings,
-time windows — configured at startup, enforced by the store. There is no
-unbounded mode and no "grow until OOM then evict" behaviour; eviction order
-and its observability are part of the contract, because an investigator must
-be able to see what has been evicted from the window they are looking at.
-The numbers themselves live in [runtime-constraints.md](runtime-constraints.md).
+time windows — configured at startup, enforced by the store. The **record**
+that retention counts and evicts is the model's record:
+[telemetry-model.md](telemetry-model.md) owns record identity and the
+[accounted size](telemetry-model.md) that byte ceilings count; this document
+owns the eviction law, and the numbers live in
+[runtime-constraints.md](runtime-constraints.md).
+
+There is no unbounded mode and no "grow until OOM then evict" behaviour.
+Eviction order and its observability are part of the contract: eviction is
+observable where it happens (dropped-record counters) **and** downstream,
+because [query responses report gaps](query-model.md) and
+[the Investigation envelope](investigation-model.md) carries them in its
+coverage — an investigator must be able to see what has been evicted from
+the window they are looking at. "Oldest" is by **admission time** — the
+model's added metadata ([telemetry-model.md](telemetry-model.md)) — never
+by emitter event time, which out-of-order emitters would make
+unpredictable.
+
+When the file-backed store's disk is full, the runtime degrades durability
+and observability — it never blocks admission and never blocks the hot path
+([persistence rule](#persistence-is-never-on-the-ingestion-critical-path),
+[runtime-constraints.md](runtime-constraints.md)). A full disk is a logged,
+surfaced condition, never a stall.
 
 ## Why an embedded store, and which one
 
