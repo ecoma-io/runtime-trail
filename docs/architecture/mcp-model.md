@@ -38,8 +38,9 @@ Loom UI ──HTTP──► Investigation API ◄──in-process── MCP serv
    would.
 5. **Protocol concern stays in the crate.** MCP framing, tool schemas and
    capability negotiation are transport details owned by `crates/mcp`. They
-   must not leak _into_ the Investigation API (which stays protocol-agnostic)
-   and Investigation types must not leak _out_ as raw MCP content without
+   must not leak _into_ the Investigation API (whose contract is defined
+   without a transport — [wire shapes](investigation-model.md)) and
+   Investigation types must not leak _out_ as raw MCP content without
    going through the API's response shapes.
 
 ## Why MCP is a product surface, not an integration

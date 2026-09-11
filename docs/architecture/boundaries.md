@@ -42,7 +42,7 @@ layer-ingest           → model, storage
 layer-query            → model, storage
 layer-correlation      → model
 layer-api              → query, correlation, model
-layer-view             → (nothing internal)             # talks to the API over HTTP
+layer-view             → (nothing internal)             # HTTP via the server (layer-app)
 layer-agent            → api
 layer-app              → api, storage-driver, ingest, app
 ```
@@ -68,9 +68,10 @@ naming, because they are the invariants this architecture exists to keep:
 - `agent → storage`, `agent → query`, `agent → correlation`,
   `agent → model`, `agent → ingest` — MCP has exactly one upstream: the
   Investigation API, the same one the UI uses.
-- `api → storage-driver`, `api → ingest`, `api → view`, `api → agent`,
-  `api → app` — the Investigation layer never depends on concrete storage,
-  ingestion, or any presentation/distribution surface.
+- `api → storage`, `api → storage-driver`, `api → ingest`, `api → view`,
+  `api → agent`, `api → app` — the Investigation layer never depends on
+  storage (concrete or abstract), ingestion, or any presentation/distribution
+  surface.
 - `model → anything` — the telemetry model stays independent of storage,
   presentation and transport.
 - `storage-driver → query`, `storage-driver → correlation`, … — a driver

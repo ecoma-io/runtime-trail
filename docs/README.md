@@ -17,7 +17,9 @@ documents disagree, the authoritative home wins and the divergence is a bug.
 | [architecture/system.md](architecture/system.md)                           | Components, runtime modes, distribution surfaces                        |
 | [architecture/boundaries.md](architecture/boundaries.md)                   | Allowed dependency directions, forbidden edges, enforcement mapping     |
 | [architecture/telemetry-model.md](architecture/telemetry-model.md)         | The internal telemetry model (OTLP-faithful)                            |
-| [architecture/investigation-model.md](architecture/investigation-model.md) | Investigation API, query engine, correlation engine                     |
+| [architecture/investigation-model.md](architecture/investigation-model.md) | Investigation API and the `Investigation` envelope                      |
+| [architecture/query-model.md](architecture/query-model.md)                 | Query budgets, ordering, cursors, refuse-or-degrade policy              |
+| [architecture/correlation-model.md](architecture/correlation-model.md)     | Relation types, tiers, evidence and provenance                          |
 | [architecture/storage-model.md](architecture/storage-model.md)             | Storage abstraction, memory + embedded modes, retention                 |
 | [architecture/mcp-model.md](architecture/mcp-model.md)                     | MCP server as a peer client of the Investigation API                    |
 | [architecture/runtime-constraints.md](architecture/runtime-constraints.md) | Resource budgets (targets) and backpressure architecture                |

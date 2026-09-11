@@ -22,7 +22,10 @@ signals, and the first real population of the telemetry model.
 
 **Acceptance sketch:** an OTLP SDK configured against a locally started
 `runtime-trail` has its traces/logs/metrics queryable through the internal
-API; overload produces backpressure instead of unbounded memory growth.
+API; overload produces backpressure instead of unbounded memory growth. The
+[telemetry model](../architecture/telemetry-model.md) and
+[numeric-limit](../architecture/runtime-constraints.md) contracts are
+binding for this phase.
 
 ## Phase 2 — Investigation runtime — `planned`
 
@@ -54,7 +57,7 @@ size and startup budgets, desktop packaging for the three OSes, update story.
 Release automation stays on its own track (see [README.md](README.md)) and
 never rides on ordinary CI.
 
-## Phase 6 — Budget enforcement — `planned` (begins in Phase 0)
+## Phase 6 — Budget enforcement — `planned` (harness structure began in Phase 0 by design; measurement and CI gating are this phase's work)
 
 Resource budgets from
 [../architecture/runtime-constraints.md](../architecture/runtime-constraints.md)

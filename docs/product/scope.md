@@ -26,8 +26,8 @@ must remain independent of any presentation concern.
 
 - **Cross-signal correlation** — given a trace, find the logs and metrics that
   belong to its time window and context; given a log, find the trace it
-  belongs to when correlation fields exist; given a metric anomaly window,
-  narrow to the traces and logs inside it.
+  belongs to when correlation fields exist; given a metric window the
+  investigator flags, narrow to the traces and logs inside it.
 - **Trace waterfall / span tree** — navigate a trace as a tree and as a
   timeline; inspect any span's attributes, events and linked logs.
 - **Logs ↔ Trace navigation** — from a log record to its trace (when trace
