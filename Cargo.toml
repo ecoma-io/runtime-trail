@@ -53,3 +53,16 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Phase 1 (OTLP ingestion). `prost` is the protobuf runtime the OTLP wire
+# payloads are decoded with — OTLP is the only ingestion contract
+# (docs/product/non-goals.md), so a protobuf runtime is load-bearing, not
+# optional. `tonic` serves the OTLP/gRPC endpoint and is confined to
+# `crates/server` (layer-app) by ADR 0001: no crate outside layer-app takes a
+# transport dependency. `bytes` is the payload buffer type both edges pass
+# without copying. How OTLP message types are sourced (pre-generated crate
+# vs prost-build codegen) is decided by the ingestion unit landing them, with
+# its architectural justification in the PR.
+prost = "0.14"
+tonic = "0.14"
+bytes = "1"
