@@ -50,10 +50,10 @@ above).
 | OTLP payload ceiling                        | 4 MiB                                               | one OTLP export request; rejected non-retryably at the transport edge                                                                              |
 | Attributes per signal                       | ≤ 256                                               | per span, log record, data point, resource                                                                                                         |
 | Attributes per span event, link or exemplar | ≤ 64                                                | each carries its own attribute set                                                                                                                 |
-| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — keys and names count)                                                         |
+| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — key, entry overhead and payload all count)                                    |
 | Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                        |
 | Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                   |
-| Key-value list depth                        | ≤ 8                                                 | nested kvlist inside attribute values                                                                                                              |
+| Key-value list depth                        | ≤ 8                                                 | every value a record carries — attribute values, log bodies, exemplar filtered attributes, metric metadata                                         |
 | Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                  |
 | Series cap (active)                         | ≤ 100,000                                           | per runtime session; new series rejected with an observable counter; a slot frees when its last point is [evicted](storage-model.md)               |
 | In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal |
@@ -65,6 +65,16 @@ Byte-bounded queues are why these numbers compose: a queue holds at most
 64 MiB regardless of how large any single legal record is, so in-flight
 memory is bounded by the queue ceilings — not by a record count multiplied by
 a worst case.
+
+The retention ceilings bound **accounted** bytes, and accounted size
+deliberately over-counts record content ([telemetry-model.md](telemetry-model.md))
+— so real content residency sits under the ceiling by design, not by luck.
+On top of the ceiling stand the admission ledger's per-record entries
+([ADR 0008](../decisions/0008-admission-ledger-design.md) — bounded overhead
+per retained record, sharing ownership with the record it pins) and the
+runtime's fixed overhead; how large the real-to-accounted margin actually is
+is a measurement for [../benchmarks/README.md](../benchmarks/README.md) once
+Phase 1 lands — never an assertion made here.
 
 ## The backpressure architecture
 
