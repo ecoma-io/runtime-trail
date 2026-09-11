@@ -1,0 +1,20 @@
+# `moon` project for the Storage Abstraction crate. Tasks are `cache: false`
+# on purpose — see the comment in crates/telemetry-model/moon.yml.
+language: rust
+layer: library
+stack: backend
+tags:
+  - layer-storage
+tasks:
+  lint:
+    script: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+    options:
+      cache: false
+  typecheck:
+    command: cargo check --locked --all-targets
+    options:
+      cache: false
+  test:
+    command: bash $MOON_WORKING_DIR/scripts/cargo-test.sh
+    options:
+      cache: false

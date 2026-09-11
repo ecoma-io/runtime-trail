@@ -1,0 +1,24 @@
+{
+  "projects": {
+    "declared": [
+      {
+        "name": "canary-core",
+        "root": "core",
+        "tags": ["layer-correlation"]
+      },
+      {
+        "name": "canary-driver",
+        "root": "driver",
+        "tags": ["layer-storage-driver"]
+      }
+    ]
+  },
+  "coverage": {
+    "exempt": [
+      {
+        "path": "module-boundaries.config.mjs",
+        "reason": "The boundary law of this fixture workspace, owned by no project"
+      }
+    ]
+  }
+}

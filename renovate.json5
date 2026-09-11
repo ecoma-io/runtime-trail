@@ -1,0 +1,52 @@
+// This repo's dependency updates run through Renovate, covering three
+// ecosystems: npm/pnpm (root package.json + pnpm-lock.yaml — the workspace has
+// exactly one publishable-surface manifest, apps/web's, and dev deps live at
+// the root), github-actions (every `uses:` in .github/workflows), and cargo
+// (the workspace Cargo.toml files, auto-detected by Renovate's cargo manager).
+//
+// Activation: this file alone does nothing. Renovate only runs once the
+// official Renovate GitHub App (Mend) is installed on this repo by someone
+// with org admin rights — https://github.com/apps/renovate. Chosen over
+// self-hosting Renovate as a scheduled GitHub Actions workflow because a
+// self-hosted run needs its own PAT/App-token secret to let its PRs trigger
+// this repo's required CI checks (the default GITHUB_TOKEN cannot trigger
+// other workflows, so CI would need manual "Approve workflows to run" on
+// every single Renovate PR) — the GitHub App has no such gap, its PRs trigger
+// CI exactly like a human's. This is the same decision ecoma made, for the
+// same reason.
+//
+// helpers:pinGitHubActionDigests is load-bearing beyond convenience:
+// `.github/semgrep/workflows.yaml` blocks any `uses:` that is not a full
+// commit SHA, so an unpinned action bump would fail CI instead of landing.
+// The preset makes Renovate write the SHA (keeping the `# vX.Y.Z` comment
+// current), which is the only way a bump can pass the gate it feeds.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  timezone: "UTC",
+  // Weekly, not continuous — this is a small, single-maintainer, pre-release
+  // project; a steady drip of PRs several times a day would just be noise.
+  schedule: ["before 6am on monday"],
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 6am on monday"],
+  },
+  // Must match this repo's commitlint gate (commitlint.config.mjs: type
+  // `chore`, scope from scope-enum). `deps` is declared for exactly this
+  // kind of change — a dependency bump that spans root manifest, lockfile,
+  // workflows and Cargo.toml has no narrower cover, and Renovate commits
+  // span those. Verified against scope-enum: `deps` is in it, `workspace`
+  // (ecoma's choice) is not.
+  semanticCommits: "enabled",
+  semanticCommitType: "chore",
+  semanticCommitScope: "deps",
+  packageRules: [
+    {
+      // Docker base images in the Dockerfile: pin by digest so the image
+      // cannot change under a rebuild. Renovate updates tag and digest
+      // together, keeping the tag human-readable in the comment beside it.
+      matchManagers: ["docker"],
+      pinDigests: true,
+    },
+  ],
+}

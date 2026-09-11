@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "$comment": "One component, the repository root. Nothing ships anywhere yet, so the release type is `simple`: changelog and tag only, no version written into any file — there is no version-bearing file to write. `include-component-in-tag` keeps the tag bare `vX.Y.Z`. The title pattern is pinned scopeless on purpose, not as a style choice: release-please's default is `chore${scope}: release${component} ${version}` and it fills `${scope}` with the TARGET BRANCH — so a Release PR would arrive titled `chore(main): release 0.1.0`, and `main` is not one of the scopes commitlint.config.mjs declares because it is not an area of the code at all. The tempting fix — adding `main` to scope-enum — buys the merge by making the scope list mean something other than what it means. The pattern matters twice over: it is the PR title AND the commit message release-please writes (verified in release-please's own source: the commit message is the title string), and ci.yml runs commitlint over every pull-request commit, release PRs included. Scopeless `chore: release 0.1.0` passes; every restatement of the default fails.",
+  "release-type": "simple",
+  "include-component-in-tag": false,
+  "pull-request-title-pattern": "chore: release${component} ${version}",
+  "packages": {
+    ".": {}
+  }
+}

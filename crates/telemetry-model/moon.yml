@@ -1,0 +1,24 @@
+# `moon` project for the Telemetry Model crate.
+#
+# Every cargo task is `cache: false` on purpose: cargo's own target directory
+# and lockfile are the cache of record, and a moon-cached task that misses an
+# input (a workspace-level dependency change, a lint config) would report a
+# stale verdict as green. Slow and honest beats fast and wrong.
+language: rust
+layer: library
+stack: backend
+tags:
+  - layer-model
+tasks:
+  lint:
+    script: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+    options:
+      cache: false
+  typecheck:
+    command: cargo check --locked --all-targets
+    options:
+      cache: false
+  test:
+    command: bash $MOON_WORKING_DIR/scripts/cargo-test.sh
+    options:
+      cache: false

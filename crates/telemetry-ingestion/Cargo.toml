@@ -1,0 +1,16 @@
+[package]
+name = "runtime-trail-telemetry-ingestion"
+description = "OTLP ingestion: receiving OpenTelemetry data with admission control and backpressure."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-storage = { workspace = true }
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true

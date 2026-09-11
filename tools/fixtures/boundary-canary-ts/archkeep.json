@@ -1,0 +1,24 @@
+{
+  "projects": {
+    "declared": [
+      {
+        "name": "canary-view",
+        "root": "view",
+        "tags": ["layer-view"]
+      },
+      {
+        "name": "canary-storage",
+        "root": "storage",
+        "tags": ["layer-storage"]
+      }
+    ]
+  },
+  "coverage": {
+    "exempt": [
+      {
+        "path": "module-boundaries.config.mjs",
+        "reason": "The boundary law of this fixture workspace, owned by no project"
+      }
+    ]
+  }
+}

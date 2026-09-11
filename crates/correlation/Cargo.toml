@@ -1,0 +1,15 @@
+[package]
+name = "runtime-trail-correlation"
+description = "The Correlation Engine: the one place that knows how logs, traces and metrics relate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true

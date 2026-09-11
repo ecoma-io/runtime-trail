@@ -1,0 +1,39 @@
+# Rust — the workspace builds into the root `target/`. A root-level entry is
+# deliberate: tooling that reads only the root ignore file (Prettier) must not
+# walk build output.
+/target/
+
+# Tauri regenerates the capability ACL manifests and config schemas on every
+# build (`apps/desktop/src-tauri/build.rs`); they are build output, not source,
+# and tracking them would fight Prettier and churn on every Tauri bump.
+apps/desktop/src-tauri/gen/schemas/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# moon
+.moon/cache/
+
+# Test runners
+test-results/
+playwright-report/
+blob-report/
+
+# Editors and OS
+.DS_Store
+*.local
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+
+# Agent hosts — the shared settings are tracked; local overrides are not.
+.claude/settings.local.json
+.claude/worktrees/
+.claude/plans/
+.claude/tmp/
+
+# Benchmark raw runs (summaries may be committed deliberately)
+scripts/bench/results/raw/

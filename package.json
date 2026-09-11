@@ -1,0 +1,49 @@
+{
+  "name": "runtime-trail",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A local developer observability and investigation runtime.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ecoma-io/runtime-trail"
+  },
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=12"
+  },
+  "scripts": {
+    "format": "prettier --write --ignore-unknown .",
+    "format:check": "prettier --check --ignore-unknown .",
+    "lint": "pnpm exec moon run :lint",
+    "typecheck": "pnpm exec moon run :typecheck",
+    "test": "pnpm exec moon run :test",
+    "build": "pnpm exec moon run web:build server:build",
+    "arch": "archkeep check",
+    "arch:canary": "node tools/check-arch-canary.mjs",
+    "sync-skills": "node scripts/sync-skills.mjs --from ../archkeep/skills",
+    "check-skills": "node scripts/check-skills.mjs",
+    "check-docs-links": "node scripts/check-docs-links.mjs",
+    "verify": "bash scripts/verify-local.sh",
+    "moon": "moon"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.1.0",
+    "@commitlint/config-conventional": "^20.1.0",
+    "@ecoma-io/archkeep": "0.28.1",
+    "@eslint/js": "^10.0.1",
+    "@moonrepo/cli": "^2.5.4",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-vue": "^10.10.0",
+    "eslint-plugin-vuejs-accessibility": "^2.6.0",
+    "github-slugger": "^2.0.0",
+    "globals": "^16.0.0",
+    "lefthook": "^2.0.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.69.0"
+  }
+}

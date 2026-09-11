@@ -1,0 +1,36 @@
+# Everything the two build stages do not COPY. The point is not tidiness: the
+# build context is what `docker build` uploads, and a context that carries the
+# local toolchain output (target/ alone is gigabytes) makes every image build
+# pay for it — and a context that carries secrets hands them to every
+# `ADD`/`COPY` far too easily. Sources and manifests travel; everything else
+# stays behind.
+
+# Build output and local state
+target/
+**/node_modules/
+**/dist/
+coverage/
+.moon/cache/
+scripts/bench/results/
+
+# Version control and CI — the image builds FROM the checkout, not FROM git
+.git/
+.github/
+.claude/
+.agents/
+.codex/
+.opencode/
+
+# Docs, gates and fixtures — none of it compiles into the image
+docs/
+tools/
+scripts/
+*.md
+.lefthook.yml
+lefthook.yml
+commitlint.config.mjs
+eslint.config.mjs
+module-boundaries.config.mjs
+renovate.json5
+.prettierignore
+.eslintignore

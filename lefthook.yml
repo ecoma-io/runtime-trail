@@ -1,0 +1,40 @@
+# Git hooks. The editor/agent gates (Claude Code, Codex, OpenCode) call the
+# same scripts under scripts/editor-hooks/ — one implementation of every
+# gate, three thin hosts. Architecture checking is deliberately NOT in
+# pre-commit: `pnpm arch` judges the whole workspace, not staged files, so it
+# belongs to pre-push and CI (see AGENTS.md, "The boundary law is
+# mechanical").
+pre-commit:
+  commands:
+    format:
+      glob: "*.{js,mjs,cjs,ts,vue,json,jsonc,yml,yaml,md,css,html}"
+      run: pnpm exec prettier --check {staged_files}
+    lint:
+      glob: "*.{js,mjs,cjs,ts,vue}"
+      run: pnpm exec eslint --no-warn-ignored {staged_files}
+    rustfmt:
+      glob: "*.rs"
+      run: cargo fmt -- {staged_files}
+    vendored-skills:
+      # The arch-* skills are vendored byte-identical to the pinned archkeep
+      # release; a hand-edit is caught here, at the only moment it can still
+      # be an accident.
+      run: pnpm check-skills
+
+commit-msg:
+  commands:
+    commitlint:
+      run: pnpm exec commitlint --edit {1}
+
+pre-push:
+  commands:
+    arch:
+      run: pnpm arch
+    arch-canary:
+      run: pnpm arch:canary
+    typecheck:
+      run: pnpm exec moon run :typecheck --query 'project!=desktop'
+    test:
+      run: pnpm exec moon run :test --query 'project!=desktop'
+    desktop:
+      run: bash scripts/pre-push-desktop.sh

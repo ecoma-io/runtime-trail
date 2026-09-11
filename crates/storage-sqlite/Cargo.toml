@@ -1,0 +1,16 @@
+[package]
+name = "runtime-trail-storage-sqlite"
+description = "The embedded file-backed storage mode (SQLite), selected only when the user asks for persistence."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-storage = { workspace = true }
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true

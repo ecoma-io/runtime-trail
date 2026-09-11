@@ -1,0 +1,24 @@
+# `moon` project for the web surface. All checks run from this directory so
+# the root eslint/vue-tsc/vitest configs resolve against apps/web/tsconfig.json.
+language: typescript
+layer: application
+stack: frontend
+tags:
+  - layer-view
+tasks:
+  lint:
+    command: pnpm exec eslint .
+    options:
+      cache: false
+  typecheck:
+    command: pnpm exec vue-tsc --noEmit
+    options:
+      cache: false
+  test:
+    command: pnpm exec vitest run
+    options:
+      cache: false
+  build:
+    command: pnpm exec vite build
+    options:
+      cache: false

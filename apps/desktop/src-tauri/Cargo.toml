@@ -1,0 +1,23 @@
+[package]
+name = "runtime-trail-desktop"
+description = "The desktop shell: a thin Tauri wrapper around the same native core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "runtime_trail_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+runtime-trail-server = { workspace = true }
+tauri = { version = "2", features = [] }
+
+[lints]
+workspace = true

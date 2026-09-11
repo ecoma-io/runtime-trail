@@ -1,0 +1,13 @@
+# Moonrepo toolchain configuration.
+#
+# Versions mirror the repository's own pins (.node-version and
+# package.json#packageManager); moon verifies the ambient tool against them
+# before running TypeScript tasks. Keep the three in sync in one commit.
+node:
+  version: "24.16.0"
+
+pnpm:
+  version: "12.3.4"
+
+javascript:
+  packageManager: pnpm

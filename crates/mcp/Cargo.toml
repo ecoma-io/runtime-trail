@@ -1,0 +1,15 @@
+[package]
+name = "runtime-trail-mcp"
+description = "The MCP server: the AI-agent surface, a peer of the UI over the same Investigation API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-investigation = { workspace = true }
+
+[lints]
+workspace = true

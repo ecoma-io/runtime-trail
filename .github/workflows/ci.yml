@@ -1,0 +1,267 @@
+name: CI
+
+on:
+  # Unfiltered, including stacks pointed at a feature branch: a `branches:
+  # [main]` filter would skip CI on a pull request stacked on another one, and
+  # a pull request reviewed with no evidence at all is the thing this file
+  # exists to prevent.
+  pull_request:
+  # The merge queue's own event. The queue builds a temporary ref (main plus
+  # the entries ahead of this one) and waits for the required checks to report
+  # on that ref; a workflow that does not run there reports nothing and the
+  # entry times out. The queue is also the only place a semantic conflict
+  # between two independently-green pull requests can surface.
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # No `schedule:` here, unlike some of this organisation's other
+  # repositories, and that is a decision rather than an omission: a nightly
+  # exists to run what per-change selection skipped. Every job below runs the
+  # whole workspace on every trigger — there is no selection to miss with, so
+  # a nightly run would only re-prove what every pull request just proved.
+  # `analysis.yml` keeps a weekly cron, because its analysers update their own
+  # query packs and can surface findings against code that never changed.
+
+# Every job here only reads the repository and runs local checks — none call
+# the GitHub API or write anything back — so contents: read is the ceiling.
+# Each job that uploads anything (SARIF, artifacts) states its own extra
+# write at job level, which REPLACES this block rather than adding to it.
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the in-flight run for it. A push to
+# main gets a group of its own per commit, so a newer commit cannot cancel an
+# older one that is still queued (cancel-in-progress only spares runs that
+# have already started).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Moon launches one process per task up to the host CPU count; left at the
+# default, a 16-core runner starts every crate's clippy at once and the
+# processes fight over cargo's build lock. (Same cap `pnpm verify` assumes on
+# a laptop; measured organisation-wide in loom's CI.)
+env:
+  MOON_CONCURRENCY: "4"
+
+jobs:
+  # The whole local gate, exactly the checks `pnpm verify` runs — with the one
+  # conditional flipped: locally the desktop checks skip when the webview
+  # libraries are missing, here they are installed and always run. There is no
+  # "affected" selection anywhere: the workspace is twelve projects and the
+  # honest gate is the whole tree.
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Full history because the commit-message gate diffs a pull request
+      # against its base, not just the tip.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Nothing here pushes or fetches again, so checkout's write of the
+          # job token into .git/config has no reason to outlive the clone.
+          persist-credentials: false
+
+      # Reads the pnpm version from `packageManager` in package.json, so the
+      # runner uses the same pnpm a contributor's Corepack fetches.
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      # The Rust toolchain for the eleven crate projects; the MSRV itself is
+      # enforced by `rust-version` in the workspace Cargo.toml.
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      # The crate registry and `target/` are the whole cost of the Rust lane;
+      # keyed on the lockfile by the action itself.
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: ". -> target"
+
+      # Tauri links GTK and WebKitGTK on Linux and needs their development
+      # headers to compile, so without this the desktop lane dies in
+      # `gdk-sys` before reaching a line of our code. Keyed off any
+      # `tauri.conf.json` in the tree — derived, not a hand-kept list of
+      # desktop apps.
+      - name: Install the Tauri system libraries (Linux)
+        if: hashFiles('**/tauri.conf.json') != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev
+
+      # Moon resolves the node/pnpm versions `.moon/toolchains.yml` pins and
+      # installs them under ~/.proto regardless of what the setup actions
+      # above put on PATH. The tree is a pure function of that file plus the
+      # moon CLI, so the key is exact — no restore-keys to hand a bumped run
+      # a tree it would then extend forever, and no `github.sha` because a
+      # hit has nothing to advance.
+      - name: Restore moon's toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.proto/tools
+            ~/.proto/plugins
+            ~/.proto/shims
+            ~/.proto/bin
+            ~/.moon/plugins
+          key: moon-toolchain-${{ runner.os }}-${{ hashFiles('.moon/toolchains.yml', 'pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Every branch commit reaches main verbatim — under merge-commit merging
+      # as the SAME object, through the merge's second parent — and the local
+      # commit-msg hook cannot see amended or rebased history, so the gate
+      # re-runs here per pull-request commit. Merge commits are skipped by
+      # commitlint's own defaults: nobody authors a merge by hand.
+      # Release Please's pull requests are held to this too, which is why its
+      # title pattern is pinned scopeless in release-please-config.json — the
+      # commit message it writes IS the pull request title.
+      - name: Commit messages (Conventional Commits + scope enum)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: pnpm exec commitlint --from "origin/$BASE_REF" --to HEAD
+
+      # Prettier's verdict is a pure function of each file's own bytes: merging
+      # other pull requests into this one cannot unformat a file that was
+      # formatted, so the merge-queue run skips it. Everything below can change
+      # under a merge — which is the entire reason the queue exists.
+      - name: Check formatting
+        if: github.event_name != 'merge_group'
+        run: pnpm format:check
+
+      # lint + typecheck + test across every moon project (the eleven crates
+      # and the web app), then both build tasks. The desktop projects run here
+      # too, because the webview libraries above are installed.
+      - name: Lint, typecheck, test, build
+        run: pnpm exec moon run :lint :typecheck :test web:build server:build
+
+  # The boundary law, on the whole tree, on every trigger — never scoped to a
+  # diff, because a violation is a fact about the graph, not about the files
+  # that happened to change. The canaries prove the gate can still bite: each
+  # fixture is a separate archkeep workspace that MUST fail with one exact
+  # violation, and the run fails if either the bite or the cleanliness is gone.
+  architecture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Module boundaries (archkeep, whole workspace)
+        run: pnpm arch
+      - name: Boundary canaries (the law must be able to bite)
+        run: pnpm arch:canary
+
+  # The two doc gates are workspace-wide by nature — a reference from one file
+  # to another breaks from either side — and the vendored skills gate is a
+  # hash comparison against the pinned archkeep release. Small, cheap, and
+  # separate so a docs failure names itself instead of drowning in the build
+  # job's log.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Docs references resolve
+        run: pnpm check-docs-links
+      - name: Vendored skills match the pinned archkeep release
+        run: pnpm check-skills
+
+  # The image is built and smoke-run on every pull request: the container is
+  # part of the foundation's contract (the core boots with no database and
+  # answers /healthz), and a contract that is only tested at release time is
+  # not one. The smoke test is the two endpoints the server already serves.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image
+        run: docker build --tag runtime-trail:ci .
+      - name: Boot the core and answer both endpoints
+        run: |
+          docker run --detach --name smoke --publish 8599:8599 runtime-trail:ci
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:8599/healthz \
+              && curl --fail --silent --show-error http://127.0.0.1:8599/version; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the container never answered /healthz and /version within 30s"
+          exit 1
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs smoke
+      - name: Clean up the container
+        if: always()
+        run: docker rm --force --volumes smoke
+
+  # The single fixed-name check for branch protection. A job named directly in
+  # a ruleset pins its own name; gating on this aggregate instead keeps one
+  # stable name while jobs above are added or renamed, and makes a job that is
+  # never added to `needs` below impossible to leave ungated.
+  #
+  # `if: always()`, not `!cancelled()`: a required check that ends *skipped*
+  # counts as satisfied by branch protection, which is the hole this job
+  # exists to close.
+  ci-gate:
+    name: ci-gate
+    needs: [checks, architecture, docs, docker]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # An ALLOW-list: name the one result that means "safe" and fail on
+      # everything else. The deny-list shape this replaced (contains(...,
+      # 'failure') || ... 'cancelled' || ... 'skipped') went green over a red
+      # pipeline in this organisation when a dependency failed at Set up job
+      # during an outage and `needs` carried no recognisable result at all —
+      # a state the deny-list never named. The step also runs unconditionally:
+      # a step that decides whether to run is a step that can decline to.
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs results: ${RESULTS:-<empty>}"
+          if [ -z "$RESULTS" ]; then
+            echo "::error::ci-gate got no result from its dependencies. Refusing to pass."
+            exit 1
+          fi
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required job reported '$result' rather than success."
+              exit 1
+            fi
+          done
+          echo "Every required job succeeded."

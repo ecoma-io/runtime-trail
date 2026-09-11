@@ -1,0 +1,24 @@
+# Moonrepo workspace. Project discovery is an explicit map — nothing is
+# inferred from globs, so a new module must be added here, to
+# module-boundaries.config.mjs, and to commitlint.config.mjs in one commit.
+#
+# `toolchains.yml` is deliberately absent: the Rust toolchain is the ambient
+# stable toolchain (no rust-toolchain.toml by org convention), and Node/pnpm
+# are pinned by .node-version and package.json#packageManager.
+vcs:
+  client: git
+  defaultBranch: main
+
+projects:
+  telemetry-model: crates/telemetry-model
+  storage: crates/storage
+  storage-memory: crates/storage-memory
+  storage-sqlite: crates/storage-sqlite
+  query: crates/query
+  correlation: crates/correlation
+  investigation: crates/investigation
+  telemetry-ingestion: crates/telemetry-ingestion
+  mcp: crates/mcp
+  server: crates/server
+  web: apps/web
+  desktop: apps/desktop/src-tauri

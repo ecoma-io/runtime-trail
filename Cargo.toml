@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/telemetry-model",
+    "crates/telemetry-ingestion",
+    "crates/correlation",
+    "crates/query",
+    "crates/investigation",
+    "crates/storage",
+    "crates/storage-memory",
+    "crates/storage-sqlite",
+    "crates/mcp",
+    "crates/server",
+    "apps/desktop/src-tauri",
+]
+
+# The org's Rust lint bar, inherited by every crate via `[lints] workspace =
+# true`. A crate that genuinely needs `unsafe` must write its own `[lints]`
+# table — a visible diff decision, never a silent one.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# Edition 2024 stabilised in Rust 1.85 — that fact is the floor, not a number
+# someone remembered. Contributors and CI run `stable`; this is the
+# compatibility contract. See docs/decisions/0001-runtime-language.md.
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/ecoma-io/runtime-trail"
+
+[workspace.dependencies]
+runtime-trail-telemetry-model = { path = "crates/telemetry-model" }
+runtime-trail-correlation = { path = "crates/correlation" }
+runtime-trail-query = { path = "crates/query" }
+runtime-trail-investigation = { path = "crates/investigation" }
+runtime-trail-storage = { path = "crates/storage" }
+runtime-trail-storage-memory = { path = "crates/storage-memory" }
+runtime-trail-storage-sqlite = { path = "crates/storage-sqlite" }
+runtime-trail-telemetry-ingestion = { path = "crates/telemetry-ingestion" }
+runtime-trail-mcp = { path = "crates/mcp" }
+runtime-trail-server = { path = "crates/server" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

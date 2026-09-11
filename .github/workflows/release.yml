@@ -1,0 +1,78 @@
+name: Release
+
+# Releasing, at this stage of the repository, is exactly one thing: release-
+# please watches `main` and keeps one pull request open holding the next
+# version and the changelog it derived from the conventional commits since the
+# last tag. Merging it tags `vX.Y.Z` and cuts the GitHub release.
+#
+# There is deliberately no publish job here yet. Nothing this repository
+# ships anywhere — the crates are `publish = false`, the npm root is private,
+# and the container registry comes with the first deployment story. The
+# release train is laid now so that version history starts at the foundation
+# instead of starting later and back-filling it; the publish jobs are added by
+# the change that introduces a destination, each guarded the way this
+# organisation's other repositories guard theirs.
+#
+# The version-bearing surface is empty on purpose (release-type "simple" in
+# release-please-config.json: changelog and tag, no version written into any
+# file). When an artifact exists, its manifest joins the config's `packages`
+# and the type changes with it — in the same change, reviewed together.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    # Hoisted so the App-token step below has something its `if:` is allowed
+    # to read — GitHub's secrets guide is flat that secrets cannot be
+    # referenced directly in `if:` conditionals, and the runtime agrees (a
+    # direct read takes the job to a startup failure with zero jobs and no
+    # log). Only the id is lifted: the private key is passed straight into
+    # the action's `with:`, where the `secrets` context IS available.
+    env:
+      RELEASE_APP_ID: ${{ secrets.ECOMA_APP_ID }}
+    outputs:
+      # The pair downstream publish jobs will steer on, kept here so the day
+      # one lands it reads `steps.prepare.outputs.released` exactly like this
+      # organisation's other release workflows do. release-please emits the
+      # un-prefixed outputs for a component at the repository ROOT, which is
+      # what release-please-config.json declares.
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # The escape hatch, ON. GitHub documents that events raised with
+      # `GITHUB_TOKEN` do not start new workflow runs, which leaves a release
+      # pull request with no `ci-gate` and no `analysis-gate` — the two checks
+      # required to merge it — sitting at `mergeable_state: blocked` with
+      # nothing red to open. Measured across this organisation's releases
+      # (ecoma, archkeep): every required run on a release pull request
+      # arrives `action_required` with zero jobs, and every release needed a
+      # hand on run attempt 2 until the App token landed. An App token is an
+      # ordinary actor; its pull request triggers CI the way a contributor's
+      # does. The credentials are organisation secrets (ECOMA_APP_ID,
+      # ECOMA_APP_KEY) shared by every repository that runs this arrangement;
+      # where they are absent the fallback token still maintains the release
+      # pull request — it just cannot see CI run on it unattended.
+      - name: Mint a GitHub App token
+        id: app-token
+        if: env.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.ECOMA_APP_ID }}
+          private-key: ${{ secrets.ECOMA_APP_KEY }}
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}

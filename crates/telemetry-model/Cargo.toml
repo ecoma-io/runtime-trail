@@ -1,0 +1,14 @@
+[package]
+name = "runtime-trail-telemetry-model"
+description = "The presentation-independent model of OpenTelemetry logs, traces and metrics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

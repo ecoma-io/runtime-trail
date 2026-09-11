@@ -1,0 +1,3 @@
+/* Loom's design tokens and base styles. Tailwind CSS v4 is CSS-first: this
+   one import is the whole styling setup. */
+@import "@ecoma-io/loom/styles/global.css";

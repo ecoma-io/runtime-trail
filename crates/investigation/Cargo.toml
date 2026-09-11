@@ -1,0 +1,17 @@
+[package]
+name = "runtime-trail-investigation"
+description = "The Investigation API: the only door to the core, shared by the UI and MCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-correlation = { workspace = true }
+runtime-trail-query = { workspace = true }
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true

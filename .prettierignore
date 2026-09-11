@@ -1,0 +1,27 @@
+# Generated and third-party files that prettier must not touch.
+pnpm-lock.yaml
+/target/
+**/dist/
+**/coverage/
+node_modules/
+
+# Vendored, byte-identity-enforced: scripts/skills-manifest.json pins the
+# hashes of the arch-* skills against the archkeep release they were synced
+# from, so one prettier pass is indistinguishable from a hand-edit — both
+# fail `pnpm check-skills`. The tree must leave this repository exactly as
+# it entered it.
+.claude/skills/
+.agents/skills/
+
+# Copied verbatim from ecoma-io/action-agents (0-line diff at copy time, so
+# the provenance stays checkable with a plain `diff` against that repo).
+# Formatting them here would be drift from upstream disguised as style.
+# The ADAPTED siblings — format-edited-file.mjs (rustfmt leg) and
+# check-docs-links.mjs (IGNORE_PREFIXES) — are NOT exempted: they have
+# already diverged on purpose.
+scripts/check-skills.mjs
+scripts/sync-skills.mjs
+scripts/editor-hooks/lint-edited-file.mjs
+scripts/editor-hooks/check-docs-links-edited-file.mjs
+scripts/editor-hooks/codex-post-tool-use.mjs
+.opencode/plugins/editor-gates.js

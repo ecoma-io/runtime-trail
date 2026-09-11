@@ -1,0 +1,27 @@
+# `moon` project for the desktop shell. The project root is the crate root
+# (apps/desktop/src-tauri), not apps/desktop, so Archkeep sees the
+# desktop→core dependency edge at <projectRoot>/Cargo.toml.
+#
+# Tasks are `cache: false` on purpose — see the comment in
+# crates/telemetry-model/moon.yml.
+#
+# Checking this crate requires the platform webview libraries (see
+# apps/desktop/README.md); CI installs them.
+language: rust
+layer: application
+stack: backend
+tags:
+  - layer-app
+tasks:
+  lint:
+    script: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+    options:
+      cache: false
+  typecheck:
+    command: cargo check --locked --all-targets
+    options:
+      cache: false
+  test:
+    command: bash $MOON_WORKING_DIR/scripts/cargo-test.sh
+    options:
+      cache: false

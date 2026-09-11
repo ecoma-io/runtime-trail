@@ -1,0 +1,26 @@
+# The pnpm workspace covers the TypeScript side only; the Rust side is one
+# Cargo workspace rooted at Cargo.toml. The two meet at `apps/web`, which the
+# desktop shell and the Docker image consume as a build artefact.
+packages:
+  - apps/*
+# @ecoma-io/archkeep is pinned exact (org convention) and fresh-published;
+# without this pnpm's release-age guard would refuse the pin on a clean clone
+# until the version aged out. Keep the pin and this exclusion in sync.
+minimumReleaseAgeExclude:
+  - "@ecoma-io/archkeep@0.28.1"
+# Explicit allow-list for install scripts (pnpm blocks them by default, and
+# a non-interactive install — CI, docker build — FAILS the install outright
+# when a dependency's scripts are left ignored, rather than warning):
+#   - lefthook: its postinstall wires the git hooks into .git/hooks/.
+#   - vue-demi: its postinstall rewrites its own dist for the installed Vue
+#     major. Ours is Vue 3, where the rewrite is the passthrough file — but
+#     letting pnpm ignore it silently is how a future Vue-major bump would
+#     ship a half-initialised dependency. Keep the allow-list complete: every
+#     "Ignored build scripts" line in an install log is one missing entry.
+# Shape note: pnpm 11 replaced onlyBuiltDependencies / neverBuiltDependencies
+# / ignoredBuiltDependencies with this `allowBuilds` map (package -> boolean)
+# and silently ignores the old keys — an old-style block here would leave a
+# fresh clone without wired git hooks while every install still "succeeds".
+allowBuilds:
+  lefthook: true
+  vue-demi: true

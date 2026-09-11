@@ -1,0 +1,7 @@
+[package]
+name = "canary-driver"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+canary-core = { path = "../core" }

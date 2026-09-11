@@ -1,0 +1,15 @@
+[package]
+name = "runtime-trail-storage"
+description = "The storage contract: what it means to keep telemetry and answer queries against it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true
