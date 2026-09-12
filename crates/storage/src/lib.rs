@@ -46,8 +46,17 @@
 //!   scan order are the same sequence — admission time, entity id as
 //!   tie-break.
 //! - **Identity ends with residency** (ADR 0008): the store's removal hook
-//!   fires per evicted record so the composition root can drop the
-//!   record's ledger identity; a re-delivery afterwards is admitted fresh.
+//!   fires per evicted record — and once more per stream whose last
+//!   resident point that record was — so the composition root can drop the
+//!   record's ledger identity and the stream's interning; a re-delivery
+//!   afterwards is admitted fresh.
+//! - **The byte ceiling counts what residency pins**: every distinct
+//!   resident stream's identity accounted size is charged to the ceiling
+//!   exactly once — added with the stream's first resident point, released
+//!   with its last — so single-point streams cannot park identity content
+//!   under a ceiling that only saw the points
+//!   ([telemetry-model.md](../../docs/architecture/telemetry-model.md),
+//!   [storage-model.md](../../docs/architecture/storage-model.md)).
 //!
 //! # The shape of the contract
 //!
@@ -101,8 +110,14 @@ mod tests {
 
     /// The residency order is a contract fact drivers and scans share, so
     /// the ordering types are part of the public surface this crate owns.
+    ///
+    /// Compile-only, and the assertion is the point: building an
+    /// [`AdmissionKey`] and a generic [`ScanPage`] over `EntityId` from the
+    /// crate root is the proof that the residency-order surface composes
+    /// for every driver and cursor. Asserting the constructor's own output
+    /// back would be a tautology, so none is made.
     #[test]
-    fn the_residency_order_is_reachable_from_the_crate_root() {
+    fn the_residency_order_types_compose_from_the_crate_root() {
         use std::num::NonZeroU64;
 
         use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, EntityId};
@@ -110,25 +125,28 @@ mod tests {
             NonZeroU64::new(1).expect("1 is nonzero"),
         ));
         let key = super::AdmissionKey::new(AdmissionTime::from_unix_nano(7), entity);
-        let page = super::ScanPage::<EntityId> {
+        let _page = super::ScanPage::<EntityId> {
             items: vec![entity],
             cursor: Some(key),
         };
-        assert_eq!(page.cursor, Some(key));
-        assert_eq!(key.admitted_at(), AdmissionTime::from_unix_nano(7));
     }
 
     /// The counters and the keep outcomes are what observability and the
     /// hand-off are typed by; both must stay value types a composition root
-    /// can report without reaching into a driver.
+    /// can report without reaching into a driver. The behavior asserted is
+    /// the outcome's own law: keeps report what the retention law removed,
+    /// every refusal reports zero.
     #[test]
-    fn the_observability_and_handoff_types_are_reachable_from_the_crate_root() {
+    fn keep_outcomes_report_their_evictions_and_refusals_report_none() {
         assert_eq!(super::StoreStats::default().total_evictions(), 0);
-        assert_eq!(super::KeepOutcome::Oversized.evicted(), 0);
         assert_eq!(super::KeepOutcome::Kept { evicted: 3 }.evicted(), 3);
+        assert_eq!(super::KeepOutcome::Kept { evicted: 0 }.evicted(), 0);
+        assert_eq!(super::KeepOutcome::Oversized.evicted(), 0);
+        assert_eq!(super::KeepOutcome::Duplicate.evicted(), 0);
         assert_eq!(
-            super::EvictionCause::AdmissionWindow,
-            super::EvictionCause::AdmissionWindow
+            super::KeepOutcome::SeriesCapReached.evicted(),
+            0,
+            "a series-cap refusal never evicts to make room"
         );
     }
 }

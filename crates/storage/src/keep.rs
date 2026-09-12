@@ -7,7 +7,9 @@
 //! I/O wait: a store that cannot keep a record under its ceilings says so in
 //! the outcome and its counters, and never stalls.
 
-use runtime_trail_telemetry_model::EntityId;
+use std::sync::Arc;
+
+use runtime_trail_telemetry_model::{EntityId, StreamIdentity};
 
 /// Why a store removed a record from residency.
 ///
@@ -52,31 +54,77 @@ pub enum KeepOutcome {
     /// alone exceeds the accounted-byte ceiling, so no amount of eviction
     /// could keep it. Counted as `StoreStats::oversized_refusals`.
     Oversized,
+    /// Refused before anything was inserted or evicted: keeping the point
+    /// would establish a **new distinct stream** while the store already
+    /// holds the series cap's worth of resident streams
+    /// ([runtime-constraints.md](../../docs/architecture/runtime-constraints.md)
+    /// owns the number; the in-memory store starts with it as
+    /// `MemoryConfig::series_cap`). The refusal is non-retryable — the
+    /// session is at its series ceiling and retrying cannot shrink it —
+    /// and it never evicts: the store removes nothing to make room for a
+    /// new series. Counted as `StoreStats::kept_out_series_cap`. A slot
+    /// frees when a stream's last point is evicted; a re-attempt of the
+    /// refused stream then admits cleanly.
+    SeriesCapReached,
 }
 
 impl KeepOutcome {
     /// How many records the retention law removed during this keep; zero
-    /// for a duplicate or an oversized refusal.
+    /// for every refusal.
     #[must_use]
     pub const fn evicted(&self) -> u64 {
         match self {
             Self::Kept { evicted } => *evicted,
-            Self::Duplicate | Self::Oversized => 0,
+            Self::Duplicate | Self::Oversized | Self::SeriesCapReached => 0,
         }
     }
 }
 
-/// The removal hook: what runs when one record leaves residency.
+/// The removal hook: what runs when one record — or one stream — leaves
+/// residency.
 ///
 /// This is the inverted dependency the eviction lifecycle needs
 /// ([ADR 0008](../../docs/decisions/0008-admission-ledger-design.md)):
 /// evicting a record must also end its ledger identity — a re-delivery
 /// afterwards is admitted fresh — and the contract must say so without
 /// naming the admission ledger's type. The composition root implements this
-/// trait over the ledger (`forget`) and hands the store the implementation;
-/// storage speaks only "an entity id left residency". The hook fires once
-/// per evicted record, after the record left residency, in eviction order.
-pub trait EvictionHook {
+/// trait over the ledger (`forget`, `release_stream`) and hands the store
+/// the implementation; storage speaks only "an entity id left residency"
+/// and "a stream's last resident point is gone".
+///
+/// # Ordering and the must-not-panic rule
+///
+/// The hook fires **after the store's own removal has completed**: indexes,
+/// shelves, the stream-residency table and the store's counters are all
+/// updated before the first hook method runs. A misbehaving hook can
+/// therefore never corrupt the store — but it runs where the composition
+/// root releases the record's ledger identity, so a panicking hook would
+/// leave identity resident after its record is gone. **A hook must not
+/// panic.** Fallibility is the composition root's to wrap: the store does
+/// not catch, and a panic propagates out of the keep after the store's own
+/// bookkeeping is complete. A caller that catches the unwind finds a
+/// consistent store whose
+/// [`StoreStats::total_evictions`](crate::StoreStats::total_evictions)
+/// exceeds [`StoreStats::hook_deliveries`](crate::StoreStats::hook_deliveries)
+/// — the divergence is observable, never silent.
+///
+/// Per removed record the store calls [`EvictionHook::evicted`] once, in
+/// eviction order (oldest first); when that removal was the stream's last
+/// resident point, it then calls [`EvictionHook::stream_released`] once for
+/// the stream — the record's hook before its stream's.
+///
+/// The hook bounds are also the store's: [`TelemetryStore`](crate::TelemetryStore)
+/// promises `Send + Sync`, which the hook field rides along with, so the
+/// trait requires it here rather than at every wiring site.
+pub trait EvictionHook: Send + Sync {
     /// The record named by `entity` was just removed from residency.
     fn evicted(&mut self, entity: EntityId);
+
+    /// The stream whose identity is handed over had its **last resident
+    /// point** removed: the store's per-stream residency count reached
+    /// zero. The identity is shared as stored — the same interned
+    /// allocation every resident point of the stream referenced (ADR 0008)
+    /// — so the composition root can release the ledger's interning by
+    /// content without a copy.
+    fn stream_released(&mut self, stream: &Arc<StreamIdentity>);
 }

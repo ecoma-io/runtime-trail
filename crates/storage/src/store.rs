@@ -49,13 +49,27 @@ pub struct PointView {
 /// - **the keep hand-off is never on I/O**: persistence never blocks
 ///   admission (memory mode trivially; a file-backed mode by design);
 /// - **the eviction hook** ([`EvictionHook`](crate::EvictionHook)) fires
-///   once per evicted record, so identity ends exactly with residency
-///   (ADR 0008).
+///   once per evicted record — and once more per stream whose last
+///   resident point that record was — so identity ends exactly with
+///   residency (ADR 0008).
+///
+/// # Threading model
+///
+/// The runtime's composition root holds one store for the whole session
+/// while ingestion, query and retention run as separate tasks: the store
+/// must survive being **moved across threads and shared behind a lock**, so
+/// the contract requires `Send + Sync` of every implementation and the
+/// [`EvictionHook`](crate::EvictionHook) it is wired with. What the bounds
+/// do **not** promise is concurrent calls: every method that touches state
+/// takes `&mut self`, so concurrent keeps serialize at the composition
+/// root's lock — the contract is single-threaded per call, thread-safe per
+/// store. The hook runs on whichever thread runs the keep, before it
+/// returns.
 ///
 /// The trait is object-safe on purpose: the composition root holds
 /// `Box<dyn TelemetryStore>` and names the concrete driver only where it
 /// wires one.
-pub trait TelemetryStore {
+pub trait TelemetryStore: Send + Sync {
     /// Hands one admitted span to the store: the admitted-then-kept
     /// pipeline's write side. The record is shared as handed in — a driver
     /// must not copy the payload the ledger already owns (ADR 0008).
@@ -146,6 +160,14 @@ mod tests {
     /// compiles only while the trait stays object-safe: a non-object-safe
     /// addition would break the one way `layer-app` is allowed to hold a
     /// store, so it is a contract break, caught here.
+    ///
+    /// Compile-only on purpose. The functions are never called: this crate
+    /// is the contract and may not name a driver to build a real store from
+    /// (ADR 0003 — only `layer-app` names concrete drivers), so the
+    /// assertion is the compilation itself — the shapes `&dyn
+    /// TelemetryStore` and `Box<dyn TelemetryStore>` exist, are owned,
+    /// moved and dropped, and are `Send + Sync` for the composition root's
+    /// task graph.
     #[test]
     fn the_contract_is_held_as_a_trait_object() {
         fn stats_of(store: &dyn TelemetryStore) -> StoreStats {
@@ -156,6 +178,9 @@ mod tests {
             drop(store); // the box is owned and dropped: the full trait-object shape
             stats
         }
-        let _ = stats_of_boxed; // referenced, so the trait-object shapes are checked
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Box<dyn TelemetryStore>>();
+        // Referenced, never called: the assertion is the compilation.
+        let _ = stats_of_boxed;
     }
 }
