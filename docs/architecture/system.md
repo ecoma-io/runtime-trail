@@ -110,8 +110,11 @@ The process shuts down honestly:
 
 ## Status
 
-**Bootstrap.** Mode selection and the full topology are target state; the
-smoke core (`/healthz`, `/version`) is real and gated. The component map
-above states the dependency directions; the composition law itself is
+**Bootstrapped core.** The smoke core (`/healthz`, `/version`) is real and
+gated, and Phase 1's sanctioned slice — OTLP/HTTP and OTLP/gRPC ingestion into
+the bounded in-memory queue, model and store — is real for the signals it
+handles (see [phases.md](../roadmap/phases.md)). Mode selection and the full
+topology are target state. The component map above states the dependency
+directions; the composition law itself is
 [boundaries.md](boundaries.md), and any PR that would give a distribution
 its own telemetry, query or storage code violates it.

@@ -20,11 +20,14 @@ Three tiers, and the difference matters:
 
 ## Current status
 
-**Bootstrap.** The repository contains the engineering foundation only:
-toolchain, architecture contracts, agent workflow, CI/CD gates, documentation
-and governance. **No telemetry capability is implemented yet** — no OTLP
-ingestion, no storage, no query/correlation, no investigation UI, no MCP tools.
-Anything stating otherwise is wrong; this section is the source of truth.
+**Phase 1 (telemetry ingestion) is in progress.** The sanctioned slice has
+landed: the telemetry model and its admission ledger, OTLP/HTTP and
+OTLP/gRPC receivers with bounded queues and backpressure gates, the bounded
+memory driver, the composition root, and the memory-path measurements. What
+does **not** yet exist: query, correlation, investigation UI, MCP tools, and
+file-backed persistence. The status authority is [phases.md](phases.md); the
+phase acceptance (traces/logs/metrics queryable through the internal API) is
+met only when the Investigation‑runtime phase lands.
 
 ## 1.0 scope
 

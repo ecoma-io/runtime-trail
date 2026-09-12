@@ -16,10 +16,13 @@ sentence, `docs/product/scope.md` the commitments, `docs/product/non-goals.md`
 the refusals. If a change makes the product closer to "hosted metrics
 platform", it is a change to those documents first and code second.
 
-**The repository is currently at Bootstrap.** The foundation commit holds the
-toolchain, the architecture law, the gates and a smoke-only core
-(a health surface, a version surface, and static UI serving when supplied).
-No telemetry is ingested, queried, or rendered.
+**The repository has landed Phase 1's sanctioned slice: telemetry ingestion.**
+The foundation commit holds the toolchain, the architecture law, the gates
+and the smoke core (a health surface, a version surface, and static UI
+serving when supplied); OTLP/HTTP and OTLP/gRPC receivers now decode into
+the telemetry model and a bounded in-memory store under backpressure. No
+telemetry is queried, correlated, or rendered yet: the Investigation API
+and every read surface are future phases.
 `docs/roadmap/phases.md` owns what lands when; do not pull a future phase's
 work into the present one, and do not ship a capability whose phase has not
 started.
