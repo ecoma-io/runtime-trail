@@ -31,11 +31,28 @@
 //! leaves no entry behind — its identity stays free, and a later in-budget
 //! delivery of the same identity admits cleanly.
 //!
-//! The ledger is the session: its assigned serials start at 1 and are not
-//! persisted. Log records and invalid-id spans get **no** ledger entry at
-//! all — with no natural identity there is nothing to collapse onto and
-//! nothing to conflict with. When the runtime evicts a record, [`AdmissionLedger::forget`]
-//! removes its ledger entry; a re-delivery afterwards is admitted fresh.
+//! The ledger is the session: its assigned serials start at the session's
+//! serial counter and are not persisted. Log records and invalid-id spans
+//! get **no** ledger entry at all — with no natural identity there is
+//! nothing to collapse onto and nothing to conflict with. When the runtime
+//! evicts a record, [`AdmissionLedger::forget`] removes its ledger entry; a
+//! re-delivery afterwards is admitted fresh. When a stream's last resident
+//! point leaves residency, [`AdmissionLedger::release_stream`] drops the
+//! interned identity.
+//!
+//! # Stream release (ADR 0008)
+//!
+//! Interning is only half of the stream lifecycle: the ledger interns a
+//! stream when its first point is admitted and must drop it when the
+//! stream's last **resident** point leaves — a fact only the store knows
+//! (it holds the per-stream residency count). The composition root
+//! completes the lifecycle by wiring the store's eviction hook to
+//! [`AdmissionLedger::forget`] and [`AdmissionLedger::release_stream`] over
+//! the same ledger: `forget` runs per evicted record, `release_stream` when
+//! the store's per-stream residency count reaches zero. Until that call
+//! arrives the interned identity stays — a stream whose points were
+//! admitted but never kept, or whose points are still resident, remains
+//! interned by design, never dropped early.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -193,6 +210,12 @@ impl AdmissionLedger {
     /// a new serial; for a span it means the natural identity is free
     /// again (and a re-delivery re-admits under the same natural id).
     /// Forgetting an id that names no remembered entry is a no-op.
+    ///
+    /// Forgetting a metric point does **not** release its stream: the
+    /// stream's interned identity stays until
+    /// [`AdmissionLedger::release_stream`] reports that the stream's last
+    /// resident point left — a fact only the store's per-stream residency
+    /// count knows.
     pub fn forget(&mut self, entity: EntityId) {
         match entity {
             EntityId::Span {
@@ -207,6 +230,29 @@ impl AdmissionLedger {
                 }
             }
         }
+    }
+
+    /// Releases one interned stream identity: the ledger's interning entry
+    /// for `stream` is dropped, so the identity's payload leaves the ledger
+    /// when the store reports the stream's last resident point gone. The
+    /// refcount behind the call is the **store's** residency count — the
+    /// ledger does not track residency itself; it interns on admission and
+    /// releases when told. Releasing a stream that was never interned, or
+    /// that is already released, is a no-op.
+    ///
+    /// A re-delivery after a release re-interns: a fresh interned payload,
+    /// the same lifecycle as a forgotten record's fresh entity id.
+    pub fn release_stream(&mut self, stream: &StreamIdentity) {
+        self.streams.remove(stream);
+    }
+
+    /// How many stream identities are currently interned — the observable
+    /// for the release lifecycle: a session that has released every stream
+    /// whose points left residency reports zero, however many streams it
+    /// has ever seen.
+    #[must_use]
+    pub fn resident_streams(&self) -> u64 {
+        u64::try_from(self.streams.len()).unwrap_or(u64::MAX)
     }
 }
 
@@ -1173,6 +1219,83 @@ mod metric_points {
         );
         assert!(fresh.assigned_serial().is_some());
         assert_eq!(ledger.points.len(), 1);
+    }
+
+    #[test]
+    fn releasing_a_stream_drops_the_interned_identity_and_a_redelivery_re_interns() {
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let interned = first.stream.expect("interned on admission");
+        assert_eq!(ledger.resident_streams(), 1, "the stream is interned");
+        assert_eq!(ledger.points.len(), 1, "the point is remembered");
+
+        // Releasing reports the stream's last resident point gone: the
+        // interning entry is dropped while the (forgotten separately) point
+        // entry is untouched by the call.
+        ledger.release_stream(&identity);
+        assert_eq!(
+            ledger.resident_streams(),
+            0,
+            "the interned identity is gone"
+        );
+        assert_eq!(
+            ledger.points.len(),
+            1,
+            "release_stream releases the stream, not the point entries"
+        );
+
+        // A re-delivery re-interns: a fresh payload under the same identity
+        // content, and the standing-point comparison still runs by content
+        // (equality never depended on the interning entry).
+        let again = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        assert_eq!(
+            again.outcome,
+            AdmissionOutcome::Collapsed { entity: standing },
+            "content equality survives a release; the point was never forgotten"
+        );
+        let re_interned = again.stream.expect("re-interned");
+        assert!(
+            !Arc::ptr_eq(&interned, &re_interned),
+            "the re-interned identity is a fresh payload, not the released one"
+        );
+        assert_eq!(ledger.resident_streams(), 1);
+    }
+
+    #[test]
+    fn releasing_an_uninterned_stream_is_a_no_op() {
+        let mut ledger = ledger();
+        let identity = stream_identity(StreamKind::Gauge, None);
+        ledger.release_stream(&identity);
+        assert_eq!(ledger.resident_streams(), 0);
+        let admitted = ledger.admit_metric_point(&identity, gauge_point(1, 1));
+        assert_admitted(&admitted);
+        assert_eq!(ledger.resident_streams(), 1);
+    }
+
+    #[test]
+    fn forgetting_a_point_leaves_its_stream_interned_until_release() {
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let entity = assert_admitted(&first);
+        ledger.forget(entity);
+        assert!(ledger.points.is_empty(), "the point's ledger entry is gone");
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "only the store's refcount knows the stream left residency; \
+             forget alone releases nothing"
+        );
+        ledger.release_stream(&identity);
+        assert_eq!(ledger.resident_streams(), 0, "released now");
     }
 
     #[test]

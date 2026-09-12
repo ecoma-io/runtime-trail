@@ -426,6 +426,23 @@ impl Accounted for crate::metrics::MetricPoint {
     }
 }
 
+impl Accounted for crate::metrics::StreamIdentity {
+    /// The identity's own content: the resource, the scope and the metric
+    /// name it carries. A stream's points reference this through one shared
+    /// allocation (ADR 0008's interning), so whoever charges residency for a
+    /// stream charges this **once per resident stream** — never per point —
+    /// exactly like the model charges an `Arc`ed payload in full wherever
+    /// it appears. `docs/architecture/telemetry-model.md` ("Byte ceilings
+    /// count what residency pins") owns that rule.
+    fn accounted_size(&self) -> usize {
+        STRUCTURE_FIXED_BYTES
+            + self.resource.accounted_size()
+            + self.scope.accounted_size()
+            + heap_string_bytes(&self.name)
+            + 1 // kind (monotonic included), temporality included
+    }
+}
+
 impl Accounted for crate::metrics::MetricStream {
     fn accounted_size(&self) -> usize {
         STRUCTURE_FIXED_BYTES
@@ -696,6 +713,44 @@ mod tests {
             + 4 * slot_bytes::<u64>()
             + 2 * slot_bytes::<Float>();
         assert_eq!(point.accounted_size(), expected);
+    }
+
+    #[test]
+    fn stream_identity_accounting_covers_resource_scope_and_name() {
+        let identity = crate::metrics::StreamIdentity {
+            resource: empty_resource(),
+            scope: empty_scope(),
+            name: "requests".to_owned(),
+            kind: crate::metrics::StreamKind::Sum { monotonic: true },
+            temporality: Some(crate::metrics::Temporality::Cumulative),
+        };
+        let expected = STRUCTURE_FIXED_BYTES
+            + empty_resource().accounted_size()
+            + empty_scope().accounted_size()
+            + heap_string_bytes("requests")
+            + 1; // kind, temporality included
+        assert_eq!(identity.accounted_size(), expected);
+        // The count moves with every variable-length identity part: one
+        // more name byte, one more accounted byte; an attribute added to
+        // the resource charges its full keyed-entry cost.
+        let longer = crate::metrics::StreamIdentity {
+            name: "requests2".to_owned(),
+            ..identity.clone()
+        };
+        assert_eq!(longer.accounted_size(), expected + 1);
+        let attributed = crate::metrics::StreamIdentity {
+            resource: Resource {
+                attributes: attribute("service.name", "checkout"),
+                schema_url: None,
+                dropped_attributes_count: 0,
+            },
+            ..identity
+        };
+        assert_eq!(
+            attributed.accounted_size(),
+            expected + (ATTRIBUTE_MAP_NODE_BYTES + KEYED_ENTRY_BYTES + "service.name".len() + 8),
+            "the resource's attributes are identity content, charged in full"
+        );
     }
 
     #[test]
