@@ -52,7 +52,11 @@ pub enum KeepOutcome {
     Duplicate,
     /// Refused before anything was evicted: the record's accounted size
     /// alone exceeds the accounted-byte ceiling, so no amount of eviction
-    /// could keep it. Counted as `StoreStats::oversized_refusals`.
+    /// could keep it. Counted as `StoreStats::oversized_refusals`. Nothing
+    /// was inserted, so the store reports the refused record through
+    /// [`EvictionHook::keep_refused`] — its ledger identity ends with the
+    /// refusal and a re-delivery re-admits fresh; the ceiling refuses this
+    /// delivery, it does not blacklist the record.
     Oversized,
     /// Refused before anything was inserted or evicted: keeping the point
     /// would establish a **new distinct stream** while the store already
@@ -62,9 +66,15 @@ pub enum KeepOutcome {
     /// `MemoryConfig::series_cap`). The refusal is non-retryable — the
     /// session is at its series ceiling and retrying cannot shrink it —
     /// and it never evicts: the store removes nothing to make room for a
-    /// new series. Counted as `StoreStats::kept_out_series_cap`. A slot
-    /// frees when a stream's last point is evicted; a re-attempt of the
-    /// refused stream then admits cleanly.
+    /// new series. Counted as `StoreStats::kept_out_series_cap`. Nothing
+    /// was inserted, so the store reports the refused record through
+    /// [`EvictionHook::keep_refused`] and its ledger identity ends with the
+    /// refusal. That is what keeps the documented re-attempt reachable: a
+    /// slot still frees only when a stream's last resident point is
+    /// evicted, but the refused delivery's ledger entry is gone, so a
+    /// re-delivery re-admits as a fresh admission — not a collapse onto an
+    /// identity whose record never entered residency — and the re-attempt
+    /// is measured against the cap as it stands then.
     SeriesCapReached,
     /// Refused before anything was inserted or evicted: the stream
     /// identity the point arrives with carries an accounted size that
@@ -75,7 +85,13 @@ pub enum KeepOutcome {
     /// names the ceiling it was measured against and the identity's
     /// accounted size. Non-retryable — the identity is payload content;
     /// retrying cannot shrink it — and it never evicts. Counted as
-    /// `StoreStats::identity_over_ceiling_refusals`.
+    /// `StoreStats::identity_over_ceiling_refusals`. Nothing was inserted,
+    /// so the store reports the refused record through
+    /// [`EvictionHook::keep_refused`]: the refusal is final for THIS
+    /// delivery, never for the identity forever — the ledger identity ends
+    /// with the refusal, so a re-delivery re-admits fresh (and, while the
+    /// ceiling stands, refuses again — honestly, and leaving nothing
+    /// behind).
     IdentityOverCeiling {
         /// The accounted-byte ceiling the keep was measured against.
         ceiling: u64,
@@ -99,38 +115,44 @@ impl KeepOutcome {
     }
 }
 
-/// The removal hook: what runs when one record — or one stream — leaves
-/// residency.
+/// The lifecycle hook: what runs when a record ends its residency — or
+/// never enters it.
 ///
-/// This is the inverted dependency the eviction lifecycle needs
+/// This is the inverted dependency the identity lifecycle needs
 /// ([ADR 0008](../../docs/decisions/0008-admission-ledger-design.md)):
-/// evicting a record must also end its ledger identity — a re-delivery
-/// afterwards is admitted fresh — and the contract must say so without
-/// naming the admission ledger's type. The composition root implements this
-/// trait over the ledger (`forget`, `release_stream`) and hands the store
-/// the implementation; storage speaks only "an entity id left residency"
-/// and "a stream's last resident point is gone".
+/// a record's ledger identity must end wherever the record's residency
+/// story ends — a re-delivery afterwards is admitted fresh — and the
+/// contract must say so without naming the admission ledger's type. The
+/// composition root implements this trait over the ledger (`forget`,
+/// `release_stream`) and hands the store the implementation; storage
+/// speaks only "an entity id left residency", "a stream's last resident
+/// point is gone", and "a keep was refused with nothing inserted".
 ///
 /// # Ordering and the must-not-panic rule
 ///
-/// The hook fires **after the store's own removal has completed**: indexes,
-/// shelves, the stream-residency table and the store's counters are all
-/// updated before the first hook method runs. A misbehaving hook can
-/// therefore never corrupt the store — but it runs where the composition
-/// root releases the record's ledger identity, so a panicking hook would
-/// leave identity resident after its record is gone. **A hook must not
-/// panic.** Fallibility is the composition root's to wrap: the store does
-/// not catch, and a panic propagates out of the keep after the store's own
-/// bookkeeping is complete. A caller that catches the unwind finds a
-/// consistent store whose
+/// Every hook delivery fires **after the store's own state has settled**:
+/// for an eviction, indexes, shelves, the stream-residency table and the
+/// store's counters are all updated before the first hook method runs; for
+/// a keep refusal, the refusal's counter is incremented and residency is
+/// exactly as it was — nothing was inserted — before the report goes out.
+/// A misbehaving hook can therefore never corrupt the store — but it runs
+/// where the composition root releases a record's ledger identity, so a
+/// panicking hook would leave identity behind after its record's story
+/// ended. **A hook must not panic.** Fallibility is the composition root's
+/// to wrap: the store does not catch, and a panic propagates out of the
+/// keep after the store's own bookkeeping is complete. A caller that
+/// catches the unwind finds a consistent store whose
 /// [`StoreStats::total_evictions`](crate::StoreStats::total_evictions)
 /// exceeds [`StoreStats::hook_deliveries`](crate::StoreStats::hook_deliveries)
+/// or whose keep-refusal counters exceed
+/// [`StoreStats::refused_hook_deliveries`](crate::StoreStats::refused_hook_deliveries)
 /// — the divergence is observable, never silent.
 ///
 /// Per removed record the store calls [`EvictionHook::evicted`] once, in
 /// eviction order (oldest first); when that removal was the stream's last
 /// resident point, it then calls [`EvictionHook::stream_released`] once for
-/// the stream — the record's hook before its stream's.
+/// the stream — the record's hook before its stream's. Per refused keep it
+/// calls [`EvictionHook::keep_refused`] once.
 ///
 /// The hook bounds are also the store's: [`TelemetryStore`](crate::TelemetryStore)
 /// promises `Send + Sync`, which the hook field rides along with, so the
@@ -146,4 +168,21 @@ pub trait EvictionHook: Send + Sync {
     /// — so the composition root can release the ledger's interning by
     /// content without a copy.
     fn stream_released(&mut self, stream: &Arc<StreamIdentity>);
+
+    /// A keep was refused with **nothing inserted** —
+    /// [`KeepOutcome::Oversized`], [`KeepOutcome::SeriesCapReached`] or
+    /// [`KeepOutcome::IdentityOverCeiling`] — for the record admission had
+    /// handed over as `entity`. The refused record is nowhere in the store,
+    /// but admission already gave it a ledger identity (and interned its
+    /// stream); this report is what lets the composition root end that
+    /// identity, so the pipeline's next delivery of the same natural
+    /// identity re-admits fresh instead of collapsing onto an entry whose
+    /// record never entered residency (ADR 0008).
+    ///
+    /// `stream` is the interned identity the refused record arrived with,
+    /// when it carried one: a metric point's refusal always does, a span's
+    /// or log record's never does — neither kind has a stream identity.
+    /// [`KeepOutcome::Duplicate`] is never reported: the record a duplicate
+    /// names **is** resident, and its identity must stand.
+    fn keep_refused(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>);
 }

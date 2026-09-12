@@ -74,7 +74,15 @@ exactly once ([storage-model.md](storage-model.md)), so identity content
 cannot hide behind the per-record formula — and a stream identity whose
 accounted size alone exceeds the ceiling is refused at keep time,
 non-retryable and never evicting into
-([mechanism](storage-model.md)), the series-cap refusal's sibling. On top
+([mechanism](storage-model.md)), the series-cap refusal's sibling. Every
+refusal that inserts nothing is also a hook delivery: the store's hook
+carries three kinds — evicted record, stream release, keep refusal — and
+the composition root ends the refused record's ledger identity through it
+exactly as for eviction
+([ADR 0008](../decisions/0008-admission-ledger-design.md)), so the ledger's
+overhead tracks what residency and the refusals actually hold. Evictions,
+keep refusals and their hook deliveries are separately counted, so a
+delivery that does not complete is observable, never silent. On top
 of the ceiling stand the admission ledger's per-record entries
 ([ADR 0008](../decisions/0008-admission-ledger-design.md) — bounded overhead
 per retained record, sharing ownership with the record it pins) and the

@@ -217,13 +217,14 @@ pub fn boxed(config: MemoryConfig, hook: Option<Box<dyn EvictionHook>>) -> Box<d
     Box::new(InMemoryStore::new(config, hook))
 }
 
-/// A hook that records every removal report, in the order the store
-/// delivered it: evicted records and, separately, the streams whose last
-/// resident point went with them.
+/// A hook that records every delivery, in the order the store delivered
+/// it: evicted records, the streams whose last resident point went with
+/// them, and the keep refusals that inserted nothing.
 #[derive(Debug, Default)]
 pub struct RecordingHook {
     pub evicted: Vec<EntityId>,
     pub streams_released: Vec<Arc<StreamIdentity>>,
+    pub refused: Vec<(EntityId, Option<Arc<StreamIdentity>>)>,
 }
 
 impl EvictionHook for RecordingHook {
@@ -233,6 +234,10 @@ impl EvictionHook for RecordingHook {
 
     fn stream_released(&mut self, stream: &Arc<StreamIdentity>) {
         self.streams_released.push(Arc::clone(stream));
+    }
+
+    fn keep_refused(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>) {
+        self.refused.push((entity, stream.map(Arc::clone)));
     }
 }
 
@@ -257,5 +262,13 @@ impl EvictionHook for SharedRecordingHook {
             .expect("hook lock poisoned")
             .streams_released
             .push(Arc::clone(stream));
+    }
+
+    fn keep_refused(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>) {
+        self.0
+            .lock()
+            .expect("hook lock poisoned")
+            .refused
+            .push((entity, stream.map(Arc::clone)));
     }
 }

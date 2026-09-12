@@ -54,14 +54,16 @@ struct Counters {
     kept_out_series_cap: u64,
     identity_over_ceiling_refusals: u64,
     hook_deliveries: u64,
+    refused_hook_deliveries: u64,
 }
 
 /// The in-memory store.
 ///
 /// Built once with its [`MemoryConfig`] and — optionally — the
 /// [`EvictionHook`] the composition root wires to the admission ledger's
-/// `forget` and `release_stream`, so identity ends exactly when residency
-/// does (ADR 0008). Ceilings are checked after every keep and on every
+/// `forget` and `release_stream`, so identity ends exactly when a record's
+/// residency story ends — eviction **and** keep refusal (ADR 0008).
+/// Ceilings are checked after every keep and on every
 /// [`TelemetryStore::enforce_retention`] pass; when any is exceeded the
 /// oldest record is evicted — smallest [`AdmissionKey`] — until all are
 /// satisfied again. Each eviction is attributed to the first ceiling found
@@ -79,7 +81,11 @@ struct Counters {
 /// identity the ceiling cannot hold on its own is refused before the
 /// insert (`KeepOutcome::IdentityOverCeiling`, naming the ceiling and the
 /// identity's size): evicting into a charge that is over the cap by
-/// itself could never satisfy the ceiling.
+/// itself could never satisfy the ceiling. Every refusal that inserted
+/// nothing is reported through [`EvictionHook::keep_refused`] — a refused
+/// record is nowhere in the store, so its ledger identity must not stay
+/// behind (ADR 0008); a [`KeepOutcome::Duplicate`] reports nothing, the
+/// record it names being resident.
 pub struct InMemoryStore {
     config: MemoryConfig,
     window_nanos: u64,
@@ -202,6 +208,22 @@ impl InMemoryStore {
         evicted
     }
 
+    /// Reports one keep refusal through the hook, under the same ordering
+    /// law the eviction hook runs under: the refusal's own counter is
+    /// already incremented and the store's residency is exactly as it was —
+    /// nothing was inserted — before the report goes out. The delivery is
+    /// counted only once its call has returned, so a panicking hook shows
+    /// up as the gap between
+    /// [`StoreStats::total_keep_refusals`](runtime_trail_storage::StoreStats::total_keep_refusals)
+    /// and
+    /// [`StoreStats::refused_hook_deliveries`](runtime_trail_storage::StoreStats::refused_hook_deliveries).
+    fn report_refusal(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>) {
+        if let Some(hook) = self.hook.as_mut() {
+            hook.keep_refused(entity, stream);
+            self.counters.refused_hook_deliveries += 1;
+        }
+    }
+
     /// Removes the oldest record from whichever shelf holds it and returns
     /// its key together with the stream the removal retired — `Some` when
     /// the record was a metric point whose stream just lost its last
@@ -311,6 +333,7 @@ impl InMemoryStore {
             kept_out_series_cap: self.counters.kept_out_series_cap,
             identity_over_ceiling_refusals: self.counters.identity_over_ceiling_refusals,
             hook_deliveries: self.counters.hook_deliveries,
+            refused_hook_deliveries: self.counters.refused_hook_deliveries,
             admission_anomalies: self.anomalies,
         }
     }
@@ -350,7 +373,9 @@ fn refuse_early<R: Accounted>(
 /// insert. Returns `Ok(the reference now for the retention pass)` when the
 /// record entered residency, `Err(the counted outcome)` when it was
 /// refused; the caller runs the retention pass itself, so every kind's
-/// keep is this one sequence.
+/// keep is this one sequence. A refused outcome that inserted nothing is
+/// the caller's to report through the hook — the entity id is copied out
+/// first, because the `Admitted` hand-off moves into the insert.
 fn keep_on_shelf<R: Accounted>(
     shelf: &mut Shelf<R>,
     admitted: Admitted<Arc<R>>,
@@ -366,14 +391,24 @@ fn keep_on_shelf<R: Accounted>(
 
 impl TelemetryStore for InMemoryStore {
     fn keep_span(&mut self, admitted: Admitted<Arc<Span>>) -> KeepOutcome {
+        let entity = admitted.entity;
         let size = accounted_u64(admitted.record.as_ref());
-        match keep_on_shelf(
+        let result = keep_on_shelf(
             &mut self.spans,
             admitted,
             size,
             self.config.max_accounted_bytes,
             &mut self.counters,
-        ) {
+        );
+        // The one span refusal that inserted nothing reports through the
+        // hook, so the refused record's ledger identity ends with the
+        // refusal (a span carries no stream identity — nothing to hand
+        // over). A Duplicate reports nothing: the record it names is
+        // resident.
+        if matches!(result, Err(KeepOutcome::Oversized)) {
+            self.report_refusal(entity, None);
+        }
+        match result {
             Ok(now) => KeepOutcome::Kept {
                 evicted: self.enforce_against(now),
             },
@@ -382,14 +417,24 @@ impl TelemetryStore for InMemoryStore {
     }
 
     fn keep_log_record(&mut self, admitted: Admitted<Arc<LogRecord>>) -> KeepOutcome {
+        let entity = admitted.entity;
         let size = accounted_u64(admitted.record.as_ref());
-        match keep_on_shelf(
+        let result = keep_on_shelf(
             &mut self.logs,
             admitted,
             size,
             self.config.max_accounted_bytes,
             &mut self.counters,
-        ) {
+        );
+        // The one log-record refusal that inserted nothing reports through
+        // the hook. (The ledger keeps no entry for log records at all, so
+        // the composition root's release is a no-op there — the report is
+        // still owed, the hook's law being per refusal, not per kind.) A
+        // Duplicate reports nothing: the record it names is resident.
+        if matches!(result, Err(KeepOutcome::Oversized)) {
+            self.report_refusal(entity, None);
+        }
+        match result {
             Ok(now) => KeepOutcome::Kept {
                 evicted: self.enforce_against(now),
             },
@@ -407,6 +452,11 @@ impl TelemetryStore for InMemoryStore {
         // would establish a NEW distinct stream while the cap is already
         // full is refused without evicting anything. Only after all of
         // them is the slot allocated, so a refused keep costs no heap.
+        // Every refusal here inserted nothing, so each one reports through
+        // the hook once the store's own state has settled — a refused
+        // record's ledger identity ends with the refusal (ADR 0008); a
+        // Duplicate reports nothing, the record it names being resident.
+        let entity = admitted.entity;
         let size = accounted_u64(admitted.record.as_ref());
         if let Err(outcome) = refuse_early(
             &self.points,
@@ -415,6 +465,9 @@ impl TelemetryStore for InMemoryStore {
             self.config.max_accounted_bytes,
             &mut self.counters,
         ) {
+            if KeepOutcome::Oversized == outcome {
+                self.report_refusal(entity, Some(&stream));
+            }
             return outcome;
         }
         // The identity charge a keep would owe: when the stream's first
@@ -428,15 +481,18 @@ impl TelemetryStore for InMemoryStore {
         let identity_bytes = accounted_u64(stream.as_ref());
         if identity_bytes > self.config.max_accounted_bytes {
             self.counters.identity_over_ceiling_refusals += 1;
-            return KeepOutcome::IdentityOverCeiling {
+            let outcome = KeepOutcome::IdentityOverCeiling {
                 ceiling: self.config.max_accounted_bytes,
                 identity_bytes,
             };
+            self.report_refusal(entity, Some(&stream));
+            return outcome;
         }
         if !self.series.contains_key(stream.as_ref())
             && self.resident_streams() >= self.config.series_cap
         {
             self.counters.kept_out_series_cap += 1;
+            self.report_refusal(entity, Some(&stream));
             return KeepOutcome::SeriesCapReached;
         }
         let slot = Arc::new(PointSlot {
