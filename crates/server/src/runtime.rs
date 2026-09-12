@@ -204,20 +204,33 @@ impl std::fmt::Debug for RuntimeConfig {
 /// shares it out. A re-delivery after eviction is therefore admitted
 /// fresh, and interning memory ends exactly when residency does.
 ///
+/// A keep the store *refused* ends identity the same way: the refused
+/// record never entered residency, but admission had already given it a
+/// ledger identity — and interned its stream, for a metric point. The
+/// store's `keep_refused` report comes here after its state has settled
+/// with nothing inserted, and takes the same release path as an eviction
+/// (`forget`, then `release_stream` when a stream rode along), so the
+/// pipeline's next delivery of the same natural identity re-admits fresh
+/// instead of collapsing onto an entry whose record is nowhere in the
+/// store. Every forward is counted — the runtime surfaces it in the
+/// shutdown summary.
+///
 /// # Why this hook cannot panic
 ///
 /// The hook runs inside the store's keep, where a panic would leave
 /// identity resident after its record is gone — the one divergence the
 /// storage contract calls out as never silent. Structurally, there is
 /// nothing here that can unwind: no indexing, no arithmetic that can
-/// overflow, no allocation, and the two ledger calls are total map
-/// removals. The one fallible step is the ledger mutex, and poisoning is
-/// recovered from (`PoisonError::into_inner`) rather than unwound: the
-/// data the guard protects is a map whose every entry is independently
-/// valid, so a panic *elsewhere* under it does not make a `forget` unsafe
-/// to complete.
+/// overflow, no allocation, and the ledger calls are total map removals.
+/// The one fallible step is the ledger mutex, and poisoning is recovered
+/// from (`PoisonError::into_inner`) rather than unwound: the data the
+/// guard protects is a map whose every entry is independently valid, so a
+/// panic *elsewhere* under it does not make a `forget` unsafe to
+/// complete.
 struct LedgerHook {
     ledger: Arc<Mutex<AdmissionLedger>>,
+    /// Shared with the runtime: refusals whose identity this hook ended.
+    refused_forwards: Arc<AtomicU64>,
 }
 
 impl LedgerHook {
@@ -233,6 +246,17 @@ impl EvictionHook for LedgerHook {
 
     fn stream_released(&mut self, stream: &Arc<StreamIdentity>) {
         self.lock().release_stream(stream);
+    }
+
+    fn keep_refused(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>) {
+        {
+            let mut ledger = self.lock();
+            ledger.forget(entity);
+            if let Some(stream) = stream {
+                ledger.release_stream(stream);
+            }
+        }
+        self.refused_forwards.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -288,11 +312,14 @@ impl PumpCounters {
         }
     }
 
-    /// A plain read of every counter, for surfaces and tests.
+    /// A plain read of every counter, for surfaces and tests. The hook's
+    /// refusal forwards ride along — the pump never sees them, the ledger
+    /// does.
     #[must_use]
-    pub fn summary(&self) -> RunSummary {
+    pub fn summary(&self, refused_forwards: u64) -> RunSummary {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         RunSummary {
+            refused_forwards,
             kept: load(&self.kept),
             evicted_on_keep: load(&self.evicted_on_keep),
             duplicates: load(&self.duplicates),
@@ -326,6 +353,10 @@ pub struct RunSummary {
     /// Records still queued when the drain deadline passed: dropped,
     /// observably.
     pub dropped_on_drain: u64,
+    /// Keeps the store refused with nothing inserted, whose ledger
+    /// identities the hook ended — the refusal side of "eviction ends
+    /// identity" (ADR 0008).
+    pub refused_forwards: u64,
 }
 
 /// The consumer thread's and the retention thread's handles, kept so
@@ -345,6 +376,9 @@ pub struct CoreRuntime {
     store: Arc<Mutex<Box<dyn TelemetryStore>>>,
     clock: Arc<AdmissionClock>,
     counters: PumpCounters,
+    /// Shared with the eviction hook: refused keeps whose ledger identity
+    /// the hook ended.
+    refused_forwards: Arc<AtomicU64>,
     /// The drain deadline, set once: when the session stops admitting and
     /// the pump's remaining time starts being spent.
     drain_deadline: Mutex<Option<Instant>>,
@@ -381,8 +415,10 @@ impl CoreRuntime {
             config.budgets,
             config.payload_ceiling_bytes,
         )?);
+        let refused_forwards = Arc::new(AtomicU64::new(0));
         let hook = LedgerHook {
             ledger: pipeline.ledger(),
+            refused_forwards: Arc::clone(&refused_forwards),
         };
         let store: Box<dyn TelemetryStore> =
             Box::new(InMemoryStore::new(config.store, Some(Box::new(hook))));
@@ -392,6 +428,7 @@ impl CoreRuntime {
             store: Arc::new(Mutex::new(store)),
             clock: Arc::new(AdmissionClock::new(config.clock)),
             counters: PumpCounters::default(),
+            refused_forwards,
             drain_deadline: Mutex::new(None),
             payload_ceiling_bytes: config.payload_ceiling_bytes,
             grpc_decoding_ceiling_bytes,
@@ -492,7 +529,15 @@ impl CoreRuntime {
     /// The pump's counters as plain numbers.
     #[must_use]
     pub fn counters(&self) -> RunSummary {
-        self.counters.summary()
+        self.counters.summary(self.refused_keep_forwards())
+    }
+
+    /// Keeps the store refused with nothing inserted whose ledger identity
+    /// the hook then ended — the refusal half of the ADR 0008 edge, as
+    /// this graph actually ran it.
+    #[must_use]
+    pub fn refused_keep_forwards(&self) -> u64 {
+        self.refused_forwards.load(Ordering::Relaxed)
     }
 
     /// Stops the session: drains the queue to storage within the drain
@@ -537,7 +582,7 @@ impl CoreRuntime {
                 "drain deadline reached: records still in flight were dropped, observably"
             );
         }
-        let summary = self.counters.summary();
+        let summary = self.counters.summary(self.refused_keep_forwards());
         // The stop's residency snapshot: what the bounded store actually
         // holds when the runtime ends, next to what the pump kept.
         let residency = self.store_stats();
@@ -570,7 +615,10 @@ impl CoreRuntime {
 impl std::fmt::Debug for CoreRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreRuntime")
-            .field("counters", &self.counters.summary())
+            .field(
+                "counters",
+                &self.counters.summary(self.refused_keep_forwards()),
+            )
             .field("payload_ceiling_bytes", &self.payload_ceiling_bytes)
             .field("is_draining", &self.pipeline.is_draining())
             .finish_non_exhaustive()
@@ -713,8 +761,8 @@ mod tests {
 
     use runtime_trail_storage::EvictionHook;
     use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
-    use runtime_trail_telemetry_ingestion::StoredRecord;
     use runtime_trail_telemetry_ingestion::fixtures as fx;
+    use runtime_trail_telemetry_ingestion::{RecordOutcome, StoredRecord};
     use runtime_trail_telemetry_model::Admitted;
 
     use super::*;
@@ -818,6 +866,80 @@ mod tests {
             "stream a's last point left: its identity must be released, not stranded"
         );
         assert_eq!(runtime.store_stats().resident_records, 2);
+    }
+
+    /// The refusal side of the ADR 0008 edge, through the same wiring: a
+    /// keep the store refuses inserted nothing, and the hook ends the
+    /// identity admission had already handed out — so a span's re-delivery
+    /// is admitted **fresh** (not collapsed onto the refused entry's
+    /// phantom) and a refused point's stream identity leaves the ledger.
+    #[test]
+    fn a_refused_keep_ends_identity_through_the_hook() {
+        // A byte ceiling no record can fit: every keep is refused with
+        // nothing inserted.
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            store: MemoryConfig {
+                max_accounted_bytes: 1,
+                ..MemoryConfig::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let ledger = runtime.pipeline().ledger();
+        let resident_streams = || {
+            ledger
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .resident_streams()
+        };
+        let payload = one_span_export(fx::T1, fx::S1);
+
+        // Admission has no store-side opinion: the span is admitted,
+        // queued, refused by the store, and its identity is then ended by
+        // the hook.
+        let first = runtime
+            .pipeline()
+            .ingest_spans(AdmissionTime::from_unix_nano(1), &payload)
+            .expect("admission admits the span");
+        assert!(
+            matches!(&first.records[0], RecordOutcome::Admitted { .. }),
+            "the first delivery is admitted: {:?}",
+            first.records[0]
+        );
+        wait_for_pump(&runtime, |summary| summary.refused_forwards == 1);
+        assert_eq!(runtime.store_stats().resident_records, 0, "nothing kept");
+
+        // The proof the span's identity really ended: the identical
+        // re-delivery is admitted **fresh** — a `Collapsed` outcome would
+        // mean the refused entry's identity was stranded in the ledger,
+        // and the re-delivery had collapsed onto that phantom.
+        let again = runtime
+            .pipeline()
+            .ingest_spans(AdmissionTime::from_unix_nano(2), &payload)
+            .expect("the re-delivery is admitted");
+        assert!(
+            matches!(&again.records[0], RecordOutcome::Admitted { .. }),
+            "the re-delivery must be admitted fresh, not collapsed onto \
+             the refused entry's stranded identity: {:?}",
+            again.records[0]
+        );
+
+        // The `Some(stream)` arm: a refused point's stream identity is
+        // released the same way, so the ledger holds no interned stream.
+        runtime
+            .pipeline()
+            .ingest_metrics(AdmissionTime::from_unix_nano(3), &one_point_export("a", 3))
+            .expect("admission admits the point");
+        // Three forwards so far: both span deliveries and the point were
+        // all refused by the 1-byte ceiling, and every one of them ended
+        // identity through the hook.
+        wait_for_pump(&runtime, |summary| summary.refused_forwards == 3);
+        assert_eq!(
+            resident_streams(),
+            0,
+            "the refused point's stream identity was released, not stranded"
+        );
+        assert_eq!(runtime.store_stats().resident_records, 0);
     }
 
     /// The retention tick is the composition root's clock handed to the
@@ -972,6 +1094,7 @@ mod tests {
         // The hook fires after the poison and completes the release anyway.
         let mut hook = LedgerHook {
             ledger: Arc::clone(&ledger),
+            refused_forwards: Arc::new(AtomicU64::new(0)),
         };
         hook.evicted(entity);
         assert_eq!(
