@@ -83,16 +83,6 @@ pub use store::{PointView, TelemetryStore};
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The bootstrap binding surface, kept from the foundation commit.
-///
-/// This empty trait is what the Phase 3 scaffolding (`storage-sqlite`) and
-/// the smoke surfaces still bind to, so the declared boundaries stay real
-/// before their drivers exist. It is **not** the storage contract — the
-/// contract is [`TelemetryStore`]. The placeholder disappears when the
-/// file-backed driver lands against the real contract (Phase 3,
-/// `docs/roadmap/phases.md`); nothing new may implement it.
-pub trait StorageBackend {}
-
 #[cfg(test)]
 mod tests {
     #[test]
