@@ -63,6 +63,12 @@ pub struct StoreStats {
     /// distinct stream while the store already held the series cap's worth
     /// (`KeepOutcome::SeriesCapReached`). Nothing was evicted to make room.
     pub kept_out_series_cap: u64,
+    /// Keeps refused because the point's stream identity alone exceeded
+    /// the accounted-byte ceiling
+    /// (`KeepOutcome::IdentityOverCeiling`) — the identity charge the
+    /// store would owe on the stream's first resident point is already
+    /// over the cap, so nothing was evicted to try to make room.
+    pub identity_over_ceiling_refusals: u64,
     /// How many completed [`EvictionHook`](crate::EvictionHook) deliveries
     /// the store has made for evicted records. The store's own removal —
     /// indexes, shelves, stream table, counters — completes **before** the

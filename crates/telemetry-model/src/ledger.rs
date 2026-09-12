@@ -54,12 +54,12 @@
 //! admitted but never kept, or whose points are still resident, remains
 //! interned by design, never dropped early.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::budgets::{
-    BudgetLimits, check_log_record, check_point, check_resource, check_scope, check_span,
+    BudgetLimits, check_log_record, check_point, check_span, check_stream_identity,
 };
 use crate::identity::{AdmissionOutcome, AssignedId, EntityId};
 use crate::logs::LogRecord;
@@ -90,8 +90,10 @@ pub struct PointAdmission {
     pub outcome: AdmissionOutcome,
     /// The payload the identity now names, when one stands.
     pub record: Option<Arc<MetricPoint>>,
-    /// The stream identity the point belongs to, interned — `None` only
-    /// when the delivery was refused before admission.
+    /// The stream identity the point belongs to, interned — `None` when
+    /// the delivery was refused or recorded a conflict against a changed
+    /// descriptor: nothing a refused delivery earned is handed out, and a
+    /// fresh intern made for it is undone.
     pub stream: Option<Arc<StreamIdentity>>,
 }
 
@@ -104,6 +106,7 @@ pub struct PointAdmission {
 pub struct AdmissionAnomalies {
     span_identity_conflicts: u64,
     point_identity_conflicts: u64,
+    provenance_mismatches: u64,
 }
 
 impl AdmissionAnomalies {
@@ -121,10 +124,23 @@ impl AdmissionAnomalies {
         self.point_identity_conflicts
     }
 
+    /// Collapsing re-deliveries whose resource-level `schema_url` differed
+    /// from the standing record's. The collapse itself is correct — the
+    /// resource's `schema_url` is provenance outside identity, so equal
+    /// content across a schema drift is one record — but the drift is
+    /// real: the emitter moved schemas under the same resource, and whose
+    /// provenance moved must stay visible. The scope-level `schema_url`
+    /// never lands here: it participates in identity, so a delivery that
+    /// differs there resolves as a conflict or a second stream instead.
+    #[must_use]
+    pub const fn provenance_mismatches(self) -> u64 {
+        self.provenance_mismatches
+    }
+
     /// Every anomaly recorded this session.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.span_identity_conflicts + self.point_identity_conflicts
+        self.span_identity_conflicts + self.point_identity_conflicts + self.provenance_mismatches
     }
 }
 
@@ -141,19 +157,25 @@ pub struct AdmissionLedger {
     /// The admitted span payload per natural identity, shared (see the
     /// module docs). Admission time is not kept: it is the caller's
     /// [`crate::identity::Admitted`] wrapper metadata.
-    spans: HashMap<(crate::context::TraceId, crate::context::SpanId), (EntityId, Arc<Span>)>,
-    /// The admitted point payload per point identity, shared. Keyed by
-    /// `Arc<PointIdentity>` so [`AdmissionLedger::forget`] can drop an
+    spans: BTreeMap<(crate::context::TraceId, crate::context::SpanId), (EntityId, Arc<Span>)>,
+    /// The standing point per point identity. The key **owns** the
+    /// admitted record and its attribute set — one payload per entry,
+    /// shared out from the key itself, never copied into it — so the map's
+    /// value is just the entity id. Keyed by `Arc<PointIdentity>` over the
+    /// key's own total order, so [`AdmissionLedger::forget`] can drop an
     /// entry by its assigned id without duplicating key bytes: the
     /// assigned-id index below holds the same `Arc`.
-    points: HashMap<Arc<PointIdentity>, (EntityId, Arc<MetricPoint>)>,
+    points: BTreeMap<Arc<PointIdentity>, EntityId>,
     /// Assigned id → the point identity it was assigned to, for
     /// [`AdmissionLedger::forget`]. One entry per admitted point; the
     /// `Arc` is shared with the `points` key.
-    assigned_points: HashMap<AssignedId, Arc<PointIdentity>>,
+    assigned_points: BTreeMap<AssignedId, Arc<PointIdentity>>,
     /// The interned stream identities this session has admitted points
-    /// under. One payload per distinct stream, however many points.
-    streams: HashMap<StreamIdentity, Arc<StreamIdentity>>,
+    /// under, content-keyed: the set owns the single `Arc` per distinct
+    /// stream, however many points reference it. An ordered set over
+    /// identity content — byte-exact comparison, no hashing anywhere in
+    /// the ledger (ADR 0008).
+    streams: BTreeSet<Arc<StreamIdentity>>,
     /// The limits every gate here checks against. Startup configuration.
     limits: BudgetLimits,
     anomalies: AdmissionAnomalies,
@@ -172,10 +194,10 @@ impl AdmissionLedger {
     pub fn new(limits: BudgetLimits) -> Self {
         Self {
             next_serial: 0,
-            spans: HashMap::new(),
-            points: HashMap::new(),
-            assigned_points: HashMap::new(),
-            streams: HashMap::new(),
+            spans: BTreeMap::new(),
+            points: BTreeMap::new(),
+            assigned_points: BTreeMap::new(),
+            streams: BTreeSet::new(),
             limits,
             anomalies: AdmissionAnomalies::default(),
         }
@@ -294,10 +316,21 @@ impl AdmissionLedger {
              invariant behind the bounded derived glue is broken"
         );
         match self.spans.get(&key) {
-            Some((standing, admitted)) if **admitted == *span => SpanAdmission {
-                outcome: AdmissionOutcome::Collapsed { entity: *standing },
-                record: Some(Arc::clone(admitted)),
-            },
+            Some((standing, admitted)) if **admitted == *span => {
+                // The resource's `schema_url` is provenance outside
+                // identity, so equal spans across a schema drift still
+                // collapse — and the drift is recorded, never swallowed.
+                // A scope-level `schema_url` differs by being identity:
+                // such a delivery fails the equality guard and takes the
+                // conflict arm below.
+                if admitted.resource.schema_url != span.resource.schema_url {
+                    self.anomalies.provenance_mismatches += 1;
+                }
+                SpanAdmission {
+                    outcome: AdmissionOutcome::Collapsed { entity: *standing },
+                    record: Some(Arc::clone(admitted)),
+                }
+            }
             Some((standing, _)) => {
                 self.anomalies.span_identity_conflicts += 1;
                 SpanAdmission {
@@ -345,12 +378,20 @@ impl AdmissionLedger {
     /// admission-assigned entity ids — collapse identity and cursor
     /// identity are different things.
     ///
+    /// The collapse key is **descriptor-less**: a re-delivery of a
+    /// standing point under a stream identity that differs only in the
+    /// descriptor (description, unit, metadata) lands on the standing key
+    /// and is recorded as a conflict — the first descriptor stands, and a
+    /// fresh intern made for the refused delivery is undone. A *different*
+    /// point under the changed descriptor is not a re-delivery; it admits
+    /// as the second stream it is.
+    ///
     /// Before any of that, the delivery must satisfy the shape law the
     /// stream's kind imposes on the point (the same law
     /// [`MetricStream::new`] enforces) — an incoherent pair is
     /// [`AdmissionOutcome::Invalid`], not a conflict — and then the
-    /// budgets: the stream identity's resource and scope, and the point
-    /// itself.
+    /// budgets: the stream identity's resource, scope and metadata, and
+    /// the point itself.
     #[must_use]
     pub fn admit_metric_point(
         &mut self,
@@ -371,14 +412,14 @@ impl AdmissionLedger {
                 stream: None,
             };
         }
-        if let Err(rejection) = check_resource(&stream.resource, &self.limits) {
-            return PointAdmission {
-                outcome: AdmissionOutcome::Rejected { rejection },
-                record: None,
-                stream: None,
-            };
-        }
-        if let Err(rejection) = check_scope(&stream.scope, &self.limits) {
+        // The stream-level gates — the identity's resource and scope and,
+        // since the descriptor became identity content, the stream's
+        // metadata attribute set — on the path that actually admits
+        // streams. Metadata is interned once per stream and charged to the
+        // byte ceiling with the rest of the identity; ungated, a
+        // stream-shaped payload could park attribute content in the ledger
+        // behind points that carry none of it.
+        if let Err(rejection) = check_stream_identity(stream, &self.limits) {
             return PointAdmission {
                 outcome: AdmissionOutcome::Rejected { rejection },
                 record: None,
@@ -393,52 +434,87 @@ impl AdmissionLedger {
             };
         }
         // Every gate passed: now — and only now — intern the stream
-        // identity, so a refused delivery leaves no entry behind.
-        let interned = self
-            .streams
-            .entry(stream.clone())
-            .or_insert_with(|| Arc::new(stream.clone()))
-            .clone();
-        let key = Arc::new(PointIdentity::of_interned(&interned, &point));
+        // identity, so a refused delivery leaves no entry behind. The set
+        // owns the single payload per distinct stream; interning is a
+        // content lookup that never hashes (ADR 0008).
+        let (interned, fresh_intern) = if let Some(standing) = self.streams.get(stream) {
+            (Arc::clone(standing), false)
+        } else {
+            let fresh = Arc::new(stream.clone());
+            self.streams.insert(Arc::clone(&fresh));
+            (fresh, true)
+        };
+        // The key shares the record — the point is wrapped exactly once,
+        // here, and nothing about it is copied into the key.
         let point = Arc::new(point);
+        let key = Arc::new(PointIdentity::of_interned(&interned, &point));
         debug_assert!(
             check_point(&point, &self.limits).is_ok(),
             "admission stored a record its own gate refuses — the admitted-data \
              invariant behind the bounded derived glue is broken"
         );
-        match self.points.get(&key) {
-            // Collapse comparison runs through the kind-aware payload law:
-            // for a gauge, two deliveries differing only in a start_time
-            // the emitter was told not to send are the same point, not a
-            // conflict.
-            Some((standing, admitted)) if admitted.identity_payload_eq(&point, stream.kind) => {
-                PointAdmission {
-                    outcome: AdmissionOutcome::Collapsed { entity: *standing },
-                    record: Some(Arc::clone(admitted)),
-                    stream: Some(interned),
+        // The key's ordering is the descriptor-less OTel collapse key, so
+        // a re-delivery under a *changed descriptor* lands on the standing
+        // key instead of sliding past it. What stands decides the fate:
+        // the same stream content is the duplicate-delivery question (the
+        // kind-aware payload law), a different stream content is a stream
+        // conflict — the first descriptor stands.
+        if let Some((standing_key, standing)) = self.points.get_key_value(&key) {
+            if *standing_key.stream == *interned {
+                // Collapse comparison runs through the kind-aware
+                // payload law: for a gauge, two deliveries differing
+                // only in a start_time the emitter was told not to
+                // send are the same point, not a conflict.
+                if standing_key.point.identity_payload_eq(&point, stream.kind) {
+                    // The span law applies here too: the resource's
+                    // `schema_url` is provenance outside identity, so the
+                    // collapse stands across a drift — and the drift is
+                    // recorded. The scope-level `schema_url` differs by
+                    // being identity: a stream whose scope `schema_url`
+                    // changed projects to a different key and admits as a
+                    // second stream, never a provenance mismatch.
+                    if interned.resource.schema_url != stream.resource.schema_url {
+                        self.anomalies.provenance_mismatches += 1;
+                    }
+                    PointAdmission {
+                        outcome: AdmissionOutcome::Collapsed { entity: *standing },
+                        record: Some(Arc::clone(&standing_key.point)),
+                        stream: Some(interned),
+                    }
+                } else {
+                    self.anomalies.point_identity_conflicts += 1;
+                    PointAdmission {
+                        outcome: AdmissionOutcome::Conflict { entity: *standing },
+                        record: None,
+                        stream: Some(interned),
+                    }
                 }
-            }
-            Some((standing, _)) => {
+            } else {
                 self.anomalies.point_identity_conflicts += 1;
+                // A fresh intern made for this refused delivery is
+                // undone: a conflict leaves no interned stream behind,
+                // so the identity stays free exactly as a refusal
+                // would.
+                if fresh_intern {
+                    self.streams.remove(stream);
+                }
                 PointAdmission {
                     outcome: AdmissionOutcome::Conflict { entity: *standing },
                     record: None,
-                    stream: Some(interned),
+                    stream: None,
                 }
             }
-            None => {
-                let entity = self.assigned_entity();
-                let EntityId::Assigned(assigned) = entity else {
-                    unreachable!("points always receive assigned ids");
-                };
-                self.points
-                    .insert(Arc::clone(&key), (entity, Arc::clone(&point)));
-                self.assigned_points.insert(assigned, key);
-                PointAdmission {
-                    outcome: AdmissionOutcome::Admitted { entity },
-                    record: Some(point),
-                    stream: Some(interned),
-                }
+        } else {
+            let entity = self.assigned_entity();
+            let EntityId::Assigned(assigned) = entity else {
+                unreachable!("points always receive assigned ids");
+            };
+            self.points.insert(Arc::clone(&key), entity);
+            self.assigned_points.insert(assigned, key);
+            PointAdmission {
+                outcome: AdmissionOutcome::Admitted { entity },
+                record: Some(point),
+                stream: Some(interned),
             }
         }
     }
@@ -585,6 +661,69 @@ mod tests {
             &first.record.expect("standing"),
             &again.record.expect("standing")
         ));
+    }
+
+    #[test]
+    fn a_resource_schema_url_drift_collapses_and_records_a_provenance_mismatch() {
+        let mut ledger = ledger();
+        let first = ledger.admit_span(span([1; 16], [2; 8], "op"));
+        let standing = first.outcome.entity().expect("admitted");
+        let mut redelivered = span([1; 16], [2; 8], "op");
+        redelivered.resource = Arc::new(Resource {
+            attributes: Attributes::default(),
+            schema_url: Some("https://schema/v2".to_owned()),
+            dropped_attributes_count: 0,
+        });
+        let second = ledger.admit_span(redelivered);
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Collapsed { entity: standing },
+            "the resource's schema_url is provenance outside identity: \
+             equal spans collapse across the drift"
+        );
+        let standing_record = first.record.expect("standing");
+        assert!(Arc::ptr_eq(
+            &standing_record,
+            &second.record.expect("standing")
+        ));
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            1,
+            "the drift is recorded, observable"
+        );
+        assert_eq!(ledger.anomalies().total(), 1);
+        // Collapse never rewrites: the standing record keeps its own
+        // schema_url.
+        assert_eq!(standing_record.resource.schema_url.as_deref(), None);
+    }
+
+    #[test]
+    fn a_scope_schema_url_change_conflicts_instead_of_recording_provenance() {
+        let mut ledger = ledger();
+        let first = ledger.admit_span(span([1; 16], [2; 8], "op"));
+        let standing = first.outcome.entity().expect("admitted");
+        let mut redelivered = span([1; 16], [2; 8], "op");
+        redelivered.scope = Arc::new(InstrumentationScope {
+            name: String::new(),
+            version: None,
+            attributes: Attributes::default(),
+            schema_url: Some("https://scope-schema/v2".to_owned()),
+            dropped_attributes_count: 0,
+        });
+        let second = ledger.admit_span(redelivered);
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Conflict { entity: standing },
+            "the scope's schema_url participates in identity: a different \
+             scope is a conflict, not a provenance note"
+        );
+        assert!(second.record.is_none());
+        assert_eq!(ledger.anomalies().span_identity_conflicts(), 1);
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            0,
+            "the provenance counter is the resource level's alone"
+        );
     }
 
     #[test]
@@ -750,6 +889,9 @@ mod metric_points {
             resource: resource(),
             scope: scope(),
             name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: Attributes::default(),
             kind,
             temporality,
         }
@@ -1325,9 +1467,6 @@ mod metric_points {
         let mut ledger = ledger();
         let stream = MetricStream::new(
             stream_identity(StreamKind::Gauge, None),
-            None,
-            None,
-            Attributes::default(),
             vec![gauge_point(1, 1), gauge_point(2, 2)],
         )
         .expect("a coherent stream");
@@ -1343,6 +1482,195 @@ mod metric_points {
             outcomes[0].stream.as_ref().expect("interned"),
             outcomes[1].stream.as_ref().expect("interned")
         ));
+    }
+
+    #[test]
+    fn ten_thousand_points_of_one_stream_clone_nothing_into_the_keys() {
+        // The ADR 0008 proof at scale: N points of one stream must cost one
+        // stream payload and N record payloads — zero per-point copies of
+        // attribute sets or identity bytes. There is no counting-allocator
+        // harness here (the workspace forbids `unsafe`, and a global
+        // allocator override is exactly that), so the proof is by `Arc`
+        // identity and exact refcounts, which cannot pass if anything was
+        // cloned: a cloned attribute set would leave the record's own
+        // refcount at 1 while a second allocation lived, and a cloned
+        // stream payload would break the `ptr_eq` sweep below.
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(1, 1, 0));
+        let interned = Arc::clone(first.stream.as_ref().expect("interned"));
+        // Hand the first record handle back too: after this, the only
+        // owners of any record payload are the ledger keys themselves.
+        drop(first);
+        for time in 2..=10_000_u64 {
+            let admission = ledger.admit_metric_point(&identity, sum_point(1, time, 0));
+            assert!(admission.outcome.entity().is_some(), "admitted at {time}");
+        }
+        assert_eq!(ledger.streams.len(), 1, "one stream, one payload");
+        assert_eq!(ledger.points.len(), 10_000);
+        // Every key shares the one interned stream payload.
+        let mut saw_keys = 0;
+        for key in ledger.assigned_points.values() {
+            assert!(
+                Arc::ptr_eq(&key.stream, &interned),
+                "every point key references the interned stream — never a copy"
+            );
+            // The key holds the record itself: exactly one allocation per
+            // point, owned by the key, nothing duplicated beside it. Two
+            // key tables (points + assigned index) share the one key Arc.
+            assert_eq!(
+                Arc::strong_count(&key.point),
+                1,
+                "the record lives once, inside its key"
+            );
+            saw_keys += 1;
+        }
+        assert_eq!(saw_keys, 10_000);
+        // Stream refcount: the intern set (1) + 10,000 point keys (10,000)
+        // + this test's handle (1). Nothing else holds a copy.
+        assert_eq!(Arc::strong_count(&interned), 10_002);
+    }
+
+    #[test]
+    fn a_redelivery_under_a_changed_descriptor_is_a_recorded_stream_conflict() {
+        // FIX 1's law at the ledger level: the descriptor is stream
+        // identity, but the collapse key is the descriptor-less OTel key —
+        // so the same point re-sent under a changed description lands on
+        // the standing key and is a recorded conflict, the first
+        // descriptor standing. The refused delivery's fresh intern is
+        // undone: a conflict leaves no interned stream behind, exactly
+        // like a refusal.
+        let mut ledger = ledger();
+        let mut described = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        described.description = Some("requests being served".to_owned());
+        let mut changed = described.clone();
+        changed.description = Some("requests queued at the gate".to_owned());
+        assert_ne!(described, changed, "the descriptor is full identity");
+
+        let first = ledger.admit_metric_point(&described, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let standing_stream = first.stream.expect("interned");
+        assert_eq!(ledger.resident_streams(), 1);
+
+        let redelivered = ledger.admit_metric_point(&changed, sum_point(100, 200, 5));
+        assert_eq!(
+            redelivered.outcome,
+            AdmissionOutcome::Conflict { entity: standing },
+            "the same point under a changed descriptor is a conflict, \
+             never a silent merge"
+        );
+        assert!(redelivered.record.is_none());
+        assert!(
+            redelivered.stream.is_none(),
+            "a refused delivery hands out nothing it did not earn"
+        );
+        assert_eq!(
+            ledger.anomalies().point_identity_conflicts(),
+            1,
+            "the conflict is recorded, observable"
+        );
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "the fresh intern made for the refused delivery is undone"
+        );
+        assert!(
+            ledger
+                .streams
+                .iter()
+                .all(|interned| Arc::ptr_eq(interned, &standing_stream)),
+            "the first descriptor stands; nothing parallel was admitted"
+        );
+
+        // A *different* point under the changed descriptor is not a
+        // re-delivery: it admits as the second stream it is.
+        let second_stream = ledger.admit_metric_point(&changed, sum_point(100, 201, 5));
+        let second = assert_admitted(&second_stream);
+        assert_ne!(second, standing);
+        assert_eq!(
+            ledger.resident_streams(),
+            2,
+            "two distinct descriptors, two interned streams"
+        );
+        let second_stream_handle = second_stream.stream.expect("interned");
+        assert_eq!(
+            second_stream_handle.description(),
+            Some("requests queued at the gate"),
+            "the second stream keeps its own descriptor, byte-exact"
+        );
+    }
+
+    #[test]
+    fn a_resource_schema_url_drift_collapses_points_and_records_the_mismatch() {
+        // The asymmetry, point half: the resource's schema_url is
+        // provenance outside stream identity, so the drifted re-delivery
+        // interns onto the standing stream and collapses — and the drift
+        // is recorded as its own anomaly, never swallowed.
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let mut drifted = identity.clone();
+        drifted.resource.schema_url = Some("https://schema/v2".to_owned());
+        assert_eq!(
+            drifted, identity,
+            "the resource's schema_url is not stream identity"
+        );
+        let second = ledger.admit_metric_point(&drifted, sum_point(100, 200, 5));
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Collapsed { entity: standing },
+            "equal content across the resource schema drift collapses"
+        );
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            1,
+            "the drift is recorded, observable"
+        );
+        assert_eq!(ledger.anomalies().total(), 1);
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "the drifted delivery interned onto the standing stream"
+        );
+    }
+
+    #[test]
+    fn a_scope_schema_url_change_admits_a_second_stream_never_a_mismatch() {
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let mut rescoped = identity.clone();
+        rescoped.scope.schema_url = Some("https://scope-schema/v2".to_owned());
+        assert_ne!(
+            rescoped, identity,
+            "the scope's schema_url participates in identity"
+        );
+        let second = ledger.admit_metric_point(&rescoped, sum_point(100, 200, 5));
+        let second_entity = assert_admitted(&second);
+        assert_ne!(
+            second_entity, standing,
+            "the scope's schema_url made a second stream"
+        );
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            0,
+            "the provenance counter is the resource level's alone"
+        );
+        assert_eq!(ledger.resident_streams(), 2);
     }
 
     #[test]

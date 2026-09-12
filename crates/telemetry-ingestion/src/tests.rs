@@ -817,6 +817,78 @@ fn a_differing_redelivery_is_a_recorded_conflict() {
     harness.drain();
 }
 
+#[test]
+fn a_resource_schema_url_drift_collapses_and_a_scope_drift_conflicts() {
+    // The schema_url asymmetry, end to end: the resource's `schema_url` is
+    // provenance outside identity — a re-delivery across the drift
+    // collapses onto the standing span and the drift is counted as its own
+    // anomaly. The scope's `schema_url` participates in identity — the
+    // same drift there is a conflict, and the provenance counter does not
+    // move.
+    let harness = Harness::new();
+    let first = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(trace_span("op", T1, S1)))
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let drifted = encode(&traces_request(vec![resource_spans_with_schema_url(
+        "https://schema/v2",
+        Some(resource(Vec::new())),
+        vec![scope_spans(
+            Some(scope("test")),
+            vec![trace_span("op", T1, S1)],
+        )],
+    )]));
+    let second = harness
+        .pipeline
+        .ingest_spans(now(), &drifted)
+        .expect("walked");
+    assert!(
+        matches!(&second.records[0], RecordOutcome::Collapsed { .. }),
+        "equal content across the resource schema drift collapses: {second:?}"
+    );
+    assert_eq!(standing_entity(&second, 0), standing_entity(&first, 0));
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the drift is recorded, observable"
+    );
+    assert_eq!(harness.pipeline.anomalies().span_identity_conflicts(), 0);
+
+    let rescoped = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![scope_spans_with_schema_url(
+            "https://scope-schema/v2",
+            Some(scope("test")),
+            vec![trace_span("op", T1, S1)],
+        )],
+    )]));
+    let third = harness
+        .pipeline
+        .ingest_spans(now(), &rescoped)
+        .expect("walked");
+    assert!(
+        matches!(&third.records[0], RecordOutcome::Conflict { .. }),
+        "the scope's schema_url participates in identity: {third:?}"
+    );
+    assert_eq!(standing_entity(&third, 0), standing_entity(&first, 0));
+    assert_eq!(harness.pipeline.anomalies().span_identity_conflicts(), 1);
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the provenance counter is the resource level's alone"
+    );
+
+    let drained = harness.drain();
+    assert_eq!(
+        drained.len(),
+        1,
+        "collapse and conflict queue nothing: the standing span is the story"
+    );
+    assert_eq!(drained[0].entity, standing_entity(&first, 0));
+}
+
 // ---------------------------------------------------- resource envelopes
 
 #[test]
@@ -1086,7 +1158,11 @@ fn the_default_configuration_constructs() {
 fn saturation_mid_export_keeps_records_already_admitted() {
     // Shrunken budgets shrink the legal-record bound, so a queue at the
     // bound — one the construction gate accepts — can still overflow on a
-    // multi-record export.
+    // multi-record export. How many of these spans fit is *derived* from
+    // the measured record against the bound, not assumed: the bound is a
+    // max over every record kind's formula, so a shape change in any one
+    // formula moves it, and the fixture saturates at whatever whole
+    // multiple the measurement says.
     let limits = BudgetLimits {
         attributes_per_signal: 1,
         attributes_per_nested_set: 1,
@@ -1100,9 +1176,9 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     let bound = Pipeline::legal_record_bound_bytes(&limits);
 
     // Every span here carries one attribute at the per-entry cap
-    // (`160 + 1 + 95 == 256 == attribute_value_bytes`): attribute payload is
-    // what makes the span large enough that two fit a bound-sized queue and
-    // three do not.
+    // (`160 + 1 + 95 == 256 == attribute_value_bytes`): attribute payload
+    // is what keeps the span a healthy fraction of the bound, so the
+    // saturating export stays small.
     let sized_span = |name: &str, span_id: [u8; 8]| {
         let mut span = trace_span(name, T1, span_id);
         span.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
@@ -1121,33 +1197,33 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         .expect("one queued span")
         .record
         .accounted_size();
+    let fits = bound / measured;
     assert!(
-        2 * measured <= bound,
-        "the fixture assumes two of these spans fit a bound-sized queue"
+        fits >= 2,
+        "the fixture needs a multi-span export to overflow: bound \
+         {bound}, measured {measured}"
     );
-    assert!(
-        3 * measured > bound,
-        "the fixture assumes a third span saturates a bound-sized queue"
-    );
+    // The saturating export carries exactly one span too many.
+    let offered = fits + 1;
 
-    // A bound-sized queue: every single legal record fits, two of these
-    // spans fit, three do not.
+    // A bound-sized queue: every single legal record fits, `fits` of these
+    // spans fit, `offered` does not.
     let (queue, pipeline) = pipeline_over(bound, limits);
+    let spans: Vec<_> = (1..=offered)
+        .map(|index| {
+            let mut span_id = [0u8; 8];
+            span_id[0] = u8::try_from(index).expect("a few spans");
+            sized_span(&format!("span-{index}"), span_id)
+        })
+        .collect();
     let payload = encode(&traces_request(vec![resource_spans(
         Some(resource(Vec::new())),
-        vec![scope_spans(
-            Some(scope("test")),
-            vec![
-                sized_span("aaa", S1),
-                sized_span("bbb", S2),
-                sized_span("ccc", [0x33; 8]),
-            ],
-        )],
+        vec![scope_spans(Some(scope("test")), spans)],
     )]));
 
     let signal = pipeline
         .ingest_spans(now(), &payload)
-        .expect_err("three spans, a two-span queue");
+        .expect_err("one span too many for a queue at the bound");
     assert!(matches!(
         &signal,
         AdmissionSignal::QueueSaturated { ceiling_bytes, .. } if *ceiling_bytes == bound
@@ -1155,16 +1231,16 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     assert!(signal.is_retryable(), "overflow rejects the producer");
     assert_eq!(
         queue.len(),
-        2,
+        fits,
         "the records offered before saturation stay handed off"
     );
 
     // The producer retries the whole export, at a later admission time.
-    // All three re-deliveries collapse onto standing records — aaa and bbb
-    // behind their queue entries, ccc behind its ledger admission whose
-    // one offer was the refusal the signal named — and a collapse queues
-    // NOTHING. The queue keeps exactly the two entries the first attempt
-    // made, with their original admission times.
+    // Every re-delivery collapses onto a standing record — the first
+    // `fits` behind their queue entries, the last behind its ledger
+    // admission whose one offer was the refusal the signal named — and a
+    // collapse queues NOTHING. The queue keeps exactly the entries the
+    // first attempt made, with their original admission times.
     let outcome = pipeline
         .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
         .expect("a retry of standing records collapses without offering");
@@ -1175,9 +1251,9 @@ fn saturation_mid_export_keeps_records_already_admitted() {
             .all(|record| matches!(record, RecordOutcome::Collapsed { .. })),
         "every span of the retry is a collapse: {outcome:?}"
     );
-    assert_eq!(queue.len(), 2, "a collapse never queues");
+    assert_eq!(queue.len(), fits, "a collapse never queues");
     let drained = drain_queue(&queue);
-    assert_eq!(drained.len(), 2);
+    assert_eq!(drained.len(), fits);
     for record in &drained {
         assert_eq!(
             record.admitted_at,
@@ -1186,7 +1262,7 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         );
     }
 
-    // The consumer has drained everything. The third span's standing
+    // The consumer has drained everything. The refused span's standing
     // record — ledger-admitted, but its one offer was the refusal the
     // signal named — re-delivers as a collapse that queues nothing. The
     // signal, not a silent drop, is the record of the delivery that never
@@ -1195,7 +1271,7 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
         .expect("walked");
     assert!(matches!(
-        &outcome.records[2],
+        &outcome.records[fits],
         RecordOutcome::Collapsed { .. }
     ));
     assert!(queue.is_empty());

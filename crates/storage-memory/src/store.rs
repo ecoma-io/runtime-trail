@@ -52,6 +52,7 @@ struct Counters {
     oversized_refusals: u64,
     duplicate_keeps: u64,
     kept_out_series_cap: u64,
+    identity_over_ceiling_refusals: u64,
     hook_deliveries: u64,
 }
 
@@ -74,7 +75,11 @@ struct Counters {
 /// the same removal that reports [`EvictionHook::stream_released`]. The
 /// series cap bounds how many streams may be resident at all: a keep
 /// establishing a new stream beyond it is refused
-/// (`KeepOutcome::SeriesCapReached`), never evicting for it.
+/// (`KeepOutcome::SeriesCapReached`), never evicting for it. And an
+/// identity the ceiling cannot hold on its own is refused before the
+/// insert (`KeepOutcome::IdentityOverCeiling`, naming the ceiling and the
+/// identity's size): evicting into a charge that is over the cap by
+/// itself could never satisfy the ceiling.
 pub struct InMemoryStore {
     config: MemoryConfig,
     window_nanos: u64,
@@ -304,6 +309,7 @@ impl InMemoryStore {
             oversized_refusals: self.counters.oversized_refusals,
             duplicate_keeps: self.counters.duplicate_keeps,
             kept_out_series_cap: self.counters.kept_out_series_cap,
+            identity_over_ceiling_refusals: self.counters.identity_over_ceiling_refusals,
             hook_deliveries: self.counters.hook_deliveries,
             admission_anomalies: self.anomalies,
         }
@@ -319,8 +325,9 @@ fn accounted_u64(record: &(impl Accounted + ?Sized)) -> u64 {
 /// The refusals every keep runs before anything is inserted: the record's
 /// own accounted size against the byte ceiling (no amount of eviction
 /// could keep it), then the duplicate check (the resident record stands).
-/// The series-cap refusal is the metric-point keep's alone; it runs after
-/// these, also before any insert.
+/// The identity-over-ceiling refusal and the series-cap refusal are the
+/// metric-point keep's alone; they run after these, also before any
+/// insert.
 fn refuse_early<R: Accounted>(
     shelf: &Shelf<R>,
     entity: EntityId,
@@ -409,6 +416,22 @@ impl TelemetryStore for InMemoryStore {
             &mut self.counters,
         ) {
             return outcome;
+        }
+        // The identity charge a keep would owe: when the stream's first
+        // resident point enters, the series table adds the identity's
+        // accounted size to the byte ceiling. An identity already over
+        // the ceiling on its own can never be kept — no amount of
+        // eviction shrinks a charge that is over the cap by itself — so
+        // the keep is refused before anything is inserted, evicting
+        // nothing, naming the ceiling and the identity's size.
+        // Non-retryable: the identity is payload content.
+        let identity_bytes = accounted_u64(stream.as_ref());
+        if identity_bytes > self.config.max_accounted_bytes {
+            self.counters.identity_over_ceiling_refusals += 1;
+            return KeepOutcome::IdentityOverCeiling {
+                ceiling: self.config.max_accounted_bytes,
+                identity_bytes,
+            };
         }
         if !self.series.contains_key(stream.as_ref())
             && self.resident_streams() >= self.config.series_cap

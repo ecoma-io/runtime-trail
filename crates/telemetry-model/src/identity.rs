@@ -49,7 +49,11 @@ impl EntityId {
 
 /// One admission-assigned serial. Opaque: the value carries no meaning
 /// beyond session-scoped uniqueness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// The derived [`Ord`] is serial order — admission order within the
+/// session — the total order the ledger's assigned-id index needs for its
+/// ordered map. Opacity is about *meaning*, not orderability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssignedId {
     pub(crate) serial: NonZeroU64,
 }

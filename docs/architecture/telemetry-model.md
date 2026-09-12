@@ -127,6 +127,16 @@ empty; the unit is opaque at the model level — no unit grammar is interpreted
 here), its `metadata` (preserved as an attribute map; duplicate keys refused
 as everywhere), its scope and resource (below), and its points.
 
+**The descriptor is stream identity.** Name, description, unit and metadata
+are one identity unit: two metrics that differ in any of them are two
+distinct streams — never a merge under one name, and never a
+last-write-wins rewrite of a standing description. A re-delivery of a stream
+whose descriptor differs from the standing one is a **stream-identity
+conflict**: the first descriptor stands and the divergence is recorded as an
+admission anomaly ([below](#record-identity-and-duplicate-delivery)). The
+descriptor is identity content all the way down — interned, compared
+byte-exactly, and charged to byte ceilings with the rest of the identity.
+
 - **The five OTLP kinds are distinct model-level shapes**: gauge; sum (with
   its monotonicity flag preserved — it changes what the number means, and it
   is never inferred); histogram; exponential histogram (scale, zero count and
@@ -235,10 +245,19 @@ Idempotent admission is therefore a model requirement, not an optimisation.
 - **Collapse happens only where the OTel data model itself defines
   identity.** A re-delivered span (same `trace_id` + `span_id`) is the same
   span: it collapses onto the one already admitted. A re-delivered metric
-  point (same stream identity — resource, scope, name, kind, temporality —
-  plus the point's attribute set, `start_time`, `time`, and flags; for
+  point (same stream identity — resource, scope, name, description, unit,
+  metadata, kind, temporality — plus the point's attribute set,
+  `start_time`, `time`, and flags; for
   gauges the point is (stream, `time`, flags) and a sent `start_time` is
   normalised out of the identity) is the same data point: it collapses.
+- **Provenance drift under a collapse is recorded, not swallowed.** The
+  resource's `schema_url` is provenance outside identity, so a re-delivery
+  whose resource `schema_url` differs from the standing record's still
+  collapses — identical content is one record — and the drift is recorded
+  as a `provenance_mismatches` admission anomaly. The scope's `schema_url`
+  is the opposite: it participates in identity, so the same drift resolves
+  as a conflict (a re-delivered span) or a second stream (a metric point
+  under a rescoped stream), never as a provenance mismatch.
 - **Log records are never collapsed.** OTLP defines no log-record identity,
   and this model refuses to invent a destructive one: two byte-identical log
   records are two admitted records — the emitter sent two. Duplicate
@@ -307,7 +326,8 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   when measurements land — never a claim made here.
 - **Byte ceilings count what residency pins — stream identities included.**
   A metric point references a stream identity (resource, scope, name,
-  kind, temporality) whose content the point's own accounted size does not
+  description, unit, metadata, kind, temporality) whose content the point's
+  own accounted size does not
   carry. The store therefore charges each distinct resident stream's
   identity accounted size exactly once — added when the stream's first
   point enters residency, released when its last point leaves — so a

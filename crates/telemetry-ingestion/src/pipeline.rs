@@ -227,10 +227,11 @@ impl Pipeline {
     /// accounted size is at most its map's one node charge plus
     /// `count × attribute_value_bytes`. A record's budget-shaped spend is
     /// its own attribute set plus its resource's and scope's, and — per
-    /// span — every event's and link's set; per point — every exemplar's.
-    /// Taking the three record kinds' worst case gives the bound: a sink
-    /// below it can refuse a legal record forever, so
-    /// [`Pipeline::with_config`] refuses the sink first.
+    /// span — every event's and link's set; per point — the stream
+    /// identity's metadata set and every exemplar's. Taking the three
+    /// record kinds' worst case gives the bound: a sink below it can
+    /// refuse a legal record forever, so [`Pipeline::with_config`]
+    /// refuses the sink first.
     ///
     /// Everything a record carries *outside* those sets — names, ids,
     /// timestamps, fixed-width fields, and value payloads the budgets do
@@ -247,7 +248,10 @@ impl Pipeline {
         let span = signal_sets
             + limits.span_events_per_span * attribute_set(limits.attributes_per_nested_set)
             + limits.span_links_per_span * attribute_set(limits.attributes_per_nested_set);
+        // A metric point's stream identity carries a fourth per-signal set:
+        // the metric's metadata.
         let point = signal_sets
+            + attribute_set(limits.attributes_per_signal)
             + limits.exemplars_per_data_point * attribute_set(limits.attributes_per_nested_set);
         span.max(point)
     }

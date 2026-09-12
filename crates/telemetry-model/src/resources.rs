@@ -9,13 +9,15 @@
 //! `service.name`.
 //!
 //! The resource's `schema_url` is preserved *metadata*: [`Resource`]'s
-//! `PartialEq`/`Hash` compare the attribute map only, so every identity
-//! built on the type (stream identity, duplicate detection, ledger keys)
-//! inherits attribute-map equality and never a `schema_url` coincidence.
-//! The full-field comparison lives in [`Resource::identical`], clearly
-//! named for the rare caller that wants byte equality of the whole struct.
+//! `PartialEq`/`Hash`/`Ord` compare the attribute map only, so every
+//! identity built on the type (stream identity, duplicate detection,
+//! ledger keys) inherits attribute-map equality and never a `schema_url`
+//! coincidence. The full-field comparison lives in [`Resource::identical`],
+//! clearly named for the rare caller that wants byte equality of the whole
+//! struct.
 
 use crate::values::Attributes;
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 /// The resource a batch of signals was emitted under.
@@ -45,6 +47,22 @@ impl PartialEq for Resource {
 }
 
 impl Eq for Resource {}
+
+impl PartialOrd for Resource {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Resource {
+    /// Attribute-map order — the same content [`PartialEq`] compares. The
+    /// `schema_url` and the dropped count are metadata and are skipped, so
+    /// `a == b` exactly when `a.cmp(b)` is `Equal`. This is the order
+    /// identity keys need for ordered — never hashed — maps (ADR 0008).
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.attributes.cmp(&other.attributes)
+    }
+}
 
 impl Hash for Resource {
     /// Hashes the attribute map only — consistent with [`Resource::eq`].
@@ -80,13 +98,15 @@ impl Resource {
 
 /// The instrumentation scope a signal was emitted from.
 ///
-/// Scope identity is the whole of (name, version, attributes,
-/// `schema_url`): the same name with a different version is a different
-/// scope, an empty name is valid, and the scope-level `schema_url`
-/// participates in the identity (unlike the resource's). The
-/// emitter-reported dropped-attributes count is preserved as data and does
-/// not participate in identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Scope identity is the **full field set**: (name, version, attributes,
+/// `schema_url`, dropped count). The same name with a different version is
+/// a different scope, an empty name is valid, and the scope-level
+/// `schema_url` participates in the identity (unlike the resource's) —
+/// telemetry-model.md, "Resource and scope identity". The
+/// emitter-reported dropped-attributes count is part of that full-field
+/// set at the scope level, again unlike the resource level, where it stays
+/// metadata.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstrumentationScope {
     /// The scope name, as sent; the empty string is a valid name.
     pub name: String,

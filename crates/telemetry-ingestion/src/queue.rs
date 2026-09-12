@@ -34,8 +34,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use runtime_trail_telemetry_model::{
-    Accounted, AdmissionTime, EntityId, LogRecord, MetricPoint, STRUCTURE_FIXED_BYTES, Span,
-    StreamIdentity, heap_string_bytes,
+    Accounted, AdmissionTime, EntityId, LogRecord, MetricPoint, Span, StreamIdentity,
 };
 
 use crate::signal::AdmissionSignal;
@@ -104,15 +103,11 @@ impl Accounted for StoredRecord {
             Self::Span(span) => span.accounted_size(),
             Self::Log(record) => record.accounted_size(),
             Self::Point { stream, point } => {
-                // The model implements accounted size for the point and for
-                // the identity's resource and scope; the identity's own
-                // fixed fields and name complete the charge by the same
-                // formula (structure fixed bytes + named-string bytes).
-                point.accounted_size()
-                    + STRUCTURE_FIXED_BYTES
-                    + stream.resource.accounted_size()
-                    + stream.scope.accounted_size()
-                    + heap_string_bytes(&stream.name)
+                // The identity's whole accounted content — resource, scope,
+                // name and descriptor (description, unit, metadata) — rides
+                // with the point: one formula, the model's own
+                // `StreamIdentity::accounted_size`.
+                point.accounted_size() + stream.accounted_size()
             }
         }
     }

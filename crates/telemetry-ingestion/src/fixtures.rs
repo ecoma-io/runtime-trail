@@ -171,6 +171,20 @@ pub(crate) fn scope_spans(
     }
 }
 
+/// `scope_spans` carrying a non-empty scope-level `schema_url` — the
+/// scope's `schema_url` participates in scope identity.
+pub(crate) fn scope_spans_with_schema_url(
+    schema_url: &str,
+    scope: Option<common::InstrumentationScope>,
+    spans: Vec<trace::Span>,
+) -> trace::ScopeSpans {
+    trace::ScopeSpans {
+        scope,
+        spans,
+        schema_url: schema_url.to_owned(),
+    }
+}
+
 pub(crate) fn resource_spans(
     resource: Option<resource::Resource>,
     scope_spans: Vec<trace::ScopeSpans>,
@@ -179,6 +193,20 @@ pub(crate) fn resource_spans(
         resource,
         scope_spans,
         schema_url: String::new(),
+    }
+}
+
+/// `resource_spans` carrying a non-empty resource-level `schema_url` —
+/// the resource's `schema_url` is preserved metadata outside identity.
+pub(crate) fn resource_spans_with_schema_url(
+    schema_url: &str,
+    resource: Option<resource::Resource>,
+    scope_spans: Vec<trace::ScopeSpans>,
+) -> trace::ResourceSpans {
+    trace::ResourceSpans {
+        resource,
+        scope_spans,
+        schema_url: schema_url.to_owned(),
     }
 }
 
@@ -242,6 +270,27 @@ pub(crate) fn metric(name: &str, data: metrics::metric::Data) -> metrics::Metric
     }
 }
 
+/// A gauge metric carrying its descriptor: the name plus the description,
+/// unit and metadata the stream identity carries since the descriptor
+/// joined it.
+pub(crate) fn described_metric(
+    name: &str,
+    description: &str,
+    unit: &str,
+    metadata: Vec<common::KeyValue>,
+    points: Vec<metrics::NumberDataPoint>,
+) -> metrics::Metric {
+    metrics::Metric {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        unit: unit.to_owned(),
+        metadata,
+        data: Some(metrics::metric::Data::Gauge(metrics::Gauge {
+            data_points: points,
+        })),
+    }
+}
+
 pub(crate) fn number_point(value: metrics::number_data_point::Value) -> metrics::NumberDataPoint {
     metrics::NumberDataPoint {
         attributes: Vec::new(),
@@ -293,6 +342,21 @@ pub(crate) fn scope_metrics(
     }
 }
 
+/// `scope_metrics` carrying a non-empty scope-level `schema_url` — the
+/// provenance fixtures for the identity law: the scope's `schema_url`
+/// participates in scope identity.
+pub(crate) fn scope_metrics_with_schema_url(
+    schema_url: &str,
+    scope: Option<common::InstrumentationScope>,
+    metrics_list: Vec<metrics::Metric>,
+) -> metrics::ScopeMetrics {
+    metrics::ScopeMetrics {
+        scope,
+        metrics: metrics_list,
+        schema_url: schema_url.to_owned(),
+    }
+}
+
 pub(crate) fn resource_metrics(
     resource: Option<resource::Resource>,
     scope_metrics: Vec<metrics::ScopeMetrics>,
@@ -301,6 +365,21 @@ pub(crate) fn resource_metrics(
         resource,
         scope_metrics,
         schema_url: String::new(),
+    }
+}
+
+/// `resource_metrics` carrying a non-empty resource-level `schema_url` —
+/// the provenance fixtures for the identity law: the resource's
+/// `schema_url` is preserved metadata outside identity.
+pub(crate) fn resource_metrics_with_schema_url(
+    schema_url: &str,
+    resource: Option<resource::Resource>,
+    scope_metrics: Vec<metrics::ScopeMetrics>,
+) -> metrics::ResourceMetrics {
+    metrics::ResourceMetrics {
+        resource,
+        scope_metrics,
+        schema_url: schema_url.to_owned(),
     }
 }
 

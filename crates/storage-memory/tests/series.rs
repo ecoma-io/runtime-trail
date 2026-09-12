@@ -343,3 +343,95 @@ fn the_hook_sees_one_release_per_stream_exit() {
 
 // The Arc the tests share stream identities through.
 use std::sync::Arc;
+
+/// An identity the ceiling cannot hold on its own is refused before
+/// anything is inserted, evicting nothing, naming the ceiling and the
+/// identity's size — and the store stays fully usable for legal streams.
+/// The flagged edge: an over-cap identity must never be answered by
+/// evicting the store's records (eviction cannot shrink a charge that is
+/// over the cap by itself) and must never leave the refused stream's
+/// content resident.
+#[test]
+fn an_identity_over_the_ceiling_is_refused_without_evicting_anything() {
+    // Four legal 4 KiB attributes: a stream identity over the 8 KiB test
+    // ceiling, every attribute inside the model's own per-value budget —
+    // so the payload admitted cleanly and the refusal is a keep-time
+    // fact, not an admission one.
+    let over = heavy_stream("over", 4, 4_096);
+    let identity_bytes = u64::try_from(over.accounted_size()).expect("test sizes fit");
+    let ceiling = 8 * 1024;
+    assert!(
+        identity_bytes > ceiling,
+        "the fixture is the over-cap shape: {identity_bytes} against {ceiling}"
+    );
+
+    let hook = SharedRecordingHook::default();
+    let mut store = boxed(
+        config(u64::MAX, ceiling, u64::MAX),
+        Some(Box::new(hook.clone())),
+    );
+    // A legal record enters first: whatever the refusal does, it must not
+    // touch what already stands.
+    let kept = store.keep_metric_point(
+        admitted(assigned(1), 10, gauge_point(10, 1)),
+        bare_stream("legal"),
+    );
+    assert!(matches!(kept, KeepOutcome::Kept { evicted: 0 }));
+
+    let refused = store.keep_metric_point(admitted(assigned(2), 20, gauge_point(20, 1)), over);
+    assert_eq!(
+        refused,
+        KeepOutcome::IdentityOverCeiling {
+            ceiling,
+            identity_bytes,
+        },
+        "the refusal names the cap and the identity's size"
+    );
+    assert_eq!(refused.evicted(), 0, "a refusal never evicts");
+
+    let stats = store.stats();
+    assert_eq!(
+        stats.identity_over_ceiling_refusals, 1,
+        "the refusal is counted, observable"
+    );
+    assert_eq!(stats.total_evictions(), 0, "nothing was evicted to try");
+    assert_eq!(
+        stats.resident_metric_points, 1,
+        "only the legal point is resident"
+    );
+    assert_eq!(
+        stats.resident_streams, 1,
+        "the refused stream never entered"
+    );
+    assert_eq!(
+        stats.accounted_bytes,
+        stats.record_accounted_bytes + stats.identity_accounted_bytes,
+        "the refused identity is charged nowhere"
+    );
+    let legal_identity_bytes =
+        u64::try_from(bare_stream("legal").accounted_size()).expect("test sizes fit");
+    assert_eq!(
+        stats.identity_accounted_bytes, legal_identity_bytes,
+        "the over-cap identity left no charge behind"
+    );
+    assert!(store.metric_point(assigned(2)).is_none());
+    assert!(
+        store.metric_point(assigned(1)).is_some(),
+        "the legal record that stood before the refusal still stands"
+    );
+    {
+        let recorded = hook.0.lock().expect("hook lock poisoned");
+        assert!(
+            recorded.evicted.is_empty() && recorded.streams_released.is_empty(),
+            "the hook saw nothing: no record left, no stream released"
+        );
+    }
+
+    // The store is unpoisoned by the refusal: another legal stream keeps
+    // cleanly under the same ceiling.
+    let after = store.keep_metric_point(
+        admitted(assigned(3), 30, gauge_point(30, 1)),
+        bare_stream("legal-two"),
+    );
+    assert!(matches!(after, KeepOutcome::Kept { evicted: 0 }));
+}

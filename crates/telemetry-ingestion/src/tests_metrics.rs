@@ -280,6 +280,412 @@ fn metric_streams_intern_across_envelopes() {
     );
 }
 
+#[test]
+fn two_same_named_metrics_differing_only_in_description_are_two_streams() {
+    let harness = Harness::new();
+    // Same instrument name, same everything — except the description, and
+    // (necessarily) the point times: the same data point re-sent under a
+    // changed descriptor is a conflict, not a second stream (see the
+    // conflict test below). Two *different* points under two descriptors
+    // are two streams, side by side in one export.
+    let mut second = number_point(as_double(1.0));
+    second.time_unix_nano = 11;
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![
+                described_metric(
+                    "in-flight",
+                    "requests being served",
+                    "1",
+                    vec![],
+                    vec![number_point(as_double(1.0))],
+                ),
+                described_metric(
+                    "in-flight",
+                    "requests queued at the gate",
+                    "1",
+                    vec![],
+                    vec![second],
+                ),
+            ],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(
+        outcome.admitted(),
+        2,
+        "same name, different description: two streams"
+    );
+
+    let queued = harness.drain();
+    let [
+        QueuedRecord {
+            record: StoredRecord::Point { stream: a, .. },
+            ..
+        },
+        QueuedRecord {
+            record: StoredRecord::Point { stream: b, .. },
+            ..
+        },
+    ] = queued.as_slice()
+    else {
+        panic!("expected two queued points");
+    };
+    assert!(
+        !Arc::ptr_eq(a, b),
+        "distinct identities intern to distinct streams"
+    );
+    let mut descriptions: Vec<_> = [a, b].iter().map(|s| s.description().unwrap()).collect();
+    descriptions.sort_unstable();
+    assert_eq!(
+        descriptions,
+        ["requests being served", "requests queued at the gate"],
+        "each stream keeps its own description intact"
+    );
+}
+
+#[test]
+fn a_point_redelivered_under_a_changed_descriptor_is_a_recorded_conflict() {
+    let harness = Harness::new();
+    // The descriptor is stream identity — but the collapse key is the
+    // descriptor-less OTel key, so a re-delivery of the *same point* under
+    // a changed description lands on the standing point. The law fires:
+    // the first descriptor stands, the divergence is a recorded conflict,
+    // and the refused delivery admits nothing — no second stream, no
+    // second queue entry, no interned stream left behind.
+    let point_at = |description: &str, time: u64| {
+        let mut point = number_point(as_double(1.0));
+        point.time_unix_nano = time;
+        encode(&metrics_request(vec![resource_metrics(
+            Some(resource(Vec::new())),
+            vec![scope_metrics(
+                Some(scope("test")),
+                vec![described_metric(
+                    "in-flight",
+                    description,
+                    "1",
+                    vec![],
+                    vec![point],
+                )],
+            )],
+        )]))
+    };
+
+    let first_payload = point_at("requests being served", 10);
+    let redelivery_payload = point_at("requests queued at the gate", 10);
+
+    let first = harness
+        .pipeline
+        .ingest_metrics(now(), &first_payload)
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let redelivery = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &redelivery_payload)
+        .expect("walked");
+    assert!(
+        matches!(&redelivery.records[0], RecordOutcome::Conflict { .. }),
+        "a re-delivery under a changed descriptor is a conflict: {redelivery:?}"
+    );
+    assert_eq!(
+        harness.drain().len(),
+        1,
+        "the standing entry is the whole story; the conflict queues nothing"
+    );
+
+    // The refused delivery left nothing behind: the changed descriptor is
+    // not interned, and a *different point* under it admits as the second
+    // stream it is — first descriptor standing beside it.
+    let new_point_payload = point_at("requests queued at the gate", 11);
+    let second = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &new_point_payload)
+        .expect("walked");
+    assert_eq!(second.admitted(), 1, "a new point is not a re-delivery");
+    let queued = harness.drain();
+    assert_eq!(queued.len(), 1);
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.description(),
+        Some("requests queued at the gate"),
+        "the second stream carries its own descriptor"
+    );
+}
+
+#[test]
+fn a_resource_schema_url_drift_collapses_points_and_a_scope_drift_is_a_new_stream() {
+    // The schema_url asymmetry on the metrics side, over the wire: the
+    // resource's `schema_url` is provenance outside identity — the drifted
+    // re-delivery collapses onto the standing point and the drift is
+    // counted as its own anomaly. The scope's `schema_url` participates in
+    // identity — the same drift there admits the second stream it is, and
+    // the provenance counter does not move.
+    let harness = Harness::new();
+    let point_at = |time: u64| {
+        let mut point = number_point(as_double(1.0));
+        point.time_unix_nano = time;
+        point
+    };
+    let first_payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let first = harness
+        .pipeline
+        .ingest_metrics(now(), &first_payload)
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let drifted = encode(&metrics_request(vec![resource_metrics_with_schema_url(
+        "https://schema/v2",
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let second = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &drifted)
+        .expect("walked");
+    assert!(
+        matches!(&second.records[0], RecordOutcome::Collapsed { .. }),
+        "equal content across the resource schema drift collapses: {second:?}"
+    );
+    assert_eq!(standing_entity(&second, 0), standing_entity(&first, 0));
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the drift is recorded, observable"
+    );
+    assert_eq!(
+        harness.drain().len(),
+        1,
+        "a collapse never re-offers the standing point"
+    );
+
+    let rescoped = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics_with_schema_url(
+            "https://scope-schema/v2",
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let third = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &rescoped)
+        .expect("walked");
+    assert_eq!(
+        third.admitted(),
+        1,
+        "the scope's schema_url participates in identity: a new stream"
+    );
+    assert_ne!(
+        standing_entity(&third, 0),
+        standing_entity(&first, 0),
+        "a different scope is a different stream"
+    );
+    let queued = harness.drain();
+    assert_eq!(queued.len(), 1);
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.scope.schema_url.as_deref(),
+        Some("https://scope-schema/v2"),
+        "the second stream carries its own scope provenance"
+    );
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the provenance counter is the resource level's alone"
+    );
+}
+
+#[test]
+fn the_descriptor_survives_decode_byte_exact() {
+    let harness = Harness::new();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "in-flight",
+                "requests being served",
+                "ms",
+                vec![
+                    attr("tier", str_value("edge")),
+                    attr("team", str_value("edge")),
+                ],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+
+    let queued = harness.drain();
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.description(),
+        Some("requests being served"),
+        "the description decodes whole"
+    );
+    assert_eq!(stream.unit(), Some("ms"));
+    let keys: Vec<&str> = stream
+        .metadata()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, ["team", "tier"], "the metadata map arrives whole");
+    assert_eq!(
+        stream.metadata().len(),
+        2,
+        "every sent metadata entry is present"
+    );
+
+    // The empty string is not a description: proto3 strings have no
+    // presence, so an unset description and a "" description arrive
+    // identically and both read as absent — "absent is not empty" holds
+    // at the decode site, not just in the model.
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "bare",
+                "",
+                "",
+                vec![],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+    let queued = harness.drain();
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert!(
+        stream.description().is_none() && stream.unit().is_none(),
+        "\"\" on the wire is absence, not an empty-string descriptor"
+    );
+    assert!(stream.metadata().is_empty());
+}
+
+#[test]
+fn duplicate_metadata_keys_are_a_named_per_record_refusal() {
+    let harness = Harness::new();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "in-flight",
+                "requests being served",
+                "1",
+                vec![
+                    attr("tier", str_value("edge")),
+                    attr("tier", str_value("core")),
+                ],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    assert!(
+        matches!(
+            rejected_reason(&outcome, 0),
+            RecordRejection::DuplicateKey(error) if error.key == "tier"
+        ),
+        "the refusal names the duplicated key"
+    );
+    assert!(
+        harness.drain().is_empty(),
+        "nothing of a refused record is admitted"
+    );
+}
+
+#[test]
+fn stream_metadata_over_budget_refuses_at_each_point_position() {
+    let harness = Harness::new();
+    // Metadata rides the stream identity, and the identity rides every
+    // point — so an over-budget metadata map refuses every point of the
+    // stream, each refusal naming the budget the payload trips. (The
+    // stream-level gate is the ledger's: the whole-stream check cannot see
+    // a payload that arrives point by point.)
+    let oversized = described_metric(
+        "in-flight",
+        "requests being served",
+        "1",
+        vec![attr("blob", str_value(&"a".repeat(5_000)))],
+        vec![number_point(as_double(1.0)), number_point(as_double(2.0))],
+    );
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![oversized])],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    for position in 0..2 {
+        assert!(
+            matches!(
+                rejected_reason(&outcome, position),
+                RecordRejection::Budget(rejection)
+                    if rejection.budget == BudgetName::AttributeValueSize
+            ),
+            "position {position} names the value-size budget"
+        );
+    }
+    assert!(harness.drain().is_empty());
+
+    // The refusal leaves no interned stream behind: the same stream,
+    // within budget, admits cleanly afterwards.
+    let within = described_metric(
+        "in-flight",
+        "requests being served",
+        "1",
+        vec![attr("tier", str_value("edge"))],
+        vec![number_point(as_double(1.0))],
+    );
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![within])],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+    assert_eq!(harness.drain().len(), 1);
+}
+
 // ------------------------------------------------------------- delivery
 
 #[test]

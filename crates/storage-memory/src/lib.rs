@@ -39,6 +39,12 @@
 //!   ([`KeepOutcome::SeriesCapReached`](runtime_trail_storage::KeepOutcome)),
 //!   never answered by eviction. The slot frees exactly when the stream's
 //!   last resident point leaves.
+//! - **An identity the ceiling cannot hold is refused, not evicted
+//!   into**: a keep whose stream identity's accounted size alone exceeds
+//!   the byte ceiling is refused before anything is inserted
+//!   ([`KeepOutcome::IdentityOverCeiling`](runtime_trail_storage::KeepOutcome),
+//!   naming the ceiling and the identity's size) — no amount of eviction
+//!   shrinks a charge that is over the cap by itself.
 //! - **Eviction ends identity**: for each evicted record the wired
 //!   [`EvictionHook`](runtime_trail_storage::EvictionHook) fires with the
 //!   entity id — the composition root's hook calls the admission ledger's

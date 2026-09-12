@@ -27,19 +27,39 @@ owners, zero duplication:
 
 - **Span identities** are keyed by `(TraceId, SpanId)` — a 24-byte key — to
   the `(EntityId, Arc<Span>)` the store holds.
-- **Metric point identities** are keyed by the tuple
-  `(Arc<StreamIdentity>, Attributes, Option<u64> start_time, u64 time, u32 flags)`.
-  The stream identity (resource, scope, name, kind, temporality) is
-  **interned**: one `Arc<StreamIdentity>` per distinct stream, shared between
-  the ledger, the store and every point of the stream.
+- **Metric point identities** are keyed by
+  `Arc<PointIdentity>` — the key _is_ the sharing: it holds the interned
+  `Arc<StreamIdentity>` and the admitted `Arc<MetricPoint>` itself, and
+  projects (resource, scope, name, kind, temporality; the point's
+  attribute set; gauge-normalised `start_time`; `time`; `flags`) into its
+  equality and total order. No attribute set is ever copied into a key —
+  the attribute set lives once, inside the shared record. The stream
+  identity (resource, scope, name, descriptor — description, unit,
+  metadata — kind, temporality) is **interned**: one `Arc<StreamIdentity>`
+  per distinct stream, owned by a content-keyed ordered set, shared
+  between the ledger, the store and every point of the stream.
+- **The point key's projection is descriptor-blind.** The descriptor
+  (description, unit, metadata) is full stream identity, but it is
+  projected _out_ of the collapse key on purpose: a re-delivery of a
+  standing point under a changed descriptor must land on the standing key
+  so the ledger can record a stream conflict — first descriptor standing —
+  instead of silently admitting a parallel stream. A different point under
+  the changed descriptor projects to a different key and admits as the
+  second stream it is. The full identities, descriptor included, are what
+  the ledger compares once the key lands.
 - **Log records carry no ledger entry.** They have no natural identity to
   remember; their ledger cost is zero by design, and no log-specific memory
   is held to deduplicate what must never be deduplicated.
 
-Equality in the ledger is byte-exact by construction: it compares through the
-`Arc`s by dereference — the same comparison law as the model's own `PartialEq`
-— with no hashing anywhere in the ledger. There is no collision case to
-rule out, because there is no hash.
+The ledger's maps are **ordered** (`BTreeMap`/`BTreeSet`) keyed by total
+orders over identity content. Equality in the ledger is byte-exact by
+construction: it compares through the `Arc`s by dereference — the same
+comparison law as the model's own `PartialEq` — with no hashing anywhere in
+the ledger. There is no collision case to rule out, because there is no
+hash. The orders themselves are comparison orders, not canonical encodings:
+floats order by IEEE-754 bit pattern (equal bits `Equal`, different bits
+never equal — `-0.0` and `0.0` stay distinct, a NaN equals only its own bit
+pattern), exactly the equality the model defines.
 
 **Eviction and identity are one lifecycle.** Evicting a record calls
 `forget(identity)`: the identity entry lives exactly as long as the record's

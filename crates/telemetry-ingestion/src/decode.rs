@@ -156,6 +156,7 @@ fn key_field(field: &'static str) -> &'static str {
         "span event attribute" => "span event attribute key",
         "span link attribute" => "span link attribute key",
         "log attribute" => "log attribute key",
+        "metric metadata" => "metric metadata key",
         "data point attribute" => "data point attribute key",
         "exemplar filtered attribute" => "exemplar filtered attribute key",
         other => other,
@@ -455,7 +456,9 @@ pub(crate) fn log_record(
 /// One metric stream's identity from a `Metric` message: name, description
 /// and unit verbatim (absent is not empty), metadata as an attribute map,
 /// resource and scope, and the kind/temporality pair the `data` oneof
-/// declares. A metric with no data has no stream kind to be — refused.
+/// declares. The descriptor is identity content: two metrics differing
+/// only in it are two distinct streams, never a silent merge. A metric
+/// with no data has no stream kind to be — refused.
 pub(crate) fn stream_identity(
     proto: &wire_metrics::Metric,
     envelope: &Envelope,
@@ -480,10 +483,20 @@ pub(crate) fn stream_identity(
         Some(Data::Summary(_)) => (StreamKind::Summary, None),
         None => return unrepresentable(Unrepresentable::EmptyMetric),
     };
+    // Description and unit are proto3 `string`s without `optional`: the
+    // unset reading is `""`, the same positive-zero convention as the
+    // summary sum — the wire can produce "absent", never "present and
+    // empty". Duplicate metadata keys are refused by the model's own
+    // construction, like every other keyed container; the metadata map is
+    // cloned once per **stream** (not per point), the same cost shape as
+    // the envelope copies above, because the identity owns it by value.
     Ok(StreamIdentity {
         resource: envelope.resource_copy(),
         scope: envelope.scope_copy(),
         name: proto.name.clone(),
+        description: present_string(&proto.description),
+        unit: present_string(&proto.unit),
+        metadata: attributes(proto.metadata.clone(), "metric metadata")?,
         kind,
         temporality,
     })

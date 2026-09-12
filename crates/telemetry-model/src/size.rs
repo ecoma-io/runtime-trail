@@ -427,35 +427,33 @@ impl Accounted for crate::metrics::MetricPoint {
 }
 
 impl Accounted for crate::metrics::StreamIdentity {
-    /// The identity's own content: the resource, the scope and the metric
-    /// name it carries. A stream's points reference this through one shared
-    /// allocation (ADR 0008's interning), so whoever charges residency for a
-    /// stream charges this **once per resident stream** — never per point —
-    /// exactly like the model charges an `Arc`ed payload in full wherever
-    /// it appears. `docs/architecture/telemetry-model.md` ("Byte ceilings
-    /// count what residency pins") owns that rule.
+    /// The identity's own content: the resource, the scope, the metric
+    /// name and the stream's descriptor (description, unit, metadata) —
+    /// all of it identity content, all of it charged. A stream's points
+    /// reference this through one shared allocation (ADR 0008's
+    /// interning), so whoever charges residency for a stream charges this
+    /// **once per resident stream** — never per point — exactly like the
+    /// model charges an `Arc`ed payload in full wherever it appears.
+    /// `docs/architecture/telemetry-model.md` ("Byte ceilings count what
+    /// residency pins") owns that rule.
     fn accounted_size(&self) -> usize {
         STRUCTURE_FIXED_BYTES
             + self.resource.accounted_size()
             + self.scope.accounted_size()
             + heap_string_bytes(&self.name)
-            + 1 // kind (monotonic included), temporality included
-    }
-}
-
-impl Accounted for crate::metrics::MetricStream {
-    fn accounted_size(&self) -> usize {
-        STRUCTURE_FIXED_BYTES
-            + heap_string_bytes(&self.identity.name)
             + self
                 .description
                 .as_ref()
                 .map_or(0, |text| heap_string_bytes(text))
             + self.unit.as_ref().map_or(0, |text| heap_string_bytes(text))
             + self.metadata.accounted_size()
-            + self.identity.resource.accounted_size()
-            + self.identity.scope.accounted_size()
-            + 1 // kind, temporality included
+            + 1 // kind (monotonic included), temporality included
+    }
+}
+
+impl Accounted for crate::metrics::MetricStream {
+    fn accounted_size(&self) -> usize {
+        self.identity.accounted_size()
             + self.points.len() * slot_bytes::<crate::metrics::MetricPoint>()
             + self
                 .points
@@ -716,11 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_identity_accounting_covers_resource_scope_and_name() {
+    fn stream_identity_accounting_covers_resource_scope_name_and_descriptor() {
         let identity = crate::metrics::StreamIdentity {
             resource: empty_resource(),
             scope: empty_scope(),
             name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: Attributes::default(),
             kind: crate::metrics::StreamKind::Sum { monotonic: true },
             temporality: Some(crate::metrics::Temporality::Cumulative),
         };
@@ -754,23 +755,59 @@ mod tests {
     }
 
     #[test]
+    fn stream_identity_accounting_covers_the_descriptor_too() {
+        // Description, unit and metadata are identity content: two
+        // otherwise-identical streams differing only in a large
+        // description charge differently, or a byte ceiling would let
+        // descriptor bytes hide behind the per-point formula.
+        let bare = crate::metrics::StreamIdentity {
+            resource: empty_resource(),
+            scope: empty_scope(),
+            name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: Attributes::default(),
+            kind: crate::metrics::StreamKind::Gauge,
+            temporality: None,
+        };
+        let described = crate::metrics::StreamIdentity {
+            description: Some("an in-flight gauge".to_owned()),
+            unit: Some("1".to_owned()),
+            metadata: attribute("tier", "gold"),
+            ..bare.clone()
+        };
+        let expected_growth = heap_string_bytes("an in-flight gauge")
+            + heap_string_bytes("1")
+            + (ATTRIBUTE_MAP_NODE_BYTES + KEYED_ENTRY_BYTES + "tier".len() + 4);
+        assert_eq!(
+            described.accounted_size(),
+            bare.accounted_size() + expected_growth,
+            "the descriptor's own accounted size joins the identity's charge"
+        );
+    }
+
+    #[test]
     fn stream_accounting_includes_identity_parts_and_points() {
         let stream = crate::metrics::MetricStream::new(
             crate::metrics::StreamIdentity {
                 resource: empty_resource(),
                 scope: empty_scope(),
                 name: "requests".to_owned(),
+                description: Some("an in-flight gauge".to_owned()),
+                unit: Some("1".to_owned()),
+                metadata: Attributes::default(),
                 kind: crate::metrics::StreamKind::Gauge,
                 temporality: None,
             },
-            Some("an in-flight gauge".to_owned()),
-            Some("1".to_owned()),
-            Attributes::default(),
             Vec::new(),
         )
         .expect("a coherent stream");
         let bare = stream.accounted_size();
-        assert!(bare > STRUCTURE_FIXED_BYTES + heap_string_bytes("requests"));
+        assert!(
+            bare > STRUCTURE_FIXED_BYTES
+                + heap_string_bytes("requests")
+                + heap_string_bytes("an in-flight gauge")
+        );
         let with_point = crate::metrics::MetricStream {
             points: vec![MetricPoint::Number(NumberPoint::measurement(
                 1,
