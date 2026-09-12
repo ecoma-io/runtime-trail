@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use runtime_trail_storage::{AdmissionKey, ScanPage};
+use runtime_trail_storage::{AdmissionKey, ScanItem, ScanPage};
 use runtime_trail_telemetry_model::{Accounted, Admitted, EntityId};
 
 /// The resident records of one kind, ordered by [`AdmissionKey`].
@@ -106,7 +106,10 @@ impl<R: Accounted> Shelf<R> {
     }
 
     /// Builds the page from an ordered record iterator: at most `limit`
-    /// records, and a cursor when a record follows the page's last.
+    /// keyed records, and a cursor when a record follows the page's last —
+    /// the cursor being exactly that last item's key, the two channels
+    /// naming one position
+    /// ([ADR 0009](../../docs/decisions/0009-ordered-scans-yield-residency-keys.md)).
     fn page_from<'a, I>(records: I, limit: usize) -> ScanPage<Arc<R>>
     where
         R: 'a,
@@ -122,7 +125,10 @@ impl<R: Accounted> Shelf<R> {
                 cursor = last_in_page;
                 break;
             }
-            items.push(Arc::clone(record));
+            items.push(ScanItem {
+                key,
+                record: Arc::clone(record),
+            });
             last_in_page = Some(key);
         }
         ScanPage { items, cursor }
@@ -178,7 +184,7 @@ mod tests {
         let sizes: Vec<usize> = page
             .items
             .iter()
-            .map(|item| item.accounted_size())
+            .map(|item| item.record.accounted_size())
             .collect();
         assert_eq!(sizes, vec![10, 20, 30]);
         assert!(page.cursor.is_none(), "one page covered the whole shelf");
@@ -221,5 +227,48 @@ mod tests {
         assert!(third.cursor.is_none(), "the end of the resident set");
         let empty = shelf.scan_after(None, 0);
         assert!(empty.items.is_empty() && empty.cursor.is_none());
+    }
+
+    /// The two key channels agree: whenever a page names a cursor, it is
+    /// exactly the key of the page's last item — the same position the
+    /// items already carry
+    /// ([ADR 0009](../../docs/decisions/0009-ordered-scans-yield-residency-keys.md)).
+    ///
+    /// Kills the drift where item keys and the resume cursor are populated
+    /// from different sources, so a caller that anchors on the last item's
+    /// key would resume somewhere else than the cursor says.
+    #[test]
+    fn the_page_cursor_is_the_last_items_key_whenever_it_is_present() {
+        let mut shelf = Shelf::new();
+        for serial in 1..=7_u64 {
+            shelf.insert(item(serial, serial * 10, serial));
+        }
+
+        // Full pages with a successor: each cursor names its last item.
+        let mut after = None;
+        loop {
+            let page = shelf.scan_after(after, 3);
+            match page.cursor {
+                Some(cursor) => {
+                    let last = page.items.last().expect("a cursor implies items");
+                    assert_eq!(cursor, last.key, "the cursor is the last item's key");
+                    after = Some(cursor);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            after,
+            Some(key_of(&item(6, 60, 6))),
+            "the walk ended at the last full page's tail"
+        );
+
+        // A page ending exactly at the resident set's end: items without a
+        // cursor — the absence means no record follows, so there is no key
+        // to name, and the item's own key is still the true position.
+        let tail = shelf.scan_after(Some(key_of(&item(6, 60, 6))), 3);
+        assert_eq!(tail.items.len(), 1);
+        assert_eq!(tail.items[0].key, key_of(&item(7, 70, 7)));
+        assert_eq!(tail.cursor, None);
     }
 }

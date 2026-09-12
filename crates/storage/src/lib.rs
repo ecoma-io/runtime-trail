@@ -21,8 +21,9 @@
 //!
 //! - **get by entity id** — one resident record, by the id admission gave
 //!   it;
-//! - **ordered scans** — the resident set in residency order, cursor
-//!   continued ([`AdmissionKey`], [`ScanPage`]);
+//! - **ordered scans** — the resident set in residency order, each record
+//!   yielded with its residency key, cursor continued ([`AdmissionKey`],
+//!   [`ScanItem`], [`ScanPage`]);
 //! - **count and size introspection** — [`StoreStats`].
 //!
 //! There is no find-the-slow-trace, no related-logs, no service-error
@@ -76,7 +77,7 @@ pub mod stats;
 pub mod store;
 
 pub use keep::{EvictionCause, EvictionHook, KeepOutcome};
-pub use order::{AdmissionKey, ScanPage};
+pub use order::{AdmissionKey, ScanItem, ScanPage};
 pub use stats::StoreStats;
 pub use store::{PointView, TelemetryStore};
 
@@ -117,7 +118,10 @@ mod tests {
         ));
         let key = super::AdmissionKey::new(AdmissionTime::from_unix_nano(7), entity);
         let _page = super::ScanPage::<EntityId> {
-            items: vec![entity],
+            items: vec![super::ScanItem {
+                key,
+                record: entity,
+            }],
             cursor: Some(key),
         };
     }

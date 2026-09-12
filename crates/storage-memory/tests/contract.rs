@@ -248,10 +248,21 @@ fn scans_walk_the_residency_order_and_a_cursor_continues_it() {
     let mut cursor = None;
     for _ in 0..10 {
         let page = store.scan_log_records(cursor, 2);
-        for record in &page.items {
-            let Some(runtime_trail_telemetry_model::Value::String(body)) = &record.body else {
+        for item in &page.items {
+            let Some(runtime_trail_telemetry_model::Value::String(body)) = &item.record.body else {
                 panic!("fixture bodies are strings");
             };
+            // The key travels with the record: each item carries the
+            // residency position its record was admitted at
+            // ([ADR 0009](../../docs/decisions/0009-ordered-scans-yield-residency-keys.md)).
+            let serial: u64 = body["body-".len()..]
+                .parse()
+                .expect("fixture bodies are numbered");
+            assert_eq!(
+                item.key,
+                AdmissionKey::new(at(serial * 100), common::assigned(serial)),
+                "each item carries its true residency key"
+            );
             seen.push(body.clone());
         }
         match page.cursor {
@@ -271,7 +282,7 @@ fn scans_walk_the_residency_order_and_a_cursor_continues_it() {
     let seen_after: Vec<String> = page
         .items
         .iter()
-        .map(|record| match &record.body {
+        .map(|item| match &item.record.body {
             Some(runtime_trail_telemetry_model::Value::String(body)) => body.clone(),
             _ => panic!("fixture bodies are strings"),
         })
@@ -297,7 +308,7 @@ fn scans_walk_the_residency_order_and_a_cursor_continues_it() {
         |page: &runtime_trail_storage::ScanPage<Arc<runtime_trail_telemetry_model::LogRecord>>| {
             page.items
                 .iter()
-                .map(|record| match &record.body {
+                .map(|item| match &item.record.body {
                     Some(runtime_trail_telemetry_model::Value::String(body)) => body.clone(),
                     _ => panic!("fixture bodies are strings"),
                 })
@@ -325,7 +336,7 @@ fn span_scans_order_like_eviction_at_tied_admission_times() {
     let traces: Vec<[u8; 16]> = page
         .items
         .iter()
-        .map(|s| s.context.trace_id.as_bytes())
+        .map(|item| item.record.context.trace_id.as_bytes())
         .collect();
     assert_eq!(
         traces,
@@ -364,7 +375,8 @@ fn retrieval_shares_the_stored_allocations() {
         .items
         .into_iter()
         .next()
-        .expect("the span scans back");
+        .expect("the span scans back")
+        .record;
     assert!(
         Arc::ptr_eq(&fetched_span, &expected_span),
         "get-by-id and scan share one allocation with the shelf"
@@ -949,7 +961,7 @@ fn bodies(
 ) -> Vec<String> {
     page.items
         .iter()
-        .map(|record| match &record.body {
+        .map(|item| match &item.record.body {
             Some(runtime_trail_telemetry_model::Value::String(body)) => body.clone(),
             _ => panic!("fixture bodies are strings"),
         })
