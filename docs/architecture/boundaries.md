@@ -44,7 +44,7 @@ layer-correlation      → model, storage
 layer-api              → query, correlation, model
 layer-view             → (nothing internal)             # HTTP via the server (layer-app)
 layer-agent            → api
-layer-app              → api, storage-driver, ingest, app
+layer-app              → api, storage, storage-driver, ingest, model, app
 ```
 
 Notes on the two rows that look unusual:
@@ -53,7 +53,15 @@ Notes on the two rows that look unusual:
   core is the Investigation API over HTTP. A compile-time dependency from the
   UI onto any Rust crate is a violation — there is no legitimate one.
 - **`layer-app` is the composition root.** Only it may name concrete storage
-  drivers and ingestion, because choosing them at startup is precisely its job.
+  drivers and ingestion, because choosing them at startup is precisely its job
+  — and choosing a driver means speaking the abstraction it implements
+  ([ADR 0003](../decisions/0003-storage-strategy.md)): the composition root
+  constructs the store behind `layer-storage`'s trait, implements the
+  eviction hook that releases ledger identity
+  ([ADR 0008](../decisions/0008-admission-ledger-design.md)), moves admitted
+  records from ingestion's queue into the store, and owns the retention
+  clock. The storage contract and the telemetry model are its raw material,
+  so both are allowed imports here and nowhere else above storage.
   `server` and `desktop` may depend on each other: the desktop shell starts the
   same server core in-process (the same-core invariant in
   [system.md](system.md)).

@@ -38,8 +38,11 @@
  *   layer-storage         →  layer-model            ✅  the storage abstraction knows the model, no driver
  *   layer-storage-driver  →  storage, model         ✅  a driver implements the abstraction it belongs under
  *   layer-ingest          →  model, storage         ✅  ingestion writes through the abstraction
- *   layer-app             →  api/driver/ingest/app  ✅  the composition roots wire everything; app may
- *                                                       compose app (desktop shells server's contract, not
+ *   layer-app             →  api/storage/driver/ingest/model/app ✅ the composition roots wire
+ *                                                       everything — naming a driver means speaking
+ *                                                       the abstraction it implements and the model
+ *                                                       types it moves (ADR 0003); app may compose
+ *                                                       app (desktop shells server's contract, not
  *                                                       its crate — the edge under test stays server→api)
  *
  * The forbidden edges this makes unreachable, mechanically: view → anything
@@ -124,16 +127,23 @@ export const depConstraints = [
 
   // The composition roots wire everything: they are the only places allowed
   // to name a concrete driver (ADR 0003) and the only places that bind the
-  // network. layer-app → layer-app is allowed so the desktop shell can share
-  // composition helpers with the server without a fourth crate; the edge
-  // under test stays desktop → server → investigation, which the compiler
-  // sees because the desktop project root is the crate root.
+  // network. Naming a driver means constructing it behind layer-storage's
+  // trait, implementing the eviction hook that releases ledger identity
+  // (ADR 0008), and moving admitted records — model types — from ingestion's
+  // queue into the store, so storage and model are legal imports here and
+  // nowhere else above storage. layer-app → layer-app is allowed so the
+  // desktop shell can share composition helpers with the server without a
+  // fourth crate; the edge under test stays desktop → server →
+  // investigation, which the compiler sees because the desktop project root
+  // is the crate root.
   {
     sourceTag: "layer-app",
     onlyDependOnLibsWithTags: [
       "layer-api",
+      "layer-storage",
       "layer-storage-driver",
       "layer-ingest",
+      "layer-model",
       "layer-app",
     ],
   },
