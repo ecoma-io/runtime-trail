@@ -392,9 +392,14 @@ impl CoreRuntime {
     ///
     /// # Panics
     ///
-    /// Only if the payload ceiling plus the gRPC framing slack overflows
-    /// `usize` — a `usize`-arithmetic guard on configuration, unreachable
-    /// for every ceiling a platform this code compiles for can address.
+    /// Only in two configuration-guard shapes, both loud on purpose:
+    ///
+    /// - the payload ceiling plus the gRPC framing slack overflows `usize`
+    ///   — a `usize`-arithmetic guard on configuration, unreachable for
+    ///   every ceiling a platform this code compiles for can address;
+    /// - the two worker threads (`std::thread::Builder::spawn` for the
+    ///   ingestion pump and the retention timer) cannot be spawned — an OS
+    ///   refusal to start a thread a session cannot run without.
     pub fn build(config: RuntimeConfig) -> Result<Arc<Self>, PipelineConfigError> {
         let grpc_decoding_ceiling_bytes = config
             .payload_ceiling_bytes
