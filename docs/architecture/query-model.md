@@ -168,8 +168,9 @@ not for slowness.
 2. Ordering is total and deterministic; ties break by entity id.
 3. A cursor is valid only for its query fingerprint, and gaps under
    eviction are named in coverage.
-4. Traversal truncation always names its truncation point (cursor or
-   coverage); aggregation never returns a partial aggregate as complete.
+4. Traversal truncation always names its truncation point (a cursor, a
+   coverage entry, or the last-examined entity); aggregation never returns
+   a partial aggregate as complete.
 5. Scan accounting means the same thing in both storage modes.
 6. A refused query names the dimension, the limit and the observed spend.
 7. No query path ever writes to disk.
