@@ -45,16 +45,23 @@
 //!   ([`KeepOutcome::IdentityOverCeiling`](runtime_trail_storage::KeepOutcome),
 //!   naming the ceiling and the identity's size) — no amount of eviction
 //!   shrinks a charge that is over the cap by itself.
-//! - **Eviction ends identity**: for each evicted record the wired
-//!   [`EvictionHook`](runtime_trail_storage::EvictionHook) fires with the
-//!   entity id — the composition root's hook calls the admission ledger's
-//!   `forget`, so a re-delivery after eviction is admitted fresh (ADR 0008).
-//!   The hook also receives each stream identity whose residency just
-//!   ended (`stream_released`), so the ledger drops its interning exactly
-//!   when the store stops holding it. This crate never names the ledger's
-//!   type; the inversion is the hook, which must not panic — the store
-//!   completes its own removal first, and a panicking hook is visible as
-//!   the gap between total evictions and hook deliveries.
+//! - **Eviction and keep refusal end identity**: for each evicted record
+//!   the wired [`EvictionHook`](runtime_trail_storage::EvictionHook) fires
+//!   with the entity id — the composition root's hook calls the admission
+//!   ledger's `forget`, so a re-delivery after eviction is admitted fresh
+//!   (ADR 0008). The hook also receives each stream identity whose
+//!   residency just ended (`stream_released`), so the ledger drops its
+//!   interning exactly when the store stops holding it — and each keep
+//!   refusal that inserted nothing (`keep_refused`, with the refused
+//!   record's interned stream when it carried one), so a record the store
+//!   refused leaves no ledger identity behind and a re-delivery re-admits
+//!   fresh. A duplicate keep reports nothing: the record it names IS
+//!   resident. This crate never names the ledger's type; the inversion is
+//!   the hook, which must not panic — the store completes its own state
+//!   first (removal done, or refusal counted with nothing resident
+//!   changed), and a panicking hook is visible as the gap between total
+//!   evictions and hook deliveries, or between keep refusals and refused
+//!   hook deliveries.
 //! - **Admission never blocks on I/O** — trivially, in memory mode: a keep
 //!   is map inserts plus the retention pass, no filesystem, no network, no
 //!   locks beyond the caller's own.

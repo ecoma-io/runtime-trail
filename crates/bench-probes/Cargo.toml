@@ -1,0 +1,18 @@
+[package]
+name = "runtime-trail-bench-probes"
+description = "Phase 1 memory-path benchmark probes: real OTLP wire payloads through the real pipeline and the in-memory store, measured from the process, reported to the bench harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runtime-trail-storage = { workspace = true }
+runtime-trail-storage-memory = { workspace = true }
+runtime-trail-telemetry-ingestion = { workspace = true }
+runtime-trail-telemetry-model = { workspace = true }
+
+[lints]
+workspace = true

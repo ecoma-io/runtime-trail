@@ -45,11 +45,12 @@
 //! - **One deterministic order** ([`AdmissionKey`]): eviction order and
 //!   scan order are the same sequence — admission time, entity id as
 //!   tie-break.
-//! - **Identity ends with residency** (ADR 0008): the store's removal hook
-//!   fires per evicted record — and once more per stream whose last
-//!   resident point that record was — so the composition root can drop the
-//!   record's ledger identity and the stream's interning; a re-delivery
-//!   afterwards is admitted fresh.
+//! - **Identity ends with residency** (ADR 0008): the store's lifecycle
+//!   hook fires per evicted record — and once more per stream whose last
+//!   resident point that record was — and per keep refused with nothing
+//!   inserted, so the composition root can drop the record's ledger
+//!   identity and the stream's interning whenever a record's residency
+//!   story ends; a re-delivery afterwards is admitted fresh.
 //! - **The byte ceiling counts what residency pins**: every distinct
 //!   resident stream's identity accounted size is charged to the ceiling
 //!   exactly once — added with the stream's first resident point, released
@@ -64,7 +65,7 @@
 //!   [`PointView`].
 //! - [`keep`] — [`KeepOutcome`], [`EvictionCause`], and [`EvictionHook`],
 //!   the inverted dependency that ends a record's ledger identity on
-//!   eviction.
+//!   eviction and on keep refusal.
 //! - [`order`] — [`AdmissionKey`] and [`ScanPage`], the residency order
 //!   eviction and scans share.
 //! - [`stats`] — [`StoreStats`], the observability counters.

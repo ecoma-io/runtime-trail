@@ -1,11 +1,15 @@
 //! The contract behaviors the retention suite does not cover: eviction ends
 //! a record's identity (ADR 0008, wired through the real admission ledger),
-//! entity-id retrieval after eviction, deterministic scans with cursor
-//! continuation, Arc sharing, duplicate keeps and the anomaly pass-through.
+//! a keep refusal ends it too, entity-id retrieval after eviction,
+//! deterministic scans with cursor continuation, Arc sharing, duplicate
+//! keeps and the anomaly pass-through.
 
 mod common;
 
-use common::{admitted, at, boxed, gauge_point, log_record, span, stream};
+use common::{
+    SharedRecordingHook, admitted, assigned, at, bare_stream, boxed, gauge_point, log_record, span,
+    stream,
+};
 use runtime_trail_storage::{AdmissionKey, EvictionHook, KeepOutcome, TelemetryStore};
 use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
 use runtime_trail_telemetry_model::{
@@ -16,9 +20,14 @@ use std::sync::Mutex;
 
 /// The composition root's half of ADR 0008: the hook implemented over the
 /// real ledger's `forget` and `release_stream`, so identity ends exactly as
-/// the decision requires. The ledger is shared behind a `Send + Sync`
-/// handle because the hook must be both, the same way the store is: the
-/// runtime holds one across its tasks, and the bounds ride along.
+/// the decision requires — for every delivery kind. An evicted record is
+/// forgotten (its stream released separately, by `stream_released`, when
+/// the eviction retired it); a refused keep's record is forgotten with its
+/// interned stream released by the same `keep_refused` report, because a
+/// refusal inserted nothing and its identity must not outlive that. The
+/// ledger is shared behind a `Send + Sync` handle because the hook must be
+/// both, the same way the store is: the runtime holds one across its tasks,
+/// and the bounds ride along.
 struct LedgerHook(Arc<Mutex<AdmissionLedger>>);
 
 impl EvictionHook for LedgerHook {
@@ -31,6 +40,18 @@ impl EvictionHook for LedgerHook {
             .lock()
             .expect("ledger lock poisoned")
             .release_stream(stream);
+    }
+
+    fn keep_refused(
+        &mut self,
+        entity: EntityId,
+        stream: Option<&Arc<runtime_trail_telemetry_model::StreamIdentity>>,
+    ) {
+        let mut ledger = self.0.lock().expect("ledger lock poisoned");
+        ledger.forget(entity);
+        if let Some(stream) = stream {
+            ledger.release_stream(stream);
+        }
     }
 }
 
@@ -363,7 +384,8 @@ fn retrieval_shares_the_stored_allocations() {
 /// resident record stands, nothing is rewritten, the attempt is counted.
 #[test]
 fn a_duplicate_keep_leaves_the_resident_record_standing() {
-    let mut store = boxed(MemoryConfig::default(), None);
+    let recorded = SharedRecordingHook::default();
+    let mut store = boxed(MemoryConfig::default(), Some(Box::new(recorded.clone())));
     let s = span([6; 16], [7; 8], "original");
     let entity = s
         .natural_identity()
@@ -379,6 +401,14 @@ fn a_duplicate_keep_leaves_the_resident_record_standing() {
     assert_eq!(after.accounted_bytes, before.accounted_bytes);
     assert_eq!(after.total_evictions(), 0);
     assert_eq!(after.duplicate_keeps, before.duplicate_keeps + 1);
+    // A duplicate inserted nothing REFUSED: the record it names is
+    // resident, so the hook hears nothing — its identity must stand.
+    assert_eq!(after.refused_hook_deliveries, 0);
+    let hook = recorded.0.lock().expect("hook lock poisoned");
+    assert!(
+        hook.refused.is_empty() && hook.evicted.is_empty() && hook.streams_released.is_empty(),
+        "a duplicate keep delivers nothing to the hook"
+    );
 
     // The resident record is still the first one — a scan yields it and
     // only it.
@@ -512,6 +542,282 @@ fn the_store_releases_a_stream_only_when_its_last_point_leaves() {
     );
 }
 
+/// The review's M1 probe, as a regression. A point admitted cleanly but
+/// refused at keep (`IdentityOverCeiling`) used to strand its ledger entry
+/// and interned stream until process end: retention could never end what
+/// residency never held, and every re-delivery collapsed onto the stranded
+/// identity instead of re-offering the record. Through the documented hook
+/// wiring — the composition root answers `keep_refused` with `forget` and
+/// `release_stream`, exactly as for eviction — the identity ends with the
+/// refusal, nothing strands, and the re-delivery admits fresh.
+#[test]
+fn a_keep_refused_over_the_ceiling_strands_nothing_and_its_redelivery_readmits_fresh() {
+    let identity = stream();
+    let identity_bytes = u64::try_from(identity.accounted_size()).expect("test sizes fit");
+    let ledger = shared_ledger();
+    let mut store = boxed(
+        MemoryConfig {
+            max_accounted_bytes: identity_bytes - 1,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
+    );
+
+    let admission = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_metric_point(&identity, gauge_point(10, 1));
+    let entity = admission.outcome.entity().expect("the point admits");
+    let interned = admission.stream.expect("admission interned the stream");
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        1,
+        "admission interned the stream before any keep"
+    );
+
+    assert_eq!(
+        store.keep_metric_point(
+            Admitted {
+                entity,
+                admitted_at: at(100),
+                record: admission.record.expect("shared"),
+            },
+            interned,
+        ),
+        KeepOutcome::IdentityOverCeiling {
+            ceiling: identity_bytes - 1,
+            identity_bytes,
+        },
+        "the identity alone exceeds the ceiling: refused, nothing inserted"
+    );
+    let stats = store.stats();
+    assert_eq!(stats.identity_over_ceiling_refusals, 1);
+    assert_eq!(stats.total_keep_refusals(), 1);
+    assert_eq!(
+        stats.refused_hook_deliveries, 1,
+        "the refusal was delivered to the hook"
+    );
+    assert_eq!(stats.total_evictions(), 0);
+    assert_eq!(stats.hook_deliveries, 0, "no eviction ever happened");
+    assert_eq!(stats.resident_records, 0);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        0,
+        "the refused record's interned stream did not strand"
+    );
+
+    // Retention, run far past the window, has nothing to end — the probe's
+    // original point was residency-independence: the stranding survived
+    // every retention pass because it never lived in residency. It stays
+    // at zero.
+    let window_nanos =
+        u64::try_from(MemoryConfig::default().admission_window.as_nanos()).expect("window fits");
+    assert_eq!(store.enforce_retention(at(100 + window_nanos)), 0);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        0,
+        "no stranding survives retention"
+    );
+
+    // The re-delivery — the same bytes — admits FRESH: the collapse
+    // intercept is gone with the forgotten identity.
+    let redelivery = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_metric_point(&identity, gauge_point(10, 1));
+    let AdmissionOutcome::Admitted { entity: fresh } = redelivery.outcome else {
+        panic!("after the refusal released the identity, the same bytes admit fresh");
+    };
+    assert_ne!(fresh, entity, "a fresh serial, never a collapse");
+}
+
+/// A `SeriesCapReached` refusal ends the refused record's ledger identity,
+/// so the documented re-attempt is genuinely reachable: the re-delivery
+/// re-admits as a fresh admission rather than collapsing onto a stranded
+/// entry, and once a slot frees it keeps cleanly.
+#[test]
+fn a_series_cap_refusal_ends_the_identity_so_a_re_attempt_admits_cleanly() {
+    let ledger = shared_ledger();
+    let mut store = boxed(
+        MemoryConfig {
+            series_cap: 1,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
+    );
+    let alpha = bare_stream("alpha");
+    let gamma = bare_stream("gamma");
+
+    // Alpha fills the cap.
+    let (alpha_entity, alpha_interned, alpha_handoff) =
+        admit_point_to(&ledger, &alpha, gauge_point(10, 1), 100);
+    assert_eq!(
+        store.keep_metric_point(alpha_handoff, alpha_interned),
+        KeepOutcome::Kept { evicted: 0 }
+    );
+    assert!(store.metric_point(alpha_entity).is_some());
+
+    // Gamma is admitted — interned, the ledger now holds both streams —
+    // and refused at keep: the cap is full. The refusal delivers, and
+    // gamma's ledger identity ends with it.
+    let (gamma_entity, gamma_interned, gamma_handoff) =
+        admit_point_to(&ledger, &gamma, gauge_point(20, 1), 200);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        2,
+        "alpha and gamma are both interned before the keep"
+    );
+    assert_eq!(
+        store.keep_metric_point(gamma_handoff, gamma_interned),
+        KeepOutcome::SeriesCapReached
+    );
+    let stats = store.stats();
+    assert_eq!(stats.kept_out_series_cap, 1);
+    assert_eq!(stats.refused_hook_deliveries, 1);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        1,
+        "gamma's interned stream did not strand behind the refusal"
+    );
+
+    // The re-delivery of the same bytes admits FRESH — the pipeline's
+    // collapse intercept has nothing to land on.
+    let redelivery = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_metric_point(&gamma, gauge_point(20, 1));
+    let AdmissionOutcome::Admitted {
+        entity: fresh_gamma,
+    } = redelivery.outcome
+    else {
+        panic!("after the refusal released the identity, the re-attempt re-admits fresh");
+    };
+    let fresh_interned = redelivery.stream.expect("re-interned");
+    assert_ne!(
+        fresh_gamma, gamma_entity,
+        "a fresh serial, never a collapse"
+    );
+
+    // A slot frees — alpha's point expires, its stream released through the
+    // eviction hook — and the re-attempt, no longer shadowed by a stranded
+    // identity, ADMITS cleanly.
+    let window_nanos =
+        u64::try_from(MemoryConfig::default().admission_window.as_nanos()).expect("window fits");
+    assert_eq!(store.enforce_retention(at(100 + window_nanos)), 1);
+    assert_eq!(store.stats().resident_streams, 0);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        1,
+        "alpha's interned stream left with the eviction; only gamma's \
+         fresh intern stands"
+    );
+    // Alpha's ledger identity ended with that eviction: the same bytes
+    // admit FRESH now — no entry stands to collapse onto.
+    let alpha_redelivery = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_metric_point(&alpha, gauge_point(10, 1));
+    assert!(
+        matches!(alpha_redelivery.outcome, AdmissionOutcome::Admitted { .. }),
+        "the eviction forgot alpha: its re-delivery is fresh, never collapsed"
+    );
+    assert_eq!(
+        store.keep_metric_point(
+            Admitted {
+                entity: fresh_gamma,
+                admitted_at: at(300),
+                record: redelivery.record.expect("shared"),
+            },
+            fresh_interned,
+        ),
+        KeepOutcome::Kept { evicted: 0 },
+        "the documented re-attempt of the refused stream admits cleanly"
+    );
+}
+
+/// A refusal is final for the delivery, not for the identity: an oversized
+/// span's keep is refused with nothing inserted, the hook reports it (with
+/// no stream — spans carry none), the ledger entry ends, and the re-delivery
+/// re-admits fresh under the same natural identity. Log records carry no
+/// ledger entry at all, and their refusals are still delivered — the hook's
+/// law is per refusal, not per kind.
+#[test]
+fn an_oversized_refusal_ends_the_ledger_identity_and_reports_even_entryless_kinds() {
+    let ledger = shared_ledger();
+    let body = "x".repeat(2_000);
+    let big = span([4; 16], [5; 8], &body);
+    let ceiling = u64::try_from(big.accounted_size()).expect("fits") - 1;
+    let mut store = boxed(
+        MemoryConfig {
+            max_accounted_bytes: ceiling,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
+    );
+
+    let (entity, handoff) = admit_span_to(&mut ledger.lock().expect("ledger lock poisoned"), big);
+    assert_eq!(
+        store.keep_span(handoff),
+        KeepOutcome::Oversized,
+        "the record alone exceeds the ceiling: refused, nothing inserted"
+    );
+    let stats = store.stats();
+    assert_eq!(stats.oversized_refusals, 1);
+    assert_eq!(stats.total_keep_refusals(), 1);
+    assert_eq!(stats.refused_hook_deliveries, 1);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        0,
+        "a span carries no stream, so nothing was ever interned"
+    );
+
+    // The re-delivery re-admits FRESH under the same natural identity —
+    // the ledger entry is gone, not standing between the pipeline and the
+    // store.
+    let redelivery = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_span(span([4; 16], [5; 8], &body));
+    let AdmissionOutcome::Admitted { entity: fresh } = redelivery.outcome else {
+        panic!("after the refusal, the same span admits fresh — never collapsed");
+    };
+    assert_eq!(
+        fresh, entity,
+        "a span re-admits under its natural identity, but FRESH"
+    );
+
+    // A log record's refusal delivers too, though the ledger holds no entry
+    // for the kind at all.
+    let wide = usize::try_from(ceiling).expect("fits");
+    let refused_log =
+        store.keep_log_record(admitted(assigned(1), 50, log_record(&"y".repeat(wide))));
+    assert_eq!(refused_log, KeepOutcome::Oversized);
+    let stats = store.stats();
+    assert_eq!(stats.refused_hook_deliveries, 2);
+    assert_eq!(stats.total_keep_refusals(), 2);
+}
+
 /// A hook that panics on its first delivery and answers the rest cleanly,
 /// so one test holds both the broken hook and the control. The store's
 /// own removal completes BEFORE the hook runs, and a panic inside the
@@ -532,6 +838,14 @@ impl EvictionHook for PanickingHook {
 
     fn stream_released(&mut self, _stream: &Arc<runtime_trail_telemetry_model::StreamIdentity>) {
         // A log record's removal retires no stream; nothing runs here.
+    }
+
+    fn keep_refused(
+        &mut self,
+        _entity: EntityId,
+        _stream: Option<&Arc<runtime_trail_telemetry_model::StreamIdentity>>,
+    ) {
+        // This test's keeps are never refused; nothing runs here.
     }
 }
 
@@ -596,7 +910,8 @@ fn a_panicking_hook_leaves_a_consistent_store_behind() {
 #[test]
 fn a_duplicate_metric_point_keep_leaves_the_resident_point_standing() {
     let identity = stream();
-    let mut store = boxed(MemoryConfig::default(), None);
+    let recorded = SharedRecordingHook::default();
+    let mut store = boxed(MemoryConfig::default(), Some(Box::new(recorded.clone())));
     let entity = common::assigned(1);
     let _ = store.keep_metric_point(
         admitted(entity, 100, gauge_point(90, 1)),
@@ -618,6 +933,14 @@ fn a_duplicate_metric_point_keep_leaves_the_resident_point_standing() {
     assert_eq!(after.resident_streams, before.resident_streams);
     assert_eq!(after.total_evictions(), 0);
     assert_eq!(after.duplicate_keeps, before.duplicate_keeps + 1);
+    // The stream identity is NOT handed to the hook either: a duplicate is
+    // a resident record, not a refusal, and its identity must stand.
+    assert_eq!(after.refused_hook_deliveries, 0);
+    let hook = recorded.0.lock().expect("hook lock poisoned");
+    assert!(
+        hook.refused.is_empty() && hook.evicted.is_empty() && hook.streams_released.is_empty(),
+        "a duplicate keep delivers nothing to the hook"
+    );
 }
 
 /// The string bodies of a scan page, for the walk assertions.

@@ -70,9 +70,14 @@ pub struct StoreStats {
     /// over the cap, so nothing was evicted to try to make room.
     pub identity_over_ceiling_refusals: u64,
     /// How many completed [`EvictionHook`](crate::EvictionHook) deliveries
-    /// the store has made for evicted records. The store's own removal —
-    /// indexes, shelves, stream table, counters — completes **before** the
-    /// hook fires and is counted in
+    /// the store has made for evicted records — this counter counts the
+    /// **evicted** deliveries only: stream releases and keep refusals are
+    /// hook deliveries too, but they are not counted here, so the
+    /// divergence against
+    /// [`StoreStats::total_evictions`](crate::StoreStats::total_evictions)
+    /// stays meaningful. The store's own removal — indexes, shelves,
+    /// stream table, counters — completes **before** the hook fires and is
+    /// counted in
     /// [`StoreStats::total_evictions`](crate::StoreStats::total_evictions)
     /// regardless; the hook is where identity ends (ADR 0008), so a
     /// divergence between `total_evictions()` and `hook_deliveries` (with a
@@ -80,6 +85,19 @@ pub struct StoreStats {
     /// named by the counters instead of silently absorbed. With no hook
     /// wired, deliveries stay zero.
     pub hook_deliveries: u64,
+    /// How many completed
+    /// [`EvictionHook::keep_refused`](crate::EvictionHook::keep_refused)
+    /// deliveries the store has made for keep refusals that inserted
+    /// nothing — the refusal-report half of the hook law, mirroring
+    /// [`StoreStats::hook_deliveries`] on the eviction side. The refusal's
+    /// cause counter
+    /// ([`StoreStats::total_keep_refusals`](crate::StoreStats::total_keep_refusals))
+    /// increments before the hook fires, so a divergence between
+    /// `total_keep_refusals()` and this counter (with a hook wired) means a
+    /// refused record's ledger identity may outlive the refusal — a
+    /// misbehaving hook, observable instead of silent. With no hook wired,
+    /// deliveries stay zero.
+    pub refused_hook_deliveries: u64,
     /// The most recent admission-anomaly total the composition root pushed
     /// through [`TelemetryStore::observe_admission_anomalies`] — the
     /// pass-through that surfaces identity conflicts recorded by admission
@@ -98,6 +116,17 @@ impl StoreStats {
             + self.evicted_for_accounted_bytes_ceiling
             + self.evicted_for_admission_window
     }
+
+    /// Every keep refusal that inserted nothing, all causes together — the
+    /// number of
+    /// [`EvictionHook::keep_refused`](crate::EvictionHook::keep_refused)
+    /// calls the store owed. Compare against
+    /// [`StoreStats::refused_hook_deliveries`] (with a hook wired) to see
+    /// whether identity ended wherever a refusal did.
+    #[must_use]
+    pub const fn total_keep_refusals(&self) -> u64 {
+        self.oversized_refusals + self.kept_out_series_cap + self.identity_over_ceiling_refusals
+    }
 }
 
 #[cfg(test)]
@@ -113,8 +142,10 @@ mod tests {
         assert_eq!(stats.accounted_bytes, 0);
         assert_eq!(stats.resident_streams, 0);
         assert_eq!(stats.hook_deliveries, 0);
+        assert_eq!(stats.refused_hook_deliveries, 0);
         assert_eq!(stats.kept_out_series_cap, 0);
         assert_eq!(stats.total_evictions(), 0);
+        assert_eq!(stats.total_keep_refusals(), 0);
         let history = StoreStats {
             evicted_for_record_ceiling: 2,
             evicted_for_accounted_bytes_ceiling: 3,
@@ -122,6 +153,17 @@ mod tests {
             ..stats
         };
         assert_eq!(history.total_evictions(), 9);
+        let refusals = StoreStats {
+            oversized_refusals: 5,
+            kept_out_series_cap: 6,
+            identity_over_ceiling_refusals: 7,
+            ..stats
+        };
+        assert_eq!(
+            refusals.total_keep_refusals(),
+            18,
+            "every nothing-inserted refusal counts toward the divergence sum"
+        );
         assert_eq!(
             history.accounted_bytes,
             history.record_accounted_bytes + history.identity_accounted_bytes,
