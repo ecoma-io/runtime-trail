@@ -282,7 +282,11 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   comparison payload with the store; evicting a record also forgets its
   identity entry, and a re-delivery after eviction is admitted as a fresh
   record — first-stands applies within residency, not across it
-  ([ADR 0008](../decisions/0008-admission-ledger-design.md)). The same
+  ([ADR 0008](../decisions/0008-admission-ledger-design.md)). A keep
+  refusal ends identity exactly as eviction does: a record the store
+  refused inserted nothing, so its ledger entry and any interned stream are
+  released through the same hook, and a re-delivery after a refusal
+  re-admits as a fresh record. The same
   law bounds **stream identities**: the ledger drops a stream's interned
   identity when the stream's last resident point leaves, so interning
   never pins content for a session longer than the points that justify

@@ -61,20 +61,36 @@ floats order by IEEE-754 bit pattern (equal bits `Equal`, different bits
 never equal — `-0.0` and `0.0` stay distinct, a NaN equals only its own bit
 pattern), exactly the equality the model defines.
 
-**Eviction and identity are one lifecycle.** Evicting a record calls
-`forget(identity)`: the identity entry lives exactly as long as the record's
-residency. A re-delivery after eviction is therefore admitted as a fresh
-record — first-stands applies within residency, not across it. **Stream
-identities obey the same law.** The ledger interns a stream identity on the
-stream's first admitted point and drops it when the stream's last resident
-point leaves: the store's eviction hook reports the stream reference
-alongside the entity id, and the composition root releases the stream's
-interning in the ledger at refcount zero. The ledger's capacity therefore
-tracks what the store retains — records _and_ resident streams — and can
-outgrow neither. **The hook must not panic**: it runs after the store's own
-removal completes, and a fallible hook is the composition root's to wrap;
-the store reports evictions and hook deliveries as separate counters, so an
-evicted-but-not-released divergence is observable, never silent.
+**Eviction, keep refusal, and identity are one lifecycle.** Evicting a
+record calls `forget(entity)`: the identity entry lives exactly as long as
+the record's residency. A re-delivery after eviction is therefore admitted
+as a fresh record — first-stands applies within residency, not across it.
+**A keep refusal ends identity the same way.** A refusal that inserted
+nothing (`Oversized`, `SeriesCapReached`, `IdentityOverCeiling`) leaves the
+record nowhere in the store — but admission has already recorded its point
+entry and interned its stream, so the store reports the refused record
+through the same hook (`keep_refused`, carrying the interned stream when
+the refused record has one; a `Duplicate` reports nothing, the record it
+names being resident). The composition root answers with `forget` and
+`release_stream` exactly as for eviction. Without that delivery the ledger
+would pin the entries of records the store refused — a stranding leak no
+retention pass could clear, because the leak never lived in residency, and
+every re-delivery would collapse onto the standing entry instead of
+re-offering the record. **Stream identities obey the same law.** The ledger
+interns a stream identity on the stream's first admitted point and drops it
+when the stream's residency story ends: the store's hook reports the stream
+reference alongside the entity id on eviction (`stream_released`) and on
+refusal (`keep_refused`), and the composition root releases the stream's
+interning in the ledger either way. The ledger's capacity therefore tracks
+what the store retains — records _and_ resident streams — and can outgrow
+neither: every way a record fails to stay resident ends its identity, and a
+re-delivery afterwards re-admits fresh. **The hook must not panic**: every
+delivery runs after the store's own state has settled — removal completed,
+or refusal counted with nothing resident changed — and a fallible hook is
+the composition root's to wrap; the store reports evictions, hook
+deliveries, keep refusals and refusal deliveries as separate counters, so
+an evicted-but-not-released or refused-but-not-released divergence is
+observable, never silent.
 
 ## Consequences
 
@@ -93,7 +109,9 @@ evicted-but-not-released divergence is observable, never silent.
   at 1,000 streams), so release is load-bearing, not an optimisation.
 - Eviction visibly ends identity: re-delivery after eviction re-admits, which
   is the documented semantics ([telemetry-model.md](../architecture/telemetry-model.md)),
-  not an edge case.
+  not an edge case. A keep refusal does the same — a re-attempt after a
+  refusal is a fresh admission, which is what keeps the store's re-attempt
+  promises genuinely reachable instead of shadowed by a stranded entry.
 - Ledger equality is O(payload size) per candidate comparison and collision-
   free by construction; the ledger never approximates what the model defines
   as exact.

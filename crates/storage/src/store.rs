@@ -48,10 +48,11 @@ pub struct PointView {
 ///   unbounded mode, no grow-then-evict;
 /// - **the keep hand-off is never on I/O**: persistence never blocks
 ///   admission (memory mode trivially; a file-backed mode by design);
-/// - **the eviction hook** ([`EvictionHook`](crate::EvictionHook)) fires
+/// - **the lifecycle hook** ([`EvictionHook`](crate::EvictionHook)) fires
 ///   once per evicted record — and once more per stream whose last
-///   resident point that record was — so identity ends exactly with
-///   residency (ADR 0008).
+///   resident point that record was — and once per keep refused with
+///   nothing inserted, so identity ends exactly with the end of a record's
+///   residency story, eviction or refusal alike (ADR 0008).
 ///
 /// # Threading model
 ///

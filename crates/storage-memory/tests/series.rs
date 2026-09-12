@@ -435,3 +435,102 @@ fn an_identity_over_the_ceiling_is_refused_without_evicting_anything() {
     );
     assert!(matches!(after, KeepOutcome::Kept { evicted: 0 }));
 }
+
+/// The identity ceiling's boundary is strict, byte-pinned: an identity
+/// exactly AT the accounted-byte ceiling is KEPT — the gate's law is
+/// "exceeds", never "reaches" — and one accounted byte more is refused
+/// before anything is inserted. The two sides of the boundary are pinned
+/// against the same ceiling: at equality the gate passes and the record
+/// enters residency (the point's own bytes then trip the ceiling, and the
+/// residency law — a different law — answers by evicting; `KeepOutcome`
+/// promises residency is the store's law, not a per-call one); at +1 the
+/// outcome is `IdentityOverCeiling` and nothing at all is consumed.
+#[test]
+fn the_identity_ceiling_boundary_is_strict_and_a_refusal_consumes_nothing() {
+    // Two streams one name byte apart: exactly one accounted byte apart,
+    // so the ceiling can sit exactly on the smaller identity.
+    let at_ceiling = bare_stream("b");
+    let size = u64::try_from(at_ceiling.accounted_size()).expect("test sizes fit");
+    let one_byte_over = bare_stream("bb");
+    assert_eq!(
+        u64::try_from(one_byte_over.accounted_size()).expect("test sizes fit"),
+        size + 1,
+        "the fixture is the one-byte-over shape"
+    );
+
+    let hook = SharedRecordingHook::default();
+    let mut store = boxed(
+        config(u64::MAX, size, u64::MAX),
+        Some(Box::new(hook.clone())),
+    );
+
+    // AT the ceiling: the identity gate does not refuse. The record enters
+    // residency — and its own POINT bytes push the accounted sum one
+    // ceiling past what the identity alone already fills, so the retention
+    // law removes it: observable, and strictly not a refusal.
+    let kept_entity = assigned(1);
+    assert_eq!(
+        store.keep_metric_point(
+            admitted(kept_entity, 100, gauge_point(100, 1)),
+            Arc::clone(&at_ceiling),
+        ),
+        KeepOutcome::Kept { evicted: 1 },
+        "an identity exactly AT the ceiling is never refused: the law is \
+         strictly greater",
+    );
+    let after_kept = store.stats();
+    assert_eq!(after_kept.identity_over_ceiling_refusals, 0);
+    assert_eq!(
+        after_kept.evicted_for_accounted_bytes_ceiling, 1,
+        "the point's own bytes tripped the ceiling: the residency law answered"
+    );
+    assert_eq!(after_kept.resident_streams, 0);
+
+    // One accounted byte over the same ceiling: refused before anything is
+    // inserted, and the refusal consumes nothing — no series slot, no
+    // identity charge, no record, no eviction.
+    let before_refused = store.stats();
+    let refused_entity = assigned(2);
+    assert_eq!(
+        store.keep_metric_point(
+            admitted(refused_entity, 200, gauge_point(200, 1)),
+            Arc::clone(&one_byte_over),
+        ),
+        KeepOutcome::IdentityOverCeiling {
+            ceiling: size,
+            identity_bytes: size + 1,
+        }
+    );
+    let stats = store.stats();
+    assert_eq!(stats.resident_records, before_refused.resident_records);
+    assert_eq!(stats.resident_streams, before_refused.resident_streams);
+    assert_eq!(
+        stats.identity_accounted_bytes, before_refused.identity_accounted_bytes,
+        "a refused keep consumes no identity charge"
+    );
+    assert_eq!(
+        stats.accounted_bytes, before_refused.accounted_bytes,
+        "a refused keep consumes no accounted bytes"
+    );
+    assert_eq!(stats.total_evictions(), before_refused.total_evictions());
+    assert_eq!(stats.kept_out_series_cap, 0, "the cap was never the cause");
+    assert_eq!(stats.identity_over_ceiling_refusals, 1);
+    assert_eq!(stats.total_keep_refusals(), 1);
+    assert_eq!(
+        stats.refused_hook_deliveries, 1,
+        "the refusal was delivered once"
+    );
+
+    // The hook saw exactly the two facts that happened: the first keep's
+    // self-eviction (record, then its retired stream) and the refusal —
+    // the refusal naming the entity and the identity it arrived with.
+    let recorded = hook.0.lock().expect("hook lock poisoned");
+    assert_eq!(recorded.evicted, vec![kept_entity]);
+    assert_eq!(recorded.streams_released.len(), 1);
+    assert_eq!(recorded.streams_released[0].name, "b");
+    assert_eq!(
+        recorded.refused,
+        vec![(refused_entity, Some(one_byte_over))],
+        "the refusal names the entity and the identity it arrived with"
+    );
+}
