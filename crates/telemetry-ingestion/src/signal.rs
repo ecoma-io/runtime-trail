@@ -48,6 +48,14 @@ pub enum AdmissionSignal {
     /// collapse (spans, metric points) or re-admit (log records, which
     /// have no natural identity) — a collapse never queues, so the retry
     /// adds no second copy of what is already in flight.
+    ///
+    /// The record whose own offer was refused is ended by the pipeline
+    /// before this signal returns: the ledger entry admission just created
+    /// is forgotten (and its freshly interned stream released), by the
+    /// same lifecycle ADR 0008 gives every other way a record fails to
+    /// stay resident. No entry stands behind a delivery that never
+    /// happened — so the retry this signal invites can deliver, and no
+    /// collapse onto a stranded identity silently swallows the record.
     QueueSaturated {
         /// The queue that refused, named for logs and metrics.
         queue: &'static str,

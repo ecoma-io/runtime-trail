@@ -16,6 +16,13 @@
 //! | `ExportOverCap`     | **200** + `partial_success` naming the budget           |
 //! | per-record refusals | **200** + `partial_success` naming rejected positions   |
 //!
+//! Two answers are protocol gates, not admission signals: a request that
+//! declares a content-type this phase does not speak (anything but
+//! `application/x-protobuf` — the OTLP spec's JSON encoding included) is
+//! refused with **415** naming the supported encoding, before the body is
+//! read; and a body that never arrives in full gets **400** naming the
+//! failed read, never dressed up as an over-ceiling refusal.
+//!
 //! The transport-edge body bound is the same number the pipeline gates
 //! with ([`CoreRuntime::payload_ceiling_bytes`]): the body is read only up
 //! to the ceiling, so an over-ceiling export is refused before it is ever
@@ -42,6 +49,9 @@ use std::sync::Arc;
 /// The contract names the header, not a value; a local collector's retry
 /// is cheap, so one second. It is a hint, not a rate-limit contract.
 const RETRY_AFTER_SECS: &str = "1";
+
+/// The one content-type this phase speaks: OTLP/HTTP protobuf.
+const PROTOBUF_MEDIA_TYPE: &str = "application/x-protobuf";
 
 /// How many rejected positions a `partial_success` message names in full
 /// before the rest are summarized by count.
@@ -135,18 +145,41 @@ enum Signal {
     Logs,
 }
 
-/// The one OTLP/HTTP path: drain check, bounded body read, admission, wire
-/// mapping.
+/// The one OTLP/HTTP path: drain check, content-type gate, bounded body
+/// read, admission, wire mapping.
 async fn export(runtime: Arc<CoreRuntime>, request: Request, signal: Signal) -> Response {
     // The closing gate answers before the body is read: a draining runtime
     // refuses new telemetry outright and owes no buffering for it.
     if runtime.is_draining() {
         return draining_response();
     }
-    let Ok(payload) = to_bytes(request.into_body(), runtime.payload_ceiling_bytes()).await else {
-        // The reader only fails past the ceiling bound — the
-        // transport-edge refusal, before parsing.
-        return payload_over_cap_response(None, runtime.payload_ceiling_bytes());
+    // The protocol gate, also before the body is read: a request that
+    // declares an encoding this phase does not speak is told so plainly.
+    if let Some(refusal) = content_type_gate(request.headers()) {
+        return refusal;
+    }
+    // The over-ceiling answer when the length is *declared*: refused
+    // before a single body byte is buffered.
+    let ceiling_bytes = runtime.payload_ceiling_bytes();
+    if declared_over_ceiling(request.headers(), ceiling_bytes) {
+        return payload_over_cap_response(None, ceiling_bytes);
+    }
+    let payload = match to_bytes(request.into_body(), ceiling_bytes).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            // Two honest ways a read fails: the body grew past the ceiling
+            // mid-read (an undeclared over-cap — the refusal, but the size
+            // was never known), or the body never arrived in full — which
+            // is not an over-cap refusal and must not wear one.
+            if error
+                .into_inner()
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return payload_over_cap_response(None, ceiling_bytes);
+            }
+            return body_read_failure_response();
+        }
     };
     let now = runtime.now();
     let result = match signal {
@@ -280,6 +313,56 @@ fn payload_over_cap_response(bytes: Option<usize>, ceiling_bytes: usize) -> Resp
     )
 }
 
+/// The content-type gate: this phase speaks OTLP/HTTP protobuf only. A
+/// request that *declares* another encoding — including the OTLP spec's
+/// JSON encoding, which is real but not supported here — is refused with
+/// 415 naming the supported one, before the body is read: a protobuf
+/// decode error is not an answer a JSON emitter can act on. A request that
+/// declares nothing is handed to the decode, where the payload — not the
+/// header — is the authority.
+fn content_type_gate(headers: &axum::http::HeaderMap) -> Option<Response> {
+    let declared = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+    let media_type = declared.split(';').next()?.trim();
+    if media_type.eq_ignore_ascii_case(PROTOBUF_MEDIA_TYPE) {
+        return None;
+    }
+    tracing::debug!(
+        declared,
+        "non-protobuf content-type refused at the HTTP layer"
+    );
+    Some(text_response(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        format!(
+            "this phase speaks OTLP/HTTP protobuf only ({PROTOBUF_MEDIA_TYPE}); \
+             the request declared {declared}, which is refused before reading"
+        ),
+    ))
+}
+
+/// Whether the request declares a content length over `ceiling_bytes` —
+/// the one over-cap refusal that can be made before any body byte is
+/// buffered. An undeclared length is decided by the bounded read.
+fn declared_over_ceiling(headers: &axum::http::HeaderMap, ceiling_bytes: usize) -> bool {
+    let ceiling = u64::try_from(ceiling_bytes).unwrap_or(u64::MAX);
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|declared| declared > ceiling)
+}
+
+/// The body-read answer: the payload never arrived complete, so there is
+/// nothing to parse, no ceiling was crossed, and nothing was admitted. The
+/// honest answer names the failed read — never an over-cap refusal the
+/// payload did not commit.
+fn body_read_failure_response() -> Response {
+    text_response(
+        StatusCode::BAD_REQUEST,
+        "the request body could not be read in full; the payload never \
+         arrived complete, so nothing was parsed or admitted",
+    )
+}
+
 /// An OTLP protobuf answer: 200, `application/x-protobuf`.
 fn protobuf(status: StatusCode, body: Vec<u8>) -> Response {
     (
@@ -317,7 +400,8 @@ mod tests {
     use runtime_trail_storage_memory::MemoryConfig;
     use runtime_trail_telemetry_ingestion::fixtures as fx;
     use runtime_trail_telemetry_ingestion::{
-        ExportLogsServiceResponse, ExportMetricsServiceResponse, ExportTraceServiceResponse,
+        ExportLogsServiceResponse, ExportMetricsServiceResponse, ExportOutcome,
+        ExportTraceServiceResponse, RecordOutcome, RecordRejection, Unrepresentable,
     };
     use runtime_trail_telemetry_model::BudgetLimits;
     use tower::ServiceExt;
@@ -584,6 +668,97 @@ mod tests {
         runtime.shutdown();
     }
 
+    /// A request that declares an encoding this phase does not speak — the
+    /// OTLP spec's JSON encoding included — is refused with 415 naming the
+    /// supported one, before the body is read. Never a protobuf decode
+    /// error the JSON emitter cannot act on.
+    #[tokio::test]
+    async fn json_content_type_answers_415_naming_protobuf_only() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"resource_spans": []}"#.to_vec()))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let message = String::from_utf8_lossy(&body_bytes(response).await).to_string();
+        assert!(
+            message.contains("application/x-protobuf") && message.contains("application/json"),
+            "the supported and the declared encodings are both named: {message}"
+        );
+        runtime.shutdown();
+    }
+
+    /// An over-ceiling *declared* length is refused before a single body
+    /// byte is buffered — the request says so itself.
+    #[tokio::test]
+    async fn declared_over_ceiling_length_refused_413_before_reading() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/x-protobuf")
+            .header("content-length", "9999999999")
+            .body(Body::from(one_span_payload(fx::T1, fx::S1)))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let message = String::from_utf8_lossy(&body_bytes(response).await).to_string();
+        assert!(
+            message.contains("exceeds") && message.contains("4194304"),
+            "the ceiling is named: {message}"
+        );
+        runtime.shutdown();
+    }
+
+    /// A body that never arrives complete gets its own honest answer: the
+    /// read failed — not a 413 dressing a broken connection up as an
+    /// over-ceiling payload.
+    #[tokio::test]
+    async fn a_body_that_never_completes_answers_the_failed_read() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // One chunk, then the body errors: the payload never completes.
+        let truncated = Body::from_stream(tonic::codegen::tokio_stream::iter(vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a partial OTLP payload")),
+            Err(std::io::Error::other("the connection broke")),
+        ]));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/x-protobuf")
+            .body(truncated)
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = String::from_utf8_lossy(&body_bytes(response).await).to_string();
+        assert!(
+            message.contains("could not be read"),
+            "the failed read is named: {message}"
+        );
+        assert!(
+            !message.contains("ceiling"),
+            "a broken body is not an over-ceiling payload: {message}"
+        );
+        runtime.shutdown();
+    }
+
     /// The whole-export budget refusal rides `partial_success` too: the
     /// export was refused before anything was admitted, and the budget
     /// names itself with the observed count.
@@ -660,5 +835,50 @@ mod tests {
             queue_ceiling_bytes: 4096,
             clock: Box::new(crate::runtime::SystemWallClock),
         }
+    }
+
+    /// The summary's naming bound is the message's only truncation: the
+    /// first 64 rejected positions are named in full, the rest are
+    /// summarized by count — and the rejected count itself is never
+    /// truncated. Both transports encode through this one function.
+    #[test]
+    fn the_summary_names_sixty_four_positions_and_counts_the_rest() {
+        use super::rejected_summary;
+
+        let refused = |count: usize| ExportOutcome {
+            records: (0..count)
+                .map(|_| RecordOutcome::Rejected {
+                    reason: RecordRejection::Unrepresentable(Unrepresentable::IdLength {
+                        field: "trace_id",
+                        expected: 16,
+                        found: 3,
+                    }),
+                })
+                .collect(),
+        };
+
+        let (rejected, message) = rejected_summary(&refused(2));
+        assert_eq!(rejected, 2);
+        assert_eq!(
+            message,
+            "position 0: trace_id carried 3 bytes where the model carries \
+             16; position 1: trace_id carried 3 bytes where the model \
+             carries 16"
+        );
+
+        let (rejected, message) = rejected_summary(&refused(70));
+        assert_eq!(rejected, 70, "the count is complete");
+        assert!(
+            message.contains("position 0") && message.contains("position 63"),
+            "the first and 64th positions are named: {message:?}"
+        );
+        assert!(
+            !message.contains("position 64"),
+            "the 65th position is summarized, not named: {message:?}"
+        );
+        assert!(
+            message.contains("6 further rejected records not named"),
+            "the truncation is stated: {message:?}"
+        );
     }
 }

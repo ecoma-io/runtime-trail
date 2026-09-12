@@ -15,7 +15,7 @@ use runtime_trail_telemetry_model::{
 
 use crate::fixtures::*;
 use crate::otlp::opentelemetry::{common::v1 as common, logs::v1 as logs, trace::v1 as trace};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{LedgerReleaser, Pipeline};
 use crate::queue::{
     BoundedQueue, PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
 };
@@ -1163,27 +1163,8 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     // max over every record kind's formula, so a shape change in any one
     // formula moves it, and the fixture saturates at whatever whole
     // multiple the measurement says.
-    let limits = BudgetLimits {
-        attributes_per_signal: 1,
-        attributes_per_nested_set: 1,
-        attribute_value_bytes: 256,
-        span_events_per_span: 0,
-        span_links_per_span: 0,
-        exemplars_per_data_point: 0,
-        key_value_list_depth: 8,
-        data_points_per_export: 10_000,
-    };
+    let limits = shrunken_limits();
     let bound = Pipeline::legal_record_bound_bytes(&limits);
-
-    // Every span here carries one attribute at the per-entry cap
-    // (`160 + 1 + 95 == 256 == attribute_value_bytes`): attribute payload
-    // is what keeps the span a healthy fraction of the bound, so the
-    // saturating export stays small.
-    let sized_span = |name: &str, span_id: [u8; 8]| {
-        let mut span = trace_span(name, T1, span_id);
-        span.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
-        span
-    };
 
     // Measure one of these spans through a queue at the bound — which is
     // also the construction gate's promise in action: any single legal
@@ -1235,23 +1216,22 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         "the records offered before saturation stay handed off"
     );
 
-    // The producer retries the whole export, at a later admission time.
-    // Every re-delivery collapses onto a standing record — the first
-    // `fits` behind their queue entries, the last behind its ledger
-    // admission whose one offer was the refusal the signal named — and a
-    // collapse queues NOTHING. The queue keeps exactly the entries the
-    // first attempt made, with their original admission times.
-    let outcome = pipeline
+    // The producer retries the whole export while the queue is still
+    // saturated. The re-deliveries of the first `fits` spans collapse onto
+    // their standing records and queue nothing — but the refused span's
+    // identity was ENDED by the refusal, so its re-delivery admits fresh,
+    // offers, and is refused again: the same retryable signal, honestly,
+    // for exactly as long as the queue cannot take the record. (A collapse
+    // of the refused span here would have meant its entry stood behind a
+    // delivery that never happened.)
+    let signal = pipeline
         .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
-        .expect("a retry of standing records collapses without offering");
-    assert!(
-        outcome
-            .records
-            .iter()
-            .all(|record| matches!(record, RecordOutcome::Collapsed { .. })),
-        "every span of the retry is a collapse: {outcome:?}"
-    );
-    assert_eq!(queue.len(), fits, "a collapse never queues");
+        .expect_err("the once-refused span re-admits fresh and saturates again");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::QueueSaturated { ceiling_bytes, .. } if *ceiling_bytes == bound
+    ));
+    assert_eq!(queue.len(), fits, "the retry queued nothing new");
     let drained = drain_queue(&queue);
     assert_eq!(drained.len(), fits);
     for record in &drained {
@@ -1262,19 +1242,354 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         );
     }
 
-    // The consumer has drained everything. The refused span's standing
-    // record — ledger-admitted, but its one offer was the refusal the
-    // signal named — re-delivers as a collapse that queues nothing. The
-    // signal, not a silent drop, is the record of the delivery that never
-    // happened.
+    // The consumer has drained everything. The re-deliveries of the first
+    // `fits` spans collapse onto their standing records — draining a queue
+    // entry is the consumer's half of the delivery, not the end of
+    // identity — while the refused span is admitted FRESH and queued: the
+    // retry the signal invited actually delivers.
     let outcome = pipeline
         .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
+        .expect("the retry delivers what the refusal ended");
+    assert!(
+        outcome.records[..fits]
+            .iter()
+            .all(|record| matches!(record, RecordOutcome::Collapsed { .. })),
+        "the delivered spans still collapse onto their standing records: {outcome:?}"
+    );
+    assert!(
+        matches!(&outcome.records[fits], RecordOutcome::Admitted { .. }),
+        "the refused span is admitted fresh, not collapsed onto a \
+         stranded entry: {outcome:?}"
+    );
+    let delivered = drain_queue(&queue);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "exactly the once-refused span queues now"
+    );
+    assert_eq!(delivered[0].entity, standing_entity(&outcome, fits));
+}
+
+/// A queue refusal ends the refused record's own identity — the same
+/// lifecycle ADR 0008 gives a refused keep, applied by the pipeline — so
+/// the retry the signal invites can actually deliver it.
+#[test]
+fn a_queue_refusal_ends_the_refused_spans_identity() {
+    let limits = shrunken_limits();
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
+    let (queue, pipeline) = pipeline_over(bound, limits);
+
+    // Saturate the bound-sized queue with distinct single-span exports.
+    // The export that saturated it was refused, and — the law under test —
+    // its span's identity ended at that refusal.
+    let queued = saturate_with_spans(&pipeline);
+    assert!(queued >= 1, "the fixture needs queued spans in flight");
+
+    // The refused span, re-delivered while the queue is still full: it
+    // admits FRESH (nothing stands behind its delivery), offers, and is
+    // refused again. A `Collapsed` outcome would mean a stranded entry.
+    let refused = one_span_export(sized_span("refused", S2));
+    let signal = pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &refused)
+        .expect_err("the queue is still saturated");
+    assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
+
+    // The consumer drains. The identical re-delivery is ADMITTED — a
+    // collapse here would strand the record forever behind an entry whose
+    // delivery never happened, with the 429's promised retry useless.
+    drain_queue(&queue);
+    let retry = pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(100), &refused)
+        .expect("the retried span is admitted");
+    assert!(
+        matches!(&retry.records[0], RecordOutcome::Admitted { .. }),
+        "the retry must deliver fresh, not collapse onto the refused \
+         delivery's identity: {retry:?}"
+    );
+    assert_eq!(queue.len(), 1, "the retried span is queued for real");
+    drain_queue(&queue);
+}
+
+/// A refusal undoes exactly what the refused admission created — and
+/// nothing an earlier delivery still stands on. The collapse arm is the
+/// sharp edge: B collapses onto A's standing entry, so B's export failing
+/// on C's refusal must not end A's identity.
+#[test]
+fn a_refusal_undoes_only_what_that_admission_created() {
+    let limits = shrunken_limits();
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
+    let (queue, pipeline) = pipeline_over(bound, limits);
+
+    // A is admitted and queued while there is room.
+    let first = pipeline
+        .ingest_spans(now(), &one_span_export(sized_span("queued", S1)))
+        .expect("the empty queue takes A");
+    let entity_a = standing_entity(&first, 0);
+
+    // The queue saturates on the filler spans.
+    let queued = saturate_with_spans(&pipeline);
+    assert!(queued >= 1, "the fixture needs more than A in flight");
+    let in_flight = queue.len();
+
+    // One export, two records: B identical to A (a collapse — it must not
+    // touch A), then C fresh (its offer is the one that refuses).
+    let collapse_then_refuse = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![scope_spans(
+            Some(scope("test")),
+            vec![sized_span("queued", S1), sized_span("refused-now", S2)],
+        )],
+    )]));
+    let signal = pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &collapse_then_refuse)
+        .expect_err("C does not fit the saturated queue");
+    assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
+    assert_eq!(
+        queue.len(),
+        in_flight,
+        "the collapse queued nothing and C's refusal queued nothing"
+    );
+
+    // The consumer drains: A delivers exactly once, with its own admission
+    // time — B's collapse neither duplicated nor disturbed it.
+    let drained = drain_queue(&queue);
+    assert_eq!(
+        drained
+            .iter()
+            .filter(|record| record.entity == entity_a)
+            .count(),
+        1,
+        "A delivers exactly once"
+    );
+    assert!(
+        drained
+            .first()
+            .is_some_and(|record| record.entity == entity_a && record.admitted_at == now()),
+        "A travels first, under its original admission time"
+    );
+
+    // B left no residue — and did not end A: the re-delivery of B still
+    // collapses onto A's standing entry and queues nothing.
+    let again_b = pipeline
+        .ingest_spans(
+            AdmissionTime::from_unix_nano(100),
+            &one_span_export(sized_span("queued", S1)),
+        )
         .expect("walked");
-    assert!(matches!(
-        &outcome.records[fits],
-        RecordOutcome::Collapsed { .. }
-    ));
-    assert!(queue.is_empty());
+    assert!(
+        matches!(&again_b.records[0], RecordOutcome::Collapsed { entity } if *entity == entity_a),
+        "B collapses onto the A that stands — its identity untouched: {again_b:?}"
+    );
+    assert!(queue.is_empty(), "a collapse never queues");
+
+    // C's ending is single: its re-delivery is admitted fresh and queued.
+    let again_c = pipeline
+        .ingest_spans(
+            AdmissionTime::from_unix_nano(101),
+            &one_span_export(sized_span("refused-now", S2)),
+        )
+        .expect("the once-refused C is admitted fresh");
+    assert!(
+        matches!(&again_c.records[0], RecordOutcome::Admitted { .. }),
+        "C's identity ended exactly once, at its refusal: {again_c:?}"
+    );
+    assert_eq!(queue.len(), 1);
+    drain_queue(&queue);
+}
+
+/// The intern half of the undo, and its boundary: a refused point releases
+/// the interned stream **only when its own admission created the intern**.
+/// A stream an earlier queued delivery interned stands — its residency
+/// story belongs to that delivery, not to this refusal.
+#[test]
+fn a_refusal_releases_only_the_intern_its_own_admission_created() {
+    let limits = shrunken_limits();
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
+    let (queue, pipeline) = pipeline_over(bound, limits);
+
+    // Saturate the queue with points of one stream — its identity interned
+    // by the deliveries that were queued.
+    let mut queued = 0;
+    for time in 1..1_000_u64 {
+        match pipeline.ingest_metrics(now(), &one_point_export_of("base", time)) {
+            Ok(_) => queued += 1,
+            Err(AdmissionSignal::QueueSaturated { .. }) => break,
+            Err(signal) => panic!("only saturation may refuse here: {signal:?}"),
+        }
+    }
+    assert!(queued >= 1, "the fixture needs queued points in flight");
+    assert_eq!(resident_streams(&pipeline), 1, "only the base stream");
+    let in_flight = queue.len();
+
+    // A refused point of the SAME standing stream: the record's identity
+    // ends, but the intern does not — it is the queued deliveries' intern.
+    // (A release here would free a stream whose points are still in
+    // flight, and the count would drop to zero.)
+    let shared = pipeline
+        .ingest_metrics(
+            AdmissionTime::from_unix_nano(99),
+            &one_point_export_of("base", 5_000),
+        )
+        .expect_err("the queue is saturated");
+    assert!(matches!(shared, AdmissionSignal::QueueSaturated { .. }));
+    assert_eq!(
+        resident_streams(&pipeline),
+        1,
+        "the shared stream's intern is not this refusal's to release"
+    );
+    assert_eq!(queue.len(), in_flight);
+
+    // The consumer drains. The queued base points' entries still stand —
+    // draining is the consumer's half of the delivery, not the end of
+    // identity — so their intern stands too, and a re-delivery collapses.
+    drain_queue(&queue);
+    let again_base = pipeline
+        .ingest_metrics(
+            AdmissionTime::from_unix_nano(100),
+            &one_point_export_of("base", 1),
+        )
+        .expect("walked");
+    assert!(
+        matches!(&again_base.records[0], RecordOutcome::Collapsed { .. }),
+        "the queued delivery's point still stands: {again_base:?}"
+    );
+    assert_eq!(
+        resident_streams(&pipeline),
+        1,
+        "drain never ends identity: the intern survives its queue entry"
+    );
+    assert!(queue.is_empty(), "a collapse never queues");
+}
+
+/// The saturation storm: N refused exports leave the ledger exactly as
+/// they found it — every refused record's entry forgotten, every freshly
+/// interned stream released, no anomalies counted — so the ledger's
+/// overhead tracks the deliveries that happened, and each refused record
+/// re-delivers fresh. Read through the existing surfaces: the interned
+/// stream count, the outcomes a re-delivery produces, and the anomaly
+/// counter. No new observability was added for this.
+#[test]
+fn a_saturation_storm_leaves_no_ledger_residue() {
+    /// The storm count: refused exports, one new stream each, asserted one
+    /// by one.
+    const STORM: u64 = 8;
+    let limits = shrunken_limits();
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
+    let (queue, pipeline) = pipeline_over(bound, limits);
+
+    // Pre-storm: the queue filled with points of one stream.
+    let mut queued = 0;
+    for time in 1..1_000_u64 {
+        match pipeline.ingest_metrics(now(), &one_point_export_of("base", time)) {
+            Ok(_) => queued += 1,
+            Err(AdmissionSignal::QueueSaturated { .. }) => break,
+            Err(signal) => panic!("only saturation may refuse here: {signal:?}"),
+        }
+    }
+    assert!(queued >= 1);
+    let before = resident_streams(&pipeline);
+    assert_eq!(before, 1);
+
+    // The storm: every export carries one point of a NEW stream — admission
+    // creates the entry and interns the stream, the queue refuses, and the
+    // undo must put both back. Eight storms, asserted one by one: the
+    // interned count returns to `before` after every refusal.
+    for storm in 0..STORM {
+        let signal = pipeline
+            .ingest_metrics(
+                AdmissionTime::from_unix_nano(1_000 + storm),
+                &one_point_export_of(&format!("storm-{storm}"), 2_000 + storm),
+            )
+            .expect_err("the saturated queue refuses every storm record");
+        assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
+        assert_eq!(
+            resident_streams(&pipeline),
+            before,
+            "storm {storm}: the refused point's fresh intern was released"
+        );
+    }
+
+    // The residue check, record by record: drain, then re-deliver every
+    // storm point. An `Admitted` outcome means no entry stood behind it —
+    // the storm's ledger entries are all gone. (A collapse would be a
+    // stranded entry per storm.)
+    drain_queue(&queue);
+    for storm in 0..STORM {
+        let outcome = pipeline
+            .ingest_metrics(
+                AdmissionTime::from_unix_nano(3_000 + storm),
+                &one_point_export_of(&format!("storm-{storm}"), 2_000 + storm),
+            )
+            .expect("the re-delivery walks");
+        assert!(
+            matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+            "storm {storm} left no ledger entry: {outcome:?}"
+        );
+    }
+    assert_eq!(
+        resident_streams(&pipeline),
+        before + STORM,
+        "each re-delivery re-interned its stream, for real residency now"
+    );
+    assert_eq!(
+        pipeline.anomalies().total(),
+        0,
+        "nothing in the storm was recorded as a conflict"
+    );
+    drain_queue(&queue);
+}
+
+/// The narrow releaser forwards exactly its two endings — and recovers a
+/// poisoned ledger lock rather than unwinding. The composition root's
+/// eviction hook runs inside the store's keep, where a panic must not
+/// propagate, so the mutex recovery lives behind this handle and is
+/// proven here, where the lock is reachable.
+#[test]
+fn a_releaser_forwards_its_endings_through_a_poisoned_ledger() {
+    let harness = Harness::new();
+    let span_payload = one_span_export(trace_span("released", T1, S1));
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &span_payload)
+        .expect("admitted");
+    let entity = standing_entity(&outcome, 0);
+
+    harness
+        .pipeline
+        .ingest_metrics(now(), &one_point_export_of("doomed", 1))
+        .expect("admitted");
+    assert_eq!(resident_streams(&harness.pipeline), 1);
+
+    // Poison the ledger the way a panic elsewhere under it would.
+    let ledger = harness.pipeline.ledger();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ledger.lock().expect("a fresh lock");
+        panic!("poison the ledger mutex");
+    }));
+    assert!(poisoned.is_err(), "the poisoner panicked");
+
+    let releaser = LedgerReleaser::new(harness.pipeline.ledger());
+    let drained = harness.drain();
+    let StoredRecord::Point { stream, .. } = &drained[1].record else {
+        panic!("expected the queued point record");
+    };
+    releaser.release_stream(stream);
+    assert_eq!(
+        resident_streams(&harness.pipeline),
+        0,
+        "the release went through the poisoned lock"
+    );
+    releaser.forget(entity);
+    let again = harness
+        .pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &span_payload)
+        .expect("the re-delivery walks");
+    assert!(
+        matches!(&again.records[0], RecordOutcome::Admitted { .. }),
+        "the forget went through the poisoned lock — the identity is \
+         gone, so the re-delivery is fresh: {again:?}"
+    );
+    drain_queue(&harness.queue);
 }
 
 /// Drains a queue from the consumer side, front to back.
@@ -1299,6 +1614,77 @@ fn pipeline_over(ceiling_bytes: usize, limits: BudgetLimits) -> (Arc<BoundedQueu
         .expect("the ceiling clears the bound"),
     );
     (queue, pipeline)
+}
+
+/// The shrunken budgets the saturation fixtures share: small enough that a
+/// queue at the derived legal-record bound saturates within a few records.
+fn shrunken_limits() -> BudgetLimits {
+    BudgetLimits {
+        attributes_per_signal: 1,
+        attributes_per_nested_set: 1,
+        attribute_value_bytes: 256,
+        span_events_per_span: 0,
+        span_links_per_span: 0,
+        exemplars_per_data_point: 0,
+        key_value_list_depth: 8,
+        data_points_per_export: 10_000,
+    }
+}
+
+/// A span carrying one attribute at the per-entry cap of
+/// [`shrunken_limits`] (`160 + 1 + 95 == 256 == attribute_value_bytes`):
+/// attribute payload is what keeps each span a healthy fraction of the
+/// bound, so the saturating exports stay small.
+fn sized_span(name: &str, span_id: [u8; 8]) -> trace::Span {
+    let mut span = trace_span(name, T1, span_id);
+    span.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
+    span
+}
+
+/// One single-point export of the named gauge stream, its only point at
+/// `time` — the point's identity is the stream plus that time.
+fn one_point_export_of(name: &str, time: u64) -> Vec<u8> {
+    let mut point = number_point(as_double(1.0));
+    point.time_unix_nano = time;
+    let metric = described_metric(name, "d", "s", Vec::new(), vec![point]);
+    encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![metric])],
+    )]))
+}
+
+/// How many stream identities are interned in `pipeline`'s ledger right
+/// now — the observable for the intern half of the identity lifecycle.
+fn resident_streams(pipeline: &Pipeline) -> u64 {
+    pipeline
+        .ledger()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resident_streams()
+}
+
+/// Fills the pipeline's queue to saturation with distinct single-span
+/// exports, and returns how many of those exports queued a record. The
+/// export that saturated the queue was refused — and, by the law the
+/// saturation tests build on, its span's identity was ended by the
+/// pipeline.
+///
+/// # Panics
+///
+/// Panics if the queue never saturates within `1_000` exports, or if any
+/// export is refused by anything but saturation — a misbuilt fixture.
+fn saturate_with_spans(pipeline: &Pipeline) -> usize {
+    let mut queued = 0;
+    for index in 0..1_000_u32 {
+        let mut span_id = [0_u8; 8];
+        span_id[..4].copy_from_slice(&index.to_be_bytes());
+        match pipeline.ingest_spans(now(), &one_span_export(sized_span("filler", span_id))) {
+            Ok(_) => queued += 1,
+            Err(AdmissionSignal::QueueSaturated { .. }) => return queued,
+            Err(signal) => panic!("only saturation may refuse here: {signal:?}"),
+        }
+    }
+    panic!("a bound-sized queue never saturated within 1_000 spans");
 }
 
 #[test]

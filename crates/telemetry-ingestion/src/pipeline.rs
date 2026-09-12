@@ -55,20 +55,29 @@
 //! producer does next. A retry re-delivers the whole export; spans and
 //! metric points collapse onto their standing records and so queue
 //! nothing (the entries already in flight are the delivery), while log
-//! records — no natural identity — are admitted and queued again. The one
-//! record whose own offer the queue refused stands in the ledger with no
-//! queue entry: the signal named that refusal loudly and retryably, and
-//! no later collapse silently resurrects a delivery that never happened.
+//! records — no natural identity — are admitted and queued again.
+//!
+//! The one record whose own offer the queue refused is **ended by this
+//! pipeline before the signal returns**: the ledger entry admission just
+//! created is forgotten — and the interned stream identity released when
+//! this very admission created it — by the same lifecycle ADR 0008 gives
+//! every other way a record fails to stay resident. No entry stands
+//! behind a delivery that never happened, so the retry the signal invites
+//! can actually deliver: the re-delivery of that record is admitted
+//! fresh, not collapsed onto a stranded identity. What the undo never
+//! touches is what an **earlier** delivery created — a collapse this
+//! export made queues nothing and must leave the standing record and its
+//! identity exactly as they are.
 
 use std::sync::{
-    Arc, Mutex, PoisonError,
+    Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 
 use prost::Message;
 use runtime_trail_telemetry_model::{
     ATTRIBUTE_MAP_NODE_BYTES, AdmissionAnomalies, AdmissionLedger, AdmissionOutcome, AdmissionTime,
-    BudgetLimits, LogRecord, MetricPoint, Resource, Span, StreamIdentity,
+    BudgetLimits, EntityId, LogRecord, MetricPoint, Resource, Span, StreamIdentity,
     budgets::OTLP_PAYLOAD_BYTES, budgets::check_export_point_count,
 };
 
@@ -160,7 +169,8 @@ pub struct Pipeline {
     limits: BudgetLimits,
     payload_ceiling_bytes: usize,
     /// Shared, not owned outright: the composition root holds the same
-    /// handle (see [`Pipeline::ledger`]) so its eviction hook can end
+    /// ledger through the narrow [`LedgerReleaser`] handle (see
+    /// [`Pipeline::ledger_releaser`]) so its eviction hook can end
     /// identities in *this* ledger — the one admission consults — exactly
     /// when residency ends (ADR 0008). A second, private ledger would
     /// split the identity truth.
@@ -282,21 +292,31 @@ impl Pipeline {
         &self.sink
     }
 
-    /// The admission ledger this pipeline admits through, shared with the
-    /// composition root: its eviction-hook wiring (ADR 0008) must call
-    /// `forget` and `release_stream` on *this* ledger — the one admission
-    /// consults — so a re-delivery after eviction is admitted fresh.
-    /// Holding a second ledger would split the identity truth and
-    /// resurrect evicted records as collapses.
+    /// The narrow handle through which the composition root ends
+    /// identities in *this* ledger — the one admission consults: its
+    /// eviction-hook wiring (ADR 0008) must call `forget` and
+    /// `release_stream` here, so a re-delivery after an ending is admitted
+    /// fresh. Holding a second ledger would split the identity truth and
+    /// resurrect ended records as collapses.
     ///
-    /// The lock discipline that keeps this shared handle deadlock-free:
-    /// code that holds the ledger lock must never take the store's —
-    /// `ingest_*` touches only the ledger and the queue, while the store's
-    /// consumer takes the store lock first and reaches the ledger only
-    /// inside the eviction hook, after its keep has returned. One order,
-    /// store then ledger, everywhere.
+    /// The handle is deliberately narrow — exactly the two operations the
+    /// ADR 0008 loop needs — and cheap to clone. The lock discipline that
+    /// keeps this shared ledger deadlock-free: code that holds the ledger
+    /// lock must never take the store's — `ingest_*` touches only the
+    /// ledger and the queue, while the store's consumer takes the store
+    /// lock first and reaches the ledger only inside the eviction hook,
+    /// after its keep has returned. One order, store then ledger,
+    /// everywhere.
     #[must_use]
-    pub fn ledger(&self) -> Arc<Mutex<AdmissionLedger>> {
+    pub fn ledger_releaser(&self) -> LedgerReleaser {
+        LedgerReleaser::new(Arc::clone(&self.ledger))
+    }
+
+    /// The admission ledger itself, for this crate's own tests. Not part
+    /// of the public surface: everything outside this crate ends
+    /// identities through [`Pipeline::ledger_releaser`].
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> Arc<Mutex<AdmissionLedger>> {
         Arc::clone(&self.ledger)
     }
 
@@ -528,13 +548,26 @@ impl Pipeline {
                 let record = admission
                     .record
                     .expect("an admitted span carries its ledger record");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Span(record),
-                    })
-                    .map(|()| RecordOutcome::Admitted { entity })
+                let offer = self.sink.offer(QueuedRecord {
+                    entity,
+                    admitted_at: now,
+                    record: StoredRecord::Span(record),
+                });
+                match offer {
+                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
+                    Err(signal) => {
+                        // The queue refused the record this very admission
+                        // admitted: its ledger entry must not outlive the
+                        // delivery it names. The signal is the one retryable
+                        // answer, and its promised retry can only deliver if
+                        // the re-delivery is admitted fresh — the same
+                        // lifecycle ADR 0008 gives a refused keep, applied
+                        // by the pipeline itself. (A span with assigned ids
+                        // keeps no entry, so `forget` is a no-op there.)
+                        ledger.forget(entity);
+                        Err(signal)
+                    }
+                }
             }
             AdmissionOutcome::Collapsed { entity } => {
                 // The law the queue states and this pipeline keeps: a
@@ -568,14 +601,19 @@ impl Pipeline {
         };
         let admission = ledger.admit_log_record(&record);
         match admission {
-            AdmissionOutcome::Admitted { entity } => self
-                .sink
-                .offer(QueuedRecord {
-                    entity,
-                    admitted_at: now,
-                    record: StoredRecord::Log(Arc::new(record)),
-                })
-                .map(|()| RecordOutcome::Admitted { entity }),
+            AdmissionOutcome::Admitted { entity } => {
+                // A log record keeps no ledger entry — OTLP defines no
+                // log-record identity — so a refused offer has nothing to
+                // strand: the retry re-admits and re-queues it fresh by
+                // nature, no undo needed.
+                self.sink
+                    .offer(QueuedRecord {
+                        entity,
+                        admitted_at: now,
+                        record: StoredRecord::Log(Arc::new(record)),
+                    })
+                    .map(|()| RecordOutcome::Admitted { entity })
+            }
             AdmissionOutcome::Collapsed { entity } => Ok(RecordOutcome::Collapsed { entity }),
             AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
             AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
@@ -607,13 +645,30 @@ impl Pipeline {
                 let stream = admission
                     .stream
                     .expect("an admitted point carries its interned stream identity");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Point { stream, point },
-                    })
-                    .map(|()| RecordOutcome::Admitted { entity })
+                let offer = self.sink.offer(QueuedRecord {
+                    entity,
+                    admitted_at: now,
+                    record: StoredRecord::Point {
+                        stream: Arc::clone(&stream),
+                        point,
+                    },
+                });
+                match offer {
+                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
+                    Err(signal) => {
+                        // As with spans: the refused delivery's identity
+                        // ends here, by the pipeline that just created it.
+                        // The intern is undone only when *this* admission
+                        // created it — an intern made for an earlier
+                        // standing point of the same stream is that
+                        // point's residency story, not this refusal's.
+                        ledger.forget(entity);
+                        if admission.fresh_intern {
+                            ledger.release_stream(&stream);
+                        }
+                        Err(signal)
+                    }
+                }
             }
             AdmissionOutcome::Collapsed { entity } => {
                 // As with spans: a collapse is the point already admitted.
@@ -634,5 +689,47 @@ impl Pipeline {
 
     fn lock_ledger(&self) -> std::sync::MutexGuard<'_, AdmissionLedger> {
         self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The narrow handle on a pipeline's admission ledger: exactly the two
+/// operations the ADR 0008 identity lifecycle needs, and nothing else.
+///
+/// The composition root's eviction hook ends identities in the ledger
+/// admission itself consults — a record evicted from residency
+/// ([`LedgerReleaser::forget`]), a stream whose residency ended
+/// ([`LedgerReleaser::release_stream`]), and a keep the store refused
+/// (both) — so the ledger's overhead tracks what residency actually holds
+/// and a re-delivery after an ending is admitted fresh. Handing out the
+/// raw ledger would hand out admission itself: an insertion from outside
+/// the pipeline would fork the identity truth this handle exists to keep
+/// single. So the surface is the endings only, cheap to clone.
+#[derive(Clone, Debug)]
+pub struct LedgerReleaser {
+    ledger: Arc<Mutex<AdmissionLedger>>,
+}
+
+impl LedgerReleaser {
+    pub(crate) fn new(ledger: Arc<Mutex<AdmissionLedger>>) -> Self {
+        Self { ledger }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AdmissionLedger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends one record's identity: the ledger entry naming `entity` is
+    /// removed, so the identity's next delivery is admitted fresh.
+    /// Forgetting an id that names no remembered entry is a no-op.
+    pub fn forget(&self, entity: EntityId) {
+        self.lock().forget(entity);
+    }
+
+    /// Ends one stream's interned identity: the interning entry for
+    /// `stream` is dropped, so the identity's payload leaves the ledger and
+    /// a later delivery re-interns it fresh. Releasing a stream that is not
+    /// interned is a no-op.
+    pub fn release_stream(&self, stream: &Arc<StreamIdentity>) {
+        self.lock().release_stream(stream);
     }
 }

@@ -13,7 +13,16 @@
 //! The codec is a passthrough: the gRPC frame's payload is taken as raw
 //! `Bytes` — zero-copy — straight into `pipeline.ingest_*`, which does the
 //! one authoritative prost decode. Requests are decoded exactly once;
-//! responses are prost-encoded collector messages.
+//! responses are prost-encoded collector messages. An empty frame payload
+//! is a legal empty request: the default OTLP export decodes from zero
+//! bytes, so an empty export is `OK` with an empty `partial_success` —
+//! never an internal error.
+//!
+//! Two answers are protocol gates, not admission signals: a request whose
+//! content-type does not begin with `application/grpc` is refused with
+//! HTTP 415 before the body is read (the gRPC-over-HTTP2 spec's rule,
+//! quoted at [`is_grpc_content_type`]), and a draining runtime refuses an
+//! export before its frame is buffered — still `UNAVAILABLE`.
 //!
 //! The wire behaviour of every refusal is the backpressure architecture's
 //! contract (runtime-constraints.md; the signal table in the ingestion
@@ -114,13 +123,12 @@ impl Decoder for PassthroughDecoder {
     type Error = Status;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        if src.has_remaining() {
-            // Zero-copy: the frame's bytes leave the transport buffer as
-            // the payload the pipeline will decode.
-            Ok(Some(src.copy_to_bytes(src.remaining())))
-        } else {
-            Ok(None)
-        }
+        // Zero-copy: the frame's bytes leave the transport buffer as the
+        // payload the pipeline will decode. An empty frame payload is
+        // handed through too, as an empty item — it is a legal export, and
+        // returning `None` here would report the message as *missing*
+        // (an internal error) instead of empty.
+        Ok(Some(src.copy_to_bytes(src.remaining())))
     }
 }
 
@@ -382,10 +390,18 @@ impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportTraceServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
                     Ok(grpc.unary(ExportSpans { runtime }, req).await)
@@ -418,10 +434,18 @@ impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc =
                         Grpc::new(PassthroughCodec::<ExportMetricsServiceResponse>::new())
                             .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
@@ -455,10 +479,18 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportLogsServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
                     Ok(grpc.unary(ExportLogs { runtime }, req).await)
@@ -474,6 +506,37 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
 fn unimplemented_response(path: &str) -> http::Response<GrpcBody> {
     tracing::debug!(path, "unimplemented gRPC method");
     Status::unimplemented(format!("unknown method {path}")).into_http()
+}
+
+/// Whether the request speaks gRPC: the protocol requires a content-type
+/// that **begins with** `application/grpc` — bare (`application/grpc`),
+/// with a message format (`application/grpc+proto`), or with parameters.
+/// Everything else — a JSON post, a form, a missing header — is not a gRPC
+/// request, and answering it with a gRPC response (which rides HTTP 200)
+/// would hand a plain HTTP/2 client a 200 to read as success. The
+/// gRPC-over-HTTP2 spec ("Content-Type") prescribes the refusal:
+///
+/// > If **Content-Type** does not begin with "application/grpc", gRPC
+/// > servers SHOULD respond with HTTP status of 415 (Unsupported Media
+/// > Type). This will prevent other HTTP/2 clients from interpreting a
+/// > gRPC error response, which uses status 200 (OK), as successful.
+fn is_grpc_content_type(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"))
+}
+
+/// The 415 answer for a request that is not gRPC at all: bare HTTP — no
+/// `grpc-status`, no trailers, no body — because there is no gRPC exchange
+/// to answer. (The spec prescribes only the status; see
+/// [`is_grpc_content_type`] for why a gRPC-shaped answer must not ride it.)
+fn unsupported_media_type(path: &str) -> http::Response<GrpcBody> {
+    tracing::debug!(path, "non-gRPC content-type refused at the HTTP layer");
+    http::Response::builder()
+        .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        .body(GrpcBody::empty())
+        .expect("a static 415 response always builds")
 }
 
 #[cfg(test)]
@@ -723,25 +786,10 @@ mod tests {
         let router = build_router(Arc::clone(&runtime), ServerConfig::default());
 
         let _frozen = runtime.lock_store_for_test();
-        let mut saturated = false;
-        for i in 0..2_048_u32 {
-            let mut span_id = [0_u8; 8];
-            span_id[..4].copy_from_slice(&i.to_be_bytes());
-            let span = fx::trace_span("saturate", fx::T1, span_id);
-            let request = fx::traces_request(vec![fx::resource_spans(
-                None,
-                vec![fx::scope_spans(None, vec![span])],
-            )]);
-            if runtime
-                .pipeline()
-                .ingest_spans(fx::now(), &fx::encode(&request))
-                .is_err()
-            {
-                saturated = true;
-                break;
-            }
-        }
-        assert!(saturated, "a 4-KiB queue saturates within 2 Ki spans");
+        assert!(
+            saturate_until_full(&runtime),
+            "a 4-KiB queue saturates within 2 Ki spans"
+        );
 
         let answer = call(
             router,
@@ -836,5 +884,459 @@ mod tests {
         .await;
         assert_eq!(answer.code, Some(12), "UNIMPLEMENTED");
         runtime.shutdown();
+    }
+
+    /// A legal empty export — a gRPC frame whose payload is zero bytes —
+    /// decodes as the default request: nothing is admitted, and the answer
+    /// is `OK` with an empty `partial_success`. Not an internal error: the
+    /// message is *empty*, not *missing*.
+    #[tokio::test]
+    async fn empty_payload_frame_answers_ok() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let answer = call(router, TRACE_EXPORT, frame(&[])).await;
+        assert_eq!(answer.http, axum::http::StatusCode::OK);
+        assert_eq!(answer.code, Some(0), "the empty export is admitted");
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 0);
+        assert_eq!(partial.error_message, "");
+        assert_eq!(
+            runtime.store_stats().resident_records,
+            0,
+            "an empty export admits nothing"
+        );
+        runtime.shutdown();
+    }
+
+    /// A request whose content-type does not begin with `application/grpc`
+    /// is refused at the HTTP layer with 415 — bare, with no `grpc-status`
+    /// on it — so a plain HTTP/2 client can never read a gRPC answer's
+    /// status-200 envelope as success.
+    #[tokio::test]
+    async fn non_grpc_content_type_answers_unsupported_media_type() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"resource_spans": []}"#.to_vec()))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert!(
+            response.headers().get("grpc-status").is_none(),
+            "the refusal is bare HTTP, not a gRPC answer: {:?}",
+            response.headers()
+        );
+        runtime.shutdown();
+    }
+
+    /// The drain gate reads nothing from the body: a draining runtime
+    /// answers `UNAVAILABLE` before the export's frame is buffered, so a
+    /// request whose body never completes still gets its closing answer.
+    #[tokio::test]
+    async fn draining_runtime_refuses_before_buffering_the_frame() {
+        let runtime = test_support::runtime();
+        runtime.begin_drain();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // A body that never yields a byte: buffering a frame from it would
+        // never finish, so the answer proves the gate fires first.
+        let endless = Body::from_stream(tonic::codegen::tokio_stream::pending::<
+            Result<bytes::Bytes, std::convert::Infallible>,
+        >());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(endless)
+            .expect("a static request builds");
+        let response = tokio::time::timeout(Duration::from_secs(5), router.oneshot(request))
+            .await
+            .expect("the drain gate answers without reading the body")
+            .expect("the router answers every request");
+        let answer = answer(response).await;
+        assert_eq!(answer.code, Some(14), "UNAVAILABLE");
+        assert!(
+            answer.message.contains("draining"),
+            "the closing signal says so: {:?}",
+            answer.message
+        );
+        runtime.shutdown();
+    }
+
+    /// The whole-export budget refusal rides `partial_success` on the wire
+    /// exactly as the HTTP transport rides it: `OK`, the whole export
+    /// counted as rejected, and the budget naming itself.
+    #[tokio::test]
+    async fn export_budget_refusal_rides_partial_success() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            budgets: BudgetLimits {
+                data_points_per_export: 1,
+                ..BudgetLimits::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let two_points = fx::described_metric(
+            "cpu.seconds",
+            "described",
+            "s",
+            Vec::new(),
+            vec![
+                fx::number_point(fx::as_double(1.0)),
+                fx::number_point(fx::as_double(2.0)),
+            ],
+        );
+        let request = fx::metrics_request(vec![fx::resource_metrics(
+            None,
+            vec![fx::scope_metrics(None, vec![two_points])],
+        )]);
+        let answer = call(router, METRICS_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.http, axum::http::StatusCode::OK);
+        assert_eq!(answer.code, Some(0), "a budget refusal still answers OK");
+        let reply = ExportMetricsServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_data_points, 2, "the whole export");
+        assert!(
+            !partial.error_message.is_empty(),
+            "the budget names itself: {:?}",
+            partial.error_message
+        );
+        assert_eq!(
+            runtime.store_stats().resident_records,
+            0,
+            "nothing from a refused export reached storage"
+        );
+        runtime.shutdown();
+    }
+
+    /// The poison-position contract over the wire: exactly the refused
+    /// record is named, by its flat document-order position, and the
+    /// healthy rest of the export still keeps.
+    #[tokio::test]
+    async fn partial_success_names_exactly_the_poison_position() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let mut poison = fx::trace_span("poison", fx::T1, fx::S2);
+        poison.trace_id = vec![0x01, 0x02, 0x03]; // a wrong-width id: unrepresentable
+        let request = fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(
+                None,
+                vec![
+                    fx::trace_span("before", fx::T1, fx::S1),
+                    poison,
+                    fx::trace_span("after", fx::T2, fx::S1),
+                ],
+            )],
+        )]);
+
+        let answer = call(router, TRACE_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.code, Some(0), "the export still answers OK");
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 1, "exactly the poison record");
+        assert!(
+            partial.error_message.contains("position 1"),
+            "the refusal names the flat position: {:?}",
+            partial.error_message
+        );
+        assert!(
+            !partial.error_message.contains("position 0")
+                && !partial.error_message.contains("position 2"),
+            "only the poison record is named: {:?}",
+            partial.error_message
+        );
+
+        wait_for_resident(&runtime, 2);
+        runtime.shutdown();
+    }
+
+    /// The naming bound over the wire: an export with more rejections than
+    /// the message will name carries the truncation note and the complete
+    /// rejected count — the count is never truncated, only the naming.
+    #[tokio::test]
+    async fn more_rejections_than_named_carry_the_truncation_note_and_full_count() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // Seventy unrepresentable spans: every one refused, 6 past the
+        // 64-position naming bound.
+        let poison: Vec<_> = (1_u64..=70)
+            .map(|index| {
+                let mut span = fx::trace_span("poison", fx::T1, fx::S1);
+                span.trace_id = vec![0x01, 0x02, 0x03]; // a wrong-width id
+                span.span_id = index.to_be_bytes().to_vec();
+                span
+            })
+            .collect();
+        let request = fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(None, poison)],
+        )]);
+
+        let answer = call(router, TRACE_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.code, Some(0));
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 70, "the count is complete");
+        assert!(
+            partial.error_message.contains("position 63"),
+            "the last named position is the 64th: {:?}",
+            partial.error_message
+        );
+        assert!(
+            !partial.error_message.contains("position 64"),
+            "the 65th position is summarized, not named: {:?}",
+            partial.error_message
+        );
+        assert!(
+            partial
+                .error_message
+                .contains("6 further rejected records not named"),
+            "the truncation is stated: {:?}",
+            partial.error_message
+        );
+        runtime.shutdown();
+    }
+
+    use bytes::{Buf, BufMut, Bytes};
+    use std::marker::PhantomData;
+    use tonic::Status;
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+
+    /// The client half of the passthrough pair: the request message is the
+    /// raw payload bytes (tonic frames them; the server's passthrough codec
+    /// receives them verbatim), the response message is prost-decoded. The
+    /// mirror of [`PassthroughCodec`], for the real-socket test below.
+    struct WireClientCodec<Res> {
+        _response: PhantomData<fn() -> Res>,
+    }
+
+    impl<Res> WireClientCodec<Res> {
+        fn new() -> Self {
+            Self {
+                _response: PhantomData,
+            }
+        }
+    }
+
+    impl<Res> Codec for WireClientCodec<Res>
+    where
+        Res: prost::Message + Default + 'static,
+    {
+        type Encode = Bytes;
+        type Decode = Res;
+        type Encoder = RawBytesEncoder;
+        type Decoder = ProstDecoder<Res>;
+
+        fn encoder(&mut self) -> Self::Encoder {
+            RawBytesEncoder
+        }
+
+        fn decoder(&mut self) -> Self::Decoder {
+            ProstDecoder {
+                _response: PhantomData,
+            }
+        }
+    }
+
+    /// Writes the payload bytes into the gRPC frame verbatim.
+    struct RawBytesEncoder;
+
+    impl Encoder for RawBytesEncoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            dst.reserve(item.len());
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+
+    /// Prost-decodes the response frame.
+    struct ProstDecoder<Res> {
+        _response: PhantomData<fn() -> Res>,
+    }
+
+    impl<Res> Decoder for ProstDecoder<Res>
+    where
+        Res: prost::Message + Default,
+    {
+        type Item = Res;
+        type Error = Status;
+
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+            Res::decode(&mut src.copy_to_bytes(src.remaining()))
+                .map(Some)
+                .map_err(|error| {
+                    Status::internal(format!("decoding the OTLP response failed: {error}"))
+                })
+        }
+    }
+
+    /// The wire proof, on a real h2c socket: tonic's own client stack — an
+    /// `Endpoint` and `Channel` over TCP, a hand-written passthrough client
+    /// codec — against the served router. The in-process tower calls above
+    /// prove the answers' content; this proves the served wire speaks them.
+    ///
+    /// A unary export succeeds end to end, and the one retryable refusal —
+    /// a saturated queue — arrives as `RESOURCE_EXHAUSTED` **from the
+    /// response headers alone**: `Grpc::streaming` returns the `Err`
+    /// before a message could be read only when `grpc-status` rode the
+    /// initial HEADERS — the trailers-only shape — never when it rode
+    /// trailers after a body.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_real_h2c_client_exports_and_meets_the_retryable_refusal() {
+        use tonic::client::Grpc;
+        use tonic::codegen::http::uri::PathAndQuery;
+        use tonic::transport::Endpoint;
+
+        // The served socket: the real accept loop, the real router, one
+        // saturable runtime behind it.
+        let runtime = CoreRuntime::build(saturation_config()).expect("the config is buildable");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral bind");
+        let addr = listener.local_addr().expect("an ephemeral address");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let drain_runtime = Arc::clone(&runtime);
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+            let _ = gate.await;
+            drain_runtime.begin_drain();
+        });
+        let server = tokio::spawn(async move { serve.await });
+
+        let channel = tokio::time::timeout(
+            Duration::from_secs(10),
+            Endpoint::from_shared(format!("http://{addr}"))
+                .expect("a loopback endpoint")
+                .connect(),
+        )
+        .await
+        .expect("the client connects in time")
+        .expect("the client connects");
+        let mut grpc = Grpc::new(channel);
+        grpc.ready()
+            .await
+            .expect("the client channel becomes ready");
+        let path = PathAndQuery::from_static(TRACE_EXPORT);
+
+        // (a) The unary export succeeds on the wire, and the record is
+        // resident behind the pump.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            grpc.unary(
+                tonic::Request::new(Bytes::copy_from_slice(&one_span_payload(fx::T1, fx::S1))),
+                path.clone(),
+                WireClientCodec::<ExportTraceServiceResponse>::new(),
+            ),
+        )
+        .await
+        .expect("the unary export answers in time")
+        .expect("the export is admitted");
+        let reply = answer.into_inner();
+        assert_eq!(
+            reply
+                .partial_success
+                .expect("partial_success is present")
+                .rejected_spans,
+            0,
+            "the wire export is fully admitted"
+        );
+        wait_for_resident(&runtime, 1);
+
+        // (b) Saturate the queue — the store frozen so the pump frees no
+        // space — and meet the refusal over the same socket.
+        let frozen = runtime.lock_store_for_test();
+        assert!(
+            saturate_until_full(&runtime),
+            "a 4-KiB queue saturates within 2 Ki spans"
+        );
+
+        grpc.ready()
+            .await
+            .expect("the client channel is ready again");
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(10),
+            grpc.streaming(
+                tonic::Request::new(tonic::codegen::tokio_stream::once(Bytes::copy_from_slice(
+                    &one_span_payload(fx::T2, fx::S2),
+                ))),
+                path,
+                WireClientCodec::<ExportTraceServiceResponse>::new(),
+            ),
+        )
+        .await
+        .expect("the refusal answers in time");
+        let Err(status) = refusal else {
+            panic!("a saturated queue must refuse the wire export");
+        };
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "the one retryable status: {status:?}"
+        );
+        assert!(
+            status.message().contains("ingestion"),
+            "the saturated queue is named across the wire: {:?}",
+            status.message()
+        );
+
+        // Release the freeze before shutdown: the drain path must be able
+        // to finish the queue.
+        drop(frozen);
+        trigger.send(()).expect("the server is still running");
+        server
+            .await
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
+        runtime.shutdown();
+    }
+
+    /// Fills the runtime's queue to saturation through the pipeline, the
+    /// pump blocked by a frozen store, one fresh span per export. Returns
+    /// whether saturation was reached — the shared fixture of the
+    /// saturation tests.
+    fn saturate_until_full(runtime: &CoreRuntime) -> bool {
+        for i in 0..2_048_u32 {
+            let mut span_id = [0_u8; 8];
+            span_id[..4].copy_from_slice(&i.to_be_bytes());
+            let span = fx::trace_span("saturate", fx::T1, span_id);
+            let request = fx::traces_request(vec![fx::resource_spans(
+                None,
+                vec![fx::scope_spans(None, vec![span])],
+            )]);
+            if runtime
+                .pipeline()
+                .ingest_spans(fx::now(), &fx::encode(&request))
+                .is_err()
+            {
+                return true;
+            }
+        }
+        false
     }
 }

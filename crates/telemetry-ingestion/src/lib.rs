@@ -44,7 +44,7 @@ pub mod pipeline;
 pub mod queue;
 pub mod signal;
 
-pub use pipeline::{ExportOutcome, Pipeline, PipelineConfigError};
+pub use pipeline::{ExportOutcome, LedgerReleaser, Pipeline, PipelineConfigError};
 pub use queue::{
     BoundedQueue, PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
 };
