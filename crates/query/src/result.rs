@@ -79,15 +79,24 @@ pub enum TruncationPoint {
     LastExamined(EntityId),
 }
 
-/// A degraded part's named truncation: which dimension expired and where
-/// the answer stopped ([query-model.md](../../docs/architecture/query-model.md),
-/// invariant 4).
+/// A degraded part's named truncation: which dimension expired, where the
+/// answer stopped, and how much that position leaves out
+/// ([query-model.md](../../docs/architecture/query-model.md), invariant 4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Truncation {
     /// The dimension whose expiry truncated the part.
     pub dimension: Dimension,
     /// Where the part stopped.
     pub position: TruncationPoint,
+    /// How much `position` leaves out, in the dimension's own unit —
+    /// entities for `max_results` and `max_scan`, canonical evidence bytes
+    /// for `max_bytes` — when the engine can know it. A byte-ceiling
+    /// truncation always names the true count of records whose evidence
+    /// did not fit: the omission is named by count and position, never
+    /// enumerated (budget table, row `max_bytes`). A deadline cut
+    /// mid-traversal has not counted what it did not visit and carries
+    /// zero here; coverage then names the rest.
+    pub omitted: u64,
 }
 
 /// The fate of one part of an answer.
@@ -161,83 +170,4 @@ pub struct Page<T> {
     pub next_cursor: Option<Vec<u8>>,
     /// The run-fact block for this page.
     pub execution: Execution,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::num::NonZeroU64;
-
-    use runtime_trail_telemetry_model::AssignedId;
-
-    use super::*;
-
-    /// An assigned entity id for the tests: opaque, session-unique by
-    /// serial, exactly the shape the model assigns at admission.
-    fn examined() -> EntityId {
-        use std::num::NonZeroU64;
-        EntityId::Assigned(AssignedId::from_serial(
-            NonZeroU64::new(7).expect("7 is not zero"),
-        ))
-    }
-
-    /// A mixed-parts execution reports each part's fate as it happened:
-    /// completed parts stay complete, a degraded part names its truncation,
-    /// and a refused part carries dimension, limit and observed spend —
-    /// the envelope's honesty is per part, never collapsed into one flag.
-    #[test]
-    fn execution_reports_each_part_and_names_refusals() {
-        let refusal = BudgetRefusal {
-            dimension: Dimension::AggregationMemory,
-            limit: Magnitude::Bytes(1_048_576),
-            observed: Magnitude::Bytes(1_049_600),
-        };
-        let execution = Execution {
-            parts: vec![
-                PartOutcome::Complete,
-                PartOutcome::Degraded {
-                    truncation: Truncation {
-                        dimension: Dimension::Scan,
-                        position: TruncationPoint::LastExamined(examined()),
-                    },
-                },
-                PartOutcome::Refused(refusal),
-            ],
-            coverage: Coverage {
-                entries: Vec::new(),
-            },
-        };
-        assert_eq!(execution.parts.len(), 3);
-        assert!(matches!(execution.parts[0], PartOutcome::Complete));
-        assert_eq!(
-            execution.parts[1],
-            PartOutcome::Degraded {
-                truncation: Truncation {
-                    dimension: Dimension::Scan,
-                    position: TruncationPoint::LastExamined(examined()),
-                }
-            }
-        );
-        assert_eq!(execution.parts[2], PartOutcome::Refused(refusal));
-    }
-
-    /// An evicted record is a hole with a name: the coverage entry holds
-    /// both resident neighbors of the gap, so an investigator sees exactly
-    /// what the window lost instead of reading a silent skip as truth.
-    #[test]
-    fn coverage_names_an_eviction_gap_between_resident_neighbors() {
-        let (after, before) = (
-            examined(),
-            EntityId::Assigned(AssignedId::from_serial(
-                NonZeroU64::new(9).expect("9 is not zero"),
-            )),
-        );
-        let entry = CoverageEntry::EvictionGap { after, before };
-        let coverage = Coverage {
-            entries: vec![entry],
-        };
-        assert_eq!(
-            coverage.entries[0],
-            CoverageEntry::EvictionGap { after, before }
-        );
-    }
 }

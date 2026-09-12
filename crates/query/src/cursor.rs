@@ -1,34 +1,50 @@
-//! Opaque, fingerprint-bound cursors.
+//! Opaque, snapshot-bound, fingerprint-bound cursors.
 //!
-//! A cursor encodes (position in the total order, last entity id, query
-//! fingerprint), is opaque to callers, and is rejected when presented
-//! under a different query
+//! A cursor encodes a quadruple — (position in the total order, last
+//! entity id, query fingerprint, snapshot boundary) — is opaque to
+//! callers, and is rejected when presented under a different query
 //! ([query-model.md](../../docs/architecture/query-model.md),
-//! "Ordering, cursors and pagination", invariant 3). A cursor continues
-//! within the snapshot its first page evaluated; records admitted after it
-//! are outside every later page — a declared boundary in coverage, never a
-//! silent skip. Gaps under eviction are named in coverage, never silent.
+//! "Ordering, cursors and pagination", invariant 3). The snapshot
+//! boundary is the first page's residency frontier, an [`AdmissionKey`]
+//! in the storage contract's residency order: the engine bounds every
+//! continuation at it and names it via `CoverageEntry::SnapshotBoundary`.
+//! A cursor continues within the snapshot its first page evaluated;
+//! records admitted after the frontier are outside every later page — a
+//! declared boundary in coverage, never a silent skip. Gaps under
+//! eviction are named in coverage, never silent.
 //!
 //! # Byte layout
 //!
 //! The canonical encoding, little-endian throughout, no padding and no
 //! fields beyond these:
 //!
-//! | offset              | width | field                                 |
-//! | ------------------- | ----- | ------------------------------------- |
-//! | `0..8`              | 8     | position in the total order, `u64`    |
-//! | `8..16`             | 8     | query fingerprint, `u64`              |
-//! | `16`                | 1     | entity tag: `0` = span, `1` = assigned |
-//! | span: `17..33`      | 16    | trace id, wire byte order             |
-//! | span: `33..41`      | 8     | span id, wire byte order              |
-//! | assigned: `17..25`  | 8     | session serial, `u64`, never zero     |
+//! | offset                       | width | field                                     |
+//! | ---------------------------- | ----- | ----------------------------------------- |
+//! | `0..8`                       | 8     | position in the total order, `u64`        |
+//! | `8..16`                      | 8     | query fingerprint, `u64`                  |
+//! | `16`                         | 1     | last entity tag: `0` = span, `1` = assigned |
+//! | span: `17..41`               | 24    | trace id then span id, wire byte order    |
+//! | assigned: `17..25`           | 8     | session serial, `u64`, never zero         |
+//! | after the last entity        | 8     | snapshot admission time, `u64` unix ns    |
+//! | then                         | 1     | snapshot entity tag: same two tags        |
+//! | snapshot span: next 24       | 24    | trace id then span id, wire byte order    |
+//! | snapshot assigned: next 8    | 8     | session serial, `u64`, never zero         |
 //!
-//! A span payload encodes to exactly 41 bytes; an assigned payload to
-//! exactly 25. The last entity id is encoded raw — never hashed — because
-//! it is data the engine reads back, and a cursor's bytes are the
-//! engine's own output, opaque to callers but not to itself.
+//! Total length is 42–74 bytes depending on the two entity variants.
+//! Entity ids are encoded raw — never hashed — because they are data the
+//! engine reads back, and a cursor's bytes are the engine's own output,
+//! opaque to callers but not to itself.
+//!
+//! # Cursors are not authenticated
+//!
+//! Beyond strict canonical decoding, the fingerprint check is the whole
+//! validity test. A hand-altered cursor that still decodes continues a
+//! view its page never minted. The runtime's local-trust posture covers
+//! this — the caller is the operator's own process on this machine. A
+//! multi-tenant surface would need an authenticator.
 
-use runtime_trail_telemetry_model::{AssignedId, EntityId, SpanId, TraceId};
+use runtime_trail_storage::AdmissionKey;
+use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, EntityId, SpanId, TraceId};
 use std::fmt;
 use std::num::NonZeroU64;
 
@@ -44,18 +60,19 @@ const ASSIGNED_TAG: u8 = 1;
 /// The width of a serial in the encoding.
 const SERIAL_LEN: usize = std::mem::size_of::<u64>();
 
-/// Total encoded length of a span-identity cursor.
-const SPAN_LEN: usize = HEADER_LEN + 1 + TraceId::LENGTH + SpanId::LENGTH;
+/// The width of a span id's id region: trace id then span id.
+const SPAN_ID_REGION: usize = TraceId::LENGTH + SpanId::LENGTH;
 
-/// Total encoded length of an assigned-identity cursor.
-const ASSIGNED_LEN: usize = HEADER_LEN + 1 + SERIAL_LEN;
+/// The width of the snapshot's encoded admission time.
+const SNAPSHOT_TIME_LEN: usize = std::mem::size_of::<u64>();
 
 /// What a cursor encodes
 /// ([query-model.md](../../docs/architecture/query-model.md),
 /// "Ordering, cursors and pagination"): the engine's position in the total
 /// order where the answer continues, the entity id of the last record of
-/// the page that minted it, and the query fingerprint the cursor belongs
-/// to.
+/// the page that minted it, the query fingerprint the cursor belongs to,
+/// and the snapshot boundary — the first page's residency frontier, an
+/// [`AdmissionKey`] in the storage contract's residency order.
 ///
 /// The encoded form is opaque to callers — they carry the bytes and hand
 /// them back. These fields are the engine's view, reached through the
@@ -69,16 +86,83 @@ pub struct CursorPayload {
     last_entity: EntityId,
     /// The query fingerprint this cursor is valid for (invariant 3).
     fingerprint: u64,
+    /// The first page's residency frontier: every later page of the
+    /// continuation stops here.
+    snapshot: AdmissionKey,
+}
+
+/// The encoded width of an entity id's id region: trace id plus span id
+/// for a span, the serial for an assigned id.
+fn id_region_len(entity: EntityId) -> usize {
+    match entity {
+        EntityId::Span { .. } => SPAN_ID_REGION,
+        EntityId::Assigned(_) => SERIAL_LEN,
+    }
+}
+
+/// Appends one tagged entity id — the tag byte, then the id region in wire
+/// byte order — to `bytes`.
+fn push_entity(bytes: &mut Vec<u8>, entity: EntityId) {
+    match entity {
+        EntityId::Span { trace_id, span_id } => {
+            bytes.push(SPAN_TAG);
+            bytes.extend_from_slice(&trace_id.as_bytes());
+            bytes.extend_from_slice(&span_id.as_bytes());
+        }
+        EntityId::Assigned(assigned) => {
+            bytes.push(ASSIGNED_TAG);
+            bytes.extend_from_slice(&assigned.serial().get().to_le_bytes());
+        }
+    }
+}
+
+/// Parses one tagged entity id at the front of `bytes`; returns the entity
+/// and the bytes it consumed (tag plus id region). `None` is an unknown
+/// tag or an id region that does not fit; bytes beyond the region belong
+/// to the fields after it.
+fn parse_entity(bytes: &[u8]) -> Option<(EntityId, usize)> {
+    let (tag, rest) = bytes.split_first()?;
+    let entity = match *tag {
+        SPAN_TAG => {
+            if rest.len() < SPAN_ID_REGION {
+                return None;
+            }
+            let trace = &rest[..TraceId::LENGTH];
+            let span = &rest[TraceId::LENGTH..SPAN_ID_REGION];
+            EntityId::Span {
+                trace_id: TraceId::from_bytes(trace.try_into().ok()?),
+                span_id: SpanId::from_bytes(span.try_into().ok()?),
+            }
+        }
+        ASSIGNED_TAG => {
+            if rest.len() < SERIAL_LEN {
+                return None;
+            }
+            let serial = NonZeroU64::new(u64::from_le_bytes(rest[..SERIAL_LEN].try_into().ok()?))?;
+            EntityId::Assigned(AssignedId::from_serial(serial))
+        }
+        _ => return None,
+    };
+    Some((entity, 1 + id_region_len(entity)))
 }
 
 impl CursorPayload {
     /// Assembles the payload the engine mints when it truncates a page.
+    /// The snapshot is the first page's residency frontier in the storage
+    /// contract's residency order (an [`AdmissionKey`]): the engine bounds
+    /// continuations at it and names it via `CoverageEntry::SnapshotBoundary`.
     #[must_use]
-    pub const fn new(position: u64, last_entity: EntityId, fingerprint: u64) -> Self {
+    pub const fn new(
+        position: u64,
+        last_entity: EntityId,
+        fingerprint: u64,
+        snapshot: AdmissionKey,
+    ) -> Self {
         Self {
             position,
             last_entity,
             fingerprint,
+            snapshot,
         }
     }
 
@@ -100,49 +184,51 @@ impl CursorPayload {
         self.fingerprint
     }
 
+    /// The residency frontier every later page of the continuation is
+    /// bounded at — the first page's snapshot.
+    #[must_use]
+    pub const fn snapshot(&self) -> AdmissionKey {
+        self.snapshot
+    }
+
     /// Encodes the payload into the canonical byte layout documented on
     /// [the module](self). The inverse is [`CursorPayload::decode`].
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let capacity = match self.last_entity {
-            EntityId::Span { .. } => SPAN_LEN,
-            EntityId::Assigned(_) => ASSIGNED_LEN,
-        };
+        let capacity = HEADER_LEN
+            + 1
+            + id_region_len(self.last_entity)
+            + SNAPSHOT_TIME_LEN
+            + 1
+            + id_region_len(self.snapshot.entity());
         let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(&self.position.to_le_bytes());
         bytes.extend_from_slice(&self.fingerprint.to_le_bytes());
-        match self.last_entity {
-            EntityId::Span { trace_id, span_id } => {
-                bytes.push(SPAN_TAG);
-                bytes.extend_from_slice(&trace_id.as_bytes());
-                bytes.extend_from_slice(&span_id.as_bytes());
-            }
-            EntityId::Assigned(assigned) => {
-                bytes.push(ASSIGNED_TAG);
-                bytes.extend_from_slice(&assigned.serial().get().to_le_bytes());
-            }
-        }
+        push_entity(&mut bytes, self.last_entity);
+        bytes.extend_from_slice(&self.snapshot.admitted_at().as_unix_nano().to_le_bytes());
+        push_entity(&mut bytes, self.snapshot.entity());
         bytes
     }
 
     /// Decodes the canonical byte layout documented on
     /// [the module](self); the inverse of [`CursorPayload::encode`].
     ///
-    /// Decoding is strictly canonical: the length must be exactly the
-    /// layout's length for the encoded variant, the tag must be one of the
-    /// two defined tags, and an assigned serial must be nonzero. Truncated,
-    /// over-long and wrong-tagged inputs are all rejected — there is no
-    /// partial read, and nothing over-long is accepted as a prefix-plus-rest.
-    /// Corruption that still forms a valid layout decodes to a different
-    /// position: layout validity is all `decode` promises, and the
-    /// fingerprint is the only query-identity test — call
-    /// [`CursorPayload::verify`] after decoding.
+    /// Decoding is strictly canonical: the bytes must be exactly the
+    /// documented layout — header, last entity, snapshot admission time,
+    /// snapshot entity, and nothing else. Each tag must be one of the two
+    /// defined tags, each id region must fit exactly, and an assigned
+    /// serial must be nonzero. Truncated, over-long and wrong-tagged
+    /// inputs are all rejected — there is no partial read, and nothing
+    /// over-long is accepted as a prefix-plus-rest. Corruption that still
+    /// forms a valid layout decodes to a different position: layout
+    /// validity is all `decode` promises, and the fingerprint is the only
+    /// query-identity test — call [`CursorPayload::verify`] after decoding.
     ///
     /// # Errors
     ///
     /// [`CursorError::Malformed`] when the bytes do not match the
-    /// canonical layout exactly: wrong length for the tag, an unknown tag,
-    /// or a zero assigned serial.
+    /// canonical layout exactly: a region that does not fit, an unknown
+    /// tag, a zero assigned serial, or trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, CursorError> {
         Self::parse(bytes).ok_or(CursorError::Malformed)
     }
@@ -151,33 +237,29 @@ impl CursorPayload {
     /// every kind of non-canonicality collapsed into one rejection.
     fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.len() <= HEADER_LEN {
-            return None; // the entity tag would not fit
+            return None; // the last entity's tag would not fit
         }
-        let (header, tagged) = bytes.split_at(HEADER_LEN);
+        let header = &bytes[..HEADER_LEN];
         let position = u64::from_le_bytes(header[..SERIAL_LEN].try_into().ok()?);
         let fingerprint = u64::from_le_bytes(header[SERIAL_LEN..].try_into().ok()?);
-        let (tag, entity) = tagged.split_first()?;
-        let last_entity = match *tag {
-            SPAN_TAG => {
-                if entity.len() != TraceId::LENGTH + SpanId::LENGTH {
-                    return None;
-                }
-                let (trace, span) = entity.split_at(TraceId::LENGTH);
-                EntityId::Span {
-                    trace_id: TraceId::from_bytes(trace.try_into().ok()?),
-                    span_id: SpanId::from_bytes(span.try_into().ok()?),
-                }
-            }
-            ASSIGNED_TAG => {
-                let serial = NonZeroU64::new(u64::from_le_bytes(entity.try_into().ok()?))?;
-                EntityId::Assigned(AssignedId::from_serial(serial))
-            }
-            _ => return None,
-        };
+        let mut at = HEADER_LEN;
+        let (last_entity, used) = parse_entity(&bytes[at..])?;
+        at += used;
+        if bytes.len() - at < SNAPSHOT_TIME_LEN {
+            return None; // the snapshot's admission time would not fit
+        }
+        let nanos = u64::from_le_bytes(bytes[at..at + SNAPSHOT_TIME_LEN].try_into().ok()?);
+        at += SNAPSHOT_TIME_LEN;
+        let (snapshot_entity, used) = parse_entity(&bytes[at..])?;
+        at += used;
+        if at != bytes.len() {
+            return None; // over-long: nothing may trail the snapshot entity
+        }
         Some(Self {
             position,
             last_entity,
             fingerprint,
+            snapshot: AdmissionKey::new(AdmissionTime::from_unix_nano(nanos), snapshot_entity),
         })
     }
 
@@ -258,7 +340,8 @@ pub fn fingerprint(input: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use runtime_trail_telemetry_model::{AssignedId, SpanId, TraceId};
+    use runtime_trail_storage::AdmissionKey;
+    use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, SpanId, TraceId};
     use std::num::NonZeroU64;
 
     use crate::order::sort_deterministically;
@@ -282,46 +365,109 @@ mod tests {
     }
 
     fn span_payload() -> CursorPayload {
-        CursorPayload::new(12, span_entity([7; 16], [3; 8]), 0xABCD_EF01_2345_6789)
+        CursorPayload::new(
+            12,
+            span_entity([7; 16], [3; 8]),
+            0xABCD_EF01_2345_6789,
+            AdmissionKey::new(AdmissionTime::from_unix_nano(100), assigned(9)),
+        )
     }
 
     fn assigned_payload() -> CursorPayload {
-        CursorPayload::new(4, assigned(6), 0x0123_4567_89AB_CDEF)
+        CursorPayload::new(
+            4,
+            assigned(6),
+            0x0123_4567_89AB_CDEF,
+            AdmissionKey::new(
+                AdmissionTime::from_unix_nano(200),
+                span_entity([9; 16], [4; 8]),
+            ),
+        )
     }
 
-    /// Kills a mutation that drops any of the three fields from either
+    /// Last entity and snapshot both spans — the longest layout.
+    fn span_span_payload() -> CursorPayload {
+        CursorPayload::new(
+            1,
+            span_entity([1; 16], [1; 8]),
+            42,
+            AdmissionKey::new(
+                AdmissionTime::from_unix_nano(300),
+                span_entity([2; 16], [2; 8]),
+            ),
+        )
+    }
+
+    /// Last entity and snapshot both assigned — the shortest layout.
+    fn assigned_assigned_payload() -> CursorPayload {
+        CursorPayload::new(
+            7,
+            assigned(11),
+            43,
+            AdmissionKey::new(AdmissionTime::from_unix_nano(400), assigned(12)),
+        )
+    }
+
+    /// Kills a mutation that drops any of the four fields from either
     /// encoding step, or encodes the two entity variants inconsistently —
-    /// a roundtrip through both layouts must reproduce every field, at
-    /// the canonical lengths and nothing more.
+    /// a roundtrip through every layout must reproduce every field (the
+    /// snapshot frontier included), at the canonical lengths and nothing
+    /// more. The three payload shapes below cover three of the four
+    /// variant combinations and both extremes of the documented length
+    /// range.
     #[test]
     fn roundtrip_preserves_every_field_for_both_entity_variants() {
-        for payload in [span_payload(), assigned_payload()] {
+        for (payload, total_len) in [
+            (span_payload(), 58),
+            (assigned_payload(), 58),
+            (span_span_payload(), 74),
+        ] {
             let encoded = payload.encode();
             assert_eq!(
                 CursorPayload::decode(&encoded).expect("own encoding decodes"),
                 payload,
                 "encode then decode must be the identity"
             );
+            assert_eq!(
+                CursorPayload::decode(&encoded)
+                    .expect("own encoding decodes")
+                    .snapshot(),
+                payload.snapshot(),
+                "the snapshot frontier must survive the roundtrip"
+            );
+            let expected = HEADER_LEN
+                + 1
+                + id_region_len(payload.last_entity())
+                + SNAPSHOT_TIME_LEN
+                + 1
+                + id_region_len(payload.snapshot().entity());
+            assert_eq!(
+                encoded.len(),
+                expected,
+                "encoded length must be exactly the parts' sum"
+            );
+            assert_eq!(
+                encoded.len(),
+                total_len,
+                "the layout's canonical total length"
+            );
         }
-        assert_eq!(
-            span_payload().encode().len(),
-            HEADER_LEN + 1 + TraceId::LENGTH + SpanId::LENGTH,
-            "a span cursor encodes to exactly the documented length"
-        );
-        assert_eq!(
-            assigned_payload().encode().len(),
-            HEADER_LEN + 1 + SERIAL_LEN,
-            "an assigned cursor encodes to exactly the documented length"
-        );
     }
 
     /// Kills the lenient mutations: a length check that accepts a minimum
-    /// instead of the exact length, a missing tag check, acceptance of a
+    /// instead of the exact layout, a missing tag check, acceptance of a
     /// zero assigned serial, and any decoder that reads what is available
-    /// instead of rejecting a partial input.
+    /// instead of rejecting a partial input. The loop runs over all four
+    /// combinations of entity variants, so a lapse in one slot's handling
+    /// cannot hide behind the other slot.
     #[test]
     fn truncation_extension_and_noncanonical_inputs_are_all_rejected() {
-        for payload in [span_payload(), assigned_payload()] {
+        for payload in [
+            span_payload(),
+            assigned_payload(),
+            span_span_payload(),
+            assigned_assigned_payload(),
+        ] {
             let encoded = payload.encode();
             for cut in 1..encoded.len() {
                 let truncated = &encoded[..cut];
@@ -340,28 +486,44 @@ mod tests {
                 Err(CursorError::Malformed),
                 "an over-long input is rejected, not read as a prefix plus rest"
             );
+            // Unknown tags are malformed in both entity slots — the last
+            // entity's and the snapshot's — including tags whose region
+            // would fit, so a length match alone would not pass.
+            let snapshot_tag_at =
+                HEADER_LEN + 1 + id_region_len(payload.last_entity()) + SNAPSHOT_TIME_LEN;
+            for tag_at in [HEADER_LEN, snapshot_tag_at] {
+                for bad in [2_u8, u8::MAX] {
+                    let mut wrong_tag = encoded.clone();
+                    wrong_tag[tag_at] = bad;
+                    assert_eq!(
+                        CursorPayload::decode(&wrong_tag),
+                        Err(CursorError::Malformed),
+                        "tag byte {tag_at} set to {bad} is malformed",
+                    );
+                }
+            }
+            // Serial zero is not an assigned id: the model starts serials
+            // at 1. Each assigned slot is poisoned in turn.
+            if matches!(payload.last_entity(), EntityId::Assigned(_)) {
+                let mut zero_serial = encoded.clone();
+                zero_serial[HEADER_LEN + 1..HEADER_LEN + 1 + SERIAL_LEN]
+                    .copy_from_slice(&0_u64.to_le_bytes());
+                assert_eq!(
+                    CursorPayload::decode(&zero_serial),
+                    Err(CursorError::Malformed)
+                );
+            }
+            if matches!(payload.snapshot().entity(), EntityId::Assigned(_)) {
+                let mut zero_serial = encoded.clone();
+                let serial_at = snapshot_tag_at + 1;
+                zero_serial[serial_at..serial_at + SERIAL_LEN]
+                    .copy_from_slice(&0_u64.to_le_bytes());
+                assert_eq!(
+                    CursorPayload::decode(&zero_serial),
+                    Err(CursorError::Malformed)
+                );
+            }
         }
-        // Unknown tags are malformed — including the tag byte of the other
-        // variant's length, so a length match alone would not pass.
-        let mut wrong_tag = span_payload().encode();
-        wrong_tag[HEADER_LEN] = 2;
-        assert_eq!(
-            CursorPayload::decode(&wrong_tag),
-            Err(CursorError::Malformed)
-        );
-        let mut high_tag = assigned_payload().encode();
-        high_tag[HEADER_LEN] = u8::MAX;
-        assert_eq!(
-            CursorPayload::decode(&high_tag),
-            Err(CursorError::Malformed)
-        );
-        // Serial zero is not an assigned id: the model starts serials at 1.
-        let mut zero_serial = assigned_payload().encode();
-        zero_serial[HEADER_LEN + 1..].copy_from_slice(&0_u64.to_le_bytes());
-        assert_eq!(
-            CursorPayload::decode(&zero_serial),
-            Err(CursorError::Malformed)
-        );
     }
 
     /// Kills a no-op `verify` that always returns `Ok(())`, and any
@@ -421,7 +583,12 @@ mod tests {
             ];
             sort_deterministically(&mut records, |record| record.0, |record| record.1);
             let items: Vec<EntityId> = records.into_iter().map(|(_, entity)| entity).collect();
-            let cursor = CursorPayload::new(4, assigned(3), fingerprint(b"flow:errors:last-hour"));
+            let cursor = CursorPayload::new(
+                4,
+                assigned(3),
+                fingerprint(b"flow:errors:last-hour"),
+                AdmissionKey::new(AdmissionTime::from_unix_nano(300), assigned(3)),
+            );
             let bytes = cursor.encode();
             Page {
                 items,
@@ -431,6 +598,7 @@ mod tests {
                         truncation: Truncation {
                             dimension: Dimension::Scan,
                             position: TruncationPoint::Cursor(bytes),
+                            omitted: 0,
                         },
                     }],
                     coverage: Coverage {

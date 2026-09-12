@@ -81,12 +81,23 @@ tie in the order keys is broken by the record's
 pagination, and an investigator paging through results would see records
 appear twice or vanish between pages.
 
-A **cursor** is opaque to callers. It encodes (position in the total order,
-last entity id, query fingerprint). The engine **rejects a cursor whose
+A **cursor** is opaque to users and callers. It encodes (position in the
+total order, last entity id, query fingerprint, and the snapshot boundary
+the continuation stays within). The engine **rejects a cursor whose
 embedded fingerprint differs from the query it is presented to** — a cursor
 belongs to one query's result set (same shape and parameters), and
 presenting it anywhere else is an error. The fingerprint tracks the query,
-not residency; gaps from later eviction are coverage's job.
+not residency; the snapshot boundary travels in the cursor, so a stateless
+surface can hand back the continuation and the engine can bound it at the
+first page's residency frontier — an admission key in the storage
+contract's residency order ([storage-model.md](storage-model.md)) — and
+gaps from later eviction are coverage's job.
+
+Cursor bytes are not authenticated: beyond canonical decoding, the
+fingerprint is the only validity test, so a hand-altered cursor that still
+decodes continues a view its page never minted. The runtime's local-trust
+posture covers this — the caller is the operator's own process on this
+machine; a multi-tenant surface would need an authenticator.
 
 When [eviction](storage-model.md) has removed records the cursor points
 into, the response still returns what remains resident, ordered as before,

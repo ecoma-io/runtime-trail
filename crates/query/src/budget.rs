@@ -19,7 +19,7 @@
 //!
 //! The session is the engine's one entry point per work shape: a
 //! traversal-shaped ask degrades through an allowance
-//! ([`ScanAllowance`](crate::spend::ScanAllowance)), an aggregation-shaped
+//! ([`TraversalAllowance`](crate::spend::TraversalAllowance)), an aggregation-shaped
 //! charge refuses, and both are checked against the remaining deadline
 //! first — expiry follows the shape of the work in flight ("Every query
 //! carries a budget", "Refuse or degrade").
@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use crate::result::{BudgetRefusal, Dimension, Magnitude};
-use crate::spend::{ScanAllowance, SpendLedger};
+use crate::spend::{SpendLedger, TraversalAllowance};
 
 /// The budget every query admits with: the contract's five dimensions.
 ///
@@ -36,7 +36,7 @@ use crate::spend::{ScanAllowance, SpendLedger};
 /// has no `Default` and no argument-free constructor, because a
 /// budgetless query is invalid (invariant 1). A caller that has not
 /// chosen its ceilings has not thought about what its question may cost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryBudget {
     deadline: Duration,
     max_results: u64,
@@ -105,20 +105,24 @@ impl QueryBudget {
     /// the deadline against `at`, the monotonic reading captured at
     /// admission ("Deadlines").
     ///
-    /// The session is the budget's only spend path — the engine never
-    /// works the ceilings except through it (invariant 1: the engine is
-    /// the budget's only enforcer).
+    /// Consuming is literal — the budget moves in and is spent once. More
+    /// sessions come from more budgets (one per query), never from a copy
+    /// of a session's own: [`BudgetSession::budget`] only lends the
+    /// ceilings, and the ledger is crate-private, so a session cannot
+    /// quietly mint a second, unaccounted spend path (invariant 1: the
+    /// engine is the budget's only enforcer).
     #[must_use]
     pub fn admit(self, at: Instant) -> BudgetSession {
+        let ledger = SpendLedger::new(
+            self.max_results,
+            self.max_bytes,
+            self.max_scan,
+            self.max_aggregation_memory,
+        );
         BudgetSession {
             budget: self,
             admitted_at: at,
-            ledger: SpendLedger::new(
-                self.max_results,
-                self.max_bytes,
-                self.max_scan,
-                self.max_aggregation_memory,
-            ),
+            ledger,
         }
     }
 }
@@ -141,8 +145,16 @@ impl BudgetSession {
     /// Time left before the deadline: the admitted duration less what has
     /// elapsed since the admission capture, floored at zero. A paused VM
     /// burns the remainder visibly — never invisibly ("Deadlines").
+    ///
+    /// A reading earlier than the admission instant is a caller bug — the
+    /// monotonic clock never runs backwards — so debug builds assert it
+    /// and release builds saturate the elapsed time at zero.
     #[must_use]
     pub fn deadline_remaining(&self, now: Instant) -> Duration {
+        debug_assert!(
+            now >= self.admitted_at,
+            "the monotonic reading moved before the admission instant"
+        );
         self.budget
             .deadline()
             .saturating_sub(now.saturating_duration_since(self.admitted_at))
@@ -155,10 +167,13 @@ impl BudgetSession {
     }
 
     /// The budget the query admitted with, ceilings included — the
-    /// envelope's limits block reads them from here.
+    /// envelope's limits block reads them from here. The borrow cannot
+    /// re-admit: `admit` consumes its budget by value, so a session's own
+    /// budget is a read-only fact about the query, not a second spend
+    /// path.
     #[must_use]
-    pub const fn budget(&self) -> QueryBudget {
-        self.budget
+    pub const fn budget(&self) -> &QueryBudget {
+        &self.budget
     }
 
     /// A read-only handle on the spend ledger, for honest reads of what
@@ -171,9 +186,9 @@ impl BudgetSession {
     /// Traversal-shaped charge against `max_results`, deadline-checked:
     /// an expired deadline grants nothing and degrades with the deadline
     /// refusal; otherwise the ask proceeds through the ledger's allowance.
-    pub fn allow_results(&mut self, now: Instant, want: u64) -> ScanAllowance {
+    pub fn allow_results(&mut self, now: Instant, want: u64) -> TraversalAllowance {
         if self.deadline_exhausted(now) {
-            return ScanAllowance::Partial {
+            return TraversalAllowance::Partial {
                 granted: 0,
                 refusal: self.deadline_refusal(now),
             };
@@ -183,9 +198,9 @@ impl BudgetSession {
 
     /// Traversal-shaped charge against `max_bytes` — the answer's
     /// evidence encoding — deadline-checked like [`Self::allow_results`].
-    pub fn allow_bytes(&mut self, now: Instant, want: u64) -> ScanAllowance {
+    pub fn allow_bytes(&mut self, now: Instant, want: u64) -> TraversalAllowance {
         if self.deadline_exhausted(now) {
-            return ScanAllowance::Partial {
+            return TraversalAllowance::Partial {
                 granted: 0,
                 refusal: self.deadline_refusal(now),
             };
@@ -194,9 +209,9 @@ impl BudgetSession {
     }
 
     /// Traversal-shaped charge against `max_scan`, deadline-checked.
-    pub fn allow_scan(&mut self, now: Instant, want: u64) -> ScanAllowance {
+    pub fn allow_scan(&mut self, now: Instant, want: u64) -> TraversalAllowance {
         if self.deadline_exhausted(now) {
-            return ScanAllowance::Partial {
+            return TraversalAllowance::Partial {
                 granted: 0,
                 refusal: self.deadline_refusal(now),
             };
@@ -274,11 +289,10 @@ mod tests {
     /// reports the same number for both sessions and for both readings.
     #[test]
     fn admission_captures_the_deadline_and_remaining_is_measured_from_it() {
-        let budget = budget();
         let earlier = Instant::now();
         let later = earlier + Duration::from_millis(5);
-        let first = budget.admit(earlier);
-        let second = budget.admit(later);
+        let first = budget().admit(earlier);
+        let second = budget().admit(later);
 
         let reading = later + Duration::from_millis(1);
         let first_remaining = first.deadline_remaining(reading);
@@ -310,7 +324,8 @@ mod tests {
         let mut session = budget.admit(admitted_at);
         let late = admitted_at + Duration::from_millis(25);
 
-        let ScanAllowance::Partial { granted, refusal } = session.allow_results(late, 5) else {
+        let TraversalAllowance::Partial { granted, refusal } = session.allow_results(late, 5)
+        else {
             panic!("work past the deadline must not be granted");
         };
         assert_eq!(granted, 0);
@@ -372,13 +387,12 @@ mod tests {
     /// lets the deadline and ledger refusals blur into one.
     #[test]
     fn expiry_names_whichever_dimension_expired_first() {
-        let budget = budget();
         let admitted_at = Instant::now();
 
-        let mut spent = budget.admit(admitted_at);
+        let mut spent = budget().admit(admitted_at);
         assert_eq!(
             spent.allow_scan(admitted_at, 100),
-            ScanAllowance::Exact(100)
+            TraversalAllowance::Exact(100)
         );
         let Err(refusal) = spent.charge_scan_strict(admitted_at, 1) else {
             panic!("a strict charge past the spent scan ceiling must refuse");
@@ -387,7 +401,7 @@ mod tests {
         assert_eq!(refusal.observed, Magnitude::Units(100));
 
         let late = admitted_at + Duration::from_millis(11);
-        let mut expired = budget.admit(admitted_at);
+        let mut expired = budget().admit(admitted_at);
         let Err(refusal) = expired.charge_scan_strict(late, 1) else {
             panic!("a strict charge past the deadline must refuse");
         };
@@ -396,7 +410,7 @@ mod tests {
             panic!("a memory charge past the deadline must refuse");
         };
         assert_eq!(refusal.dimension, Dimension::Deadline);
-        let ScanAllowance::Partial { granted, refusal } = expired.allow_bytes(late, 1) else {
+        let TraversalAllowance::Partial { granted, refusal } = expired.allow_bytes(late, 1) else {
             panic!("a byte ask past the deadline must degrade to nothing");
         };
         assert_eq!(granted, 0);

@@ -39,7 +39,7 @@ use crate::result::{BudgetRefusal, Dimension, Magnitude};
 /// refused.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanAllowance {
+pub enum TraversalAllowance {
     /// The whole ask fits; the value is what was asked for and granted.
     Exact(u64),
     /// Only part of the ask fits: `granted` was taken from the dimension
@@ -77,14 +77,14 @@ impl Allowance {
         dimension: Dimension,
         want: u64,
         magnitude: fn(u64) -> Magnitude,
-    ) -> ScanAllowance {
+    ) -> TraversalAllowance {
         if want <= self.remaining {
             self.remaining -= want;
-            return ScanAllowance::Exact(want);
+            return TraversalAllowance::Exact(want);
         }
         let granted = self.remaining;
         self.remaining = 0;
-        ScanAllowance::Partial {
+        TraversalAllowance::Partial {
             granted,
             refusal: BudgetRefusal {
                 dimension,
@@ -124,7 +124,7 @@ impl Allowance {
 /// not ledger arithmetic, and lives with the session
 /// ([`BudgetSession`](crate::budget::BudgetSession)). The engine reads
 /// what remains and charges per shape: allowances for traversal
-/// ([`ScanAllowance`]), strict charges for aggregation.
+/// ([`TraversalAllowance`]), strict charges for aggregation.
 #[derive(Debug)]
 pub struct SpendLedger {
     results: Allowance,
@@ -136,8 +136,13 @@ pub struct SpendLedger {
 impl SpendLedger {
     /// A ledger fresh from a budget: every dimension's remaining
     /// allowance equals its limit.
+    ///
+    /// Crate-private by contract: a ledger outside a session is an
+    /// unaccounted spend path — the engine works the ceilings only through
+    /// a [`BudgetSession`](crate::budget::BudgetSession), which is the one
+    /// thing that builds a ledger (invariant 1).
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         max_results: u64,
         max_bytes: u64,
         max_scan: u64,
@@ -154,21 +159,21 @@ impl SpendLedger {
     /// Traversal-shaped charge against `max_results`: grants what fits of
     /// `want` and degrades with a truthful refusal for the shortfall
     /// (query-model.md, budget table row `max_results`).
-    pub fn allow_results(&mut self, want: u64) -> ScanAllowance {
+    pub fn allow_results(&mut self, want: u64) -> TraversalAllowance {
         self.results
             .degrade(Dimension::Results, want, Magnitude::Units)
     }
 
     /// Traversal-shaped charge against `max_bytes` — the canonical
     /// encoding of the answer's evidence (budget table row `max_bytes`).
-    pub fn allow_bytes(&mut self, want: u64) -> ScanAllowance {
+    pub fn allow_bytes(&mut self, want: u64) -> TraversalAllowance {
         self.bytes.degrade(Dimension::Bytes, want, Magnitude::Bytes)
     }
 
     /// Traversal-shaped charge against `max_scan`, in scan units — one
     /// entity examined per unit, driver-symmetric ("Scan work is
     /// driver-symmetric").
-    pub fn allow_scan(&mut self, want: u64) -> ScanAllowance {
+    pub fn allow_scan(&mut self, want: u64) -> TraversalAllowance {
         self.scan.degrade(Dimension::Scan, want, Magnitude::Units)
     }
 
@@ -262,8 +267,8 @@ mod tests {
         assert_eq!(refusal.limit, Magnitude::Units(100));
         assert_eq!(refusal.observed, Magnitude::Units(60));
 
-        assert_eq!(ledger.allow_bytes(512), ScanAllowance::Exact(512));
-        let ScanAllowance::Partial { refusal, .. } = ledger.allow_bytes(1) else {
+        assert_eq!(ledger.allow_bytes(512), TraversalAllowance::Exact(512));
+        let TraversalAllowance::Partial { refusal, .. } = ledger.allow_bytes(1) else {
             panic!("a byte ask past the exhausted dimension must degrade");
         };
         assert_eq!(refusal.dimension, Dimension::Bytes);
@@ -280,9 +285,9 @@ mod tests {
     #[test]
     fn traversal_partial_grants_take_exactly_the_remaining_allowance() {
         let mut ledger = ledger();
-        assert_eq!(ledger.allow_results(4), ScanAllowance::Exact(4));
+        assert_eq!(ledger.allow_results(4), TraversalAllowance::Exact(4));
         assert_eq!(ledger.remaining_results(), 6);
-        let ScanAllowance::Partial { granted, refusal } = ledger.allow_results(25) else {
+        let TraversalAllowance::Partial { granted, refusal } = ledger.allow_results(25) else {
             panic!("an ask past the remaining allowance must degrade");
         };
         assert_eq!(granted, 6);
@@ -291,8 +296,8 @@ mod tests {
         assert_eq!(refusal.observed, Magnitude::Units(10));
         assert_eq!(ledger.remaining_results(), 0);
 
-        assert_eq!(ledger.allow_scan(15), ScanAllowance::Exact(15));
-        let ScanAllowance::Partial { granted, .. } = ledger.allow_scan(1_000) else {
+        assert_eq!(ledger.allow_scan(15), TraversalAllowance::Exact(15));
+        let TraversalAllowance::Partial { granted, .. } = ledger.allow_scan(1_000) else {
             panic!("an ask past the remaining allowance must degrade");
         };
         assert_eq!(granted, 85);
@@ -332,12 +337,17 @@ mod tests {
     /// The same charge sequence against the same budget produces the same
     /// outcomes every run.
     ///
-    /// Kills any environment- or order-dependent accounting: the ledger is
-    /// plain integer arithmetic, and a replay of the same script must be
-    /// byte-for-byte identical, twice over.
+    /// Kills accidental nondeterminism — a leaked clock read, an ordering
+    /// borrowed from a hash map — landing in the accounting: the ledger is
+    /// plain integer arithmetic, so a replay of the same script must match
+    /// exactly, twice over.
     #[test]
     fn identical_charge_sequences_produce_identical_outcomes() {
-        fn run_script() -> (Vec<ScanAllowance>, Vec<Result<(), BudgetRefusal>>, [u64; 4]) {
+        fn run_script() -> (
+            Vec<TraversalAllowance>,
+            Vec<Result<(), BudgetRefusal>>,
+            [u64; 4],
+        ) {
             let mut ledger = SpendLedger::new(10, 512, 100, 4_096);
             let allowances = vec![
                 ledger.allow_results(4),
@@ -377,11 +387,11 @@ mod tests {
     #[test]
     fn a_zero_ask_on_an_exhausted_dimension_is_truthful_per_shape() {
         let mut ledger = ledger();
-        assert_eq!(ledger.allow_bytes(512), ScanAllowance::Exact(512));
+        assert_eq!(ledger.allow_bytes(512), TraversalAllowance::Exact(512));
         assert_eq!(ledger.remaining_bytes(), 0);
-        assert_eq!(ledger.allow_bytes(0), ScanAllowance::Exact(0));
+        assert_eq!(ledger.allow_bytes(0), TraversalAllowance::Exact(0));
         assert_eq!(ledger.remaining_bytes(), 0);
-        let ScanAllowance::Partial { granted, refusal } = ledger.allow_bytes(7) else {
+        let TraversalAllowance::Partial { granted, refusal } = ledger.allow_bytes(7) else {
             panic!("a positive ask past the exhausted dimension must degrade");
         };
         assert_eq!(granted, 0);
