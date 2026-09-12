@@ -820,14 +820,15 @@ mod tests {
     /// the hook ends the evicted record's identity in the ledger the
     /// pipeline admitted through. The behavioral proof is the fresh
     /// re-admission of the exact evicted point; the store-side counters
-    /// prove residency and identity ended together. (The ledger-side
+    /// prove residency and identity ended together; and the ledger-side
     /// counterpart — the interned stream released exactly when its last
-    /// point leaves — is asserted where the ledger is reachable: the
-    /// ingestion crate's release and storm tests, over the model's own
-    /// release law.)
+    /// point leaves — is asserted here through the pipeline's
+    /// fixture-gated releaser window, so a hook whose `stream_released`
+    /// forward is a no-op fails this test instead of passing silently.
     #[test]
     fn an_eviction_ends_identity_through_the_hook() {
         let runtime = CoreRuntime::build(two_record_config()).expect("the config is buildable");
+        let releaser = runtime.pipeline().ledger_releaser();
         let ingest_point = |name: &str, at: u64| {
             runtime
                 .pipeline()
@@ -846,6 +847,11 @@ mod tests {
         ingest_point("b", 3);
         wait_for_pump(&runtime, |summary| summary.kept == 3);
         assert_eq!(runtime.counters().evicted_on_keep, 1);
+        assert_eq!(
+            releaser.resident_streams(),
+            2,
+            "streams a and b are interned while their points are resident"
+        );
 
         // The next keep evicts stream "a"'s last point: the stream leaves
         // residency on the store side with it.
@@ -857,6 +863,12 @@ mod tests {
         assert_eq!(
             stats.resident_streams, 1,
             "stream a's last point left: it is resident no more"
+        );
+        assert_eq!(
+            releaser.resident_streams(),
+            1,
+            "the hook released stream a's interned identity when its last \
+             point left: the ledger tracks residency, not history"
         );
 
         // The proof the evictions ended the evicted point's identity: the
@@ -870,6 +882,11 @@ mod tests {
              entry: {:?}",
             again.records[0]
         );
+        assert_eq!(
+            releaser.resident_streams(),
+            2,
+            "the re-delivery re-interned stream a fresh"
+        );
         wait_for_pump(&runtime, |summary| summary.kept == 5);
         // Every removal was reported: identity ended wherever residency
         // did, with no divergence between the store's removals and the
@@ -882,8 +899,10 @@ mod tests {
     /// keep the store refuses inserted nothing, and the hook ends the
     /// identity admission had already handed out — so a re-delivery is
     /// admitted **fresh**, not collapsed onto the refused entry's phantom.
-    /// (The refused point's stream release, the `Some(stream)` arm, is
-    /// asserted at the ledger: the ingestion crate's release tests.)
+    /// The refused point's stream release — the `Some(stream)` arm — is
+    /// asserted here at the ledger through the fixture-gated releaser
+    /// window, so a hook whose `stream_released` forward is a no-op fails
+    /// this test instead of passing silently.
     #[test]
     fn a_refused_keep_ends_identity_through_the_hook() {
         // A byte ceiling no record can fit: every keep is refused with
@@ -942,6 +961,13 @@ mod tests {
         let stats = runtime.store_stats();
         assert_eq!(stats.refused_hook_deliveries, stats.total_keep_refusals());
         assert_eq!(stats.resident_records, 0);
+        assert_eq!(
+            runtime.pipeline().ledger_releaser().resident_streams(),
+            0,
+            "the refused point's stream must leave the ledger with its \
+             refused keep — an interned survivor would pin the identity \
+             for the whole session"
+        );
     }
 
     /// The retention tick is the composition root's clock handed to the

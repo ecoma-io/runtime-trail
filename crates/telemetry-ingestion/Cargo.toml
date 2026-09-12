@@ -15,9 +15,11 @@ runtime-trail-telemetry-model = { workspace = true }
 [features]
 # Compiles the semantic OTLP fixtures (`crates/telemetry-ingestion/src/
 # fixtures.rs`) into the crate for consumers above admission — the transport
-# tests its wire bytes against the same builders this crate's own tests use.
-# Off by default: a production consumer of admission never links the
-# fixtures.
+# tests its wire bytes against the same builders this crate's own tests use —
+# together with the one test-observable ledger window
+# (`LedgerReleaser::resident_streams`) the composition tests use to prove
+# the eviction hook's release forwards reach the ledger. Off by default: a
+# production consumer of admission never links the fixtures or the window.
 fixtures = []
 
 [lints]

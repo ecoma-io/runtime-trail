@@ -732,4 +732,16 @@ impl LedgerReleaser {
     pub fn release_stream(&self, stream: &Arc<StreamIdentity>) {
         self.lock().release_stream(stream);
     }
+
+    /// How many stream identities are currently interned in the ledger this
+    /// handle ends — the fixture-gated observation window the composition
+    /// tests above admission use to prove the eviction hook's
+    /// `stream_released` forwards really reach the ledger: the release
+    /// law's counterpart of the fresh-re-admission proof. Gated like the
+    /// fixtures, off in production builds.
+    #[cfg(feature = "fixtures")]
+    #[must_use]
+    pub fn resident_streams(&self) -> u64 {
+        self.lock().resident_streams()
+    }
 }
