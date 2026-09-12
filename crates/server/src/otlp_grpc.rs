@@ -1,0 +1,840 @@
+//! The OTLP/gRPC surface: the three collector services, hand-written over
+//! the vendored collector protos.
+//!
+//! The vendored codegen in the ingestion crate is prost-only — messages,
+//! no service stubs — because build-time tonic codegen would need `protoc`
+//! on every machine (ADR 0001). So the glue is written here, on tonic's
+//! public server API, in the same shape its generated code takes: per
+//! service, a server struct implementing `tower::Service` over the HTTP
+//! request, dispatching the one RPC path (`/Export`) to
+//! `tonic::server::Grpc::unary` with a `UnaryService` impl that calls the
+//! shared pipeline.
+//!
+//! The codec is a passthrough: the gRPC frame's payload is taken as raw
+//! `Bytes` — zero-copy — straight into `pipeline.ingest_*`, which does the
+//! one authoritative prost decode. Requests are decoded exactly once;
+//! responses are prost-encoded collector messages.
+//!
+//! The wire behaviour of every refusal is the backpressure architecture's
+//! contract (runtime-constraints.md; the signal table in the ingestion
+//! crate):
+//!
+//! | Signal              | gRPC answer                              |
+//! | ------------------- | ---------------------------------------- |
+//! | `QueueSaturated`    | `RESOURCE_EXHAUSTED` — the one retryable |
+//! | `Draining`          | `UNAVAILABLE` — the closing signal        |
+//! | `PayloadOverCap`    | `INVALID_ARGUMENT` naming the ceiling     |
+//! | `MalformedRequest`  | `INVALID_ARGUMENT` naming the failure     |
+//! | `ExportOverCap`     | `OK` + `partial_success` naming the budget |
+//! | per-record refusals | `OK` + `partial_success` naming positions |
+
+use std::convert::Infallible;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use bytes::{Buf, Bytes};
+use prost::Message;
+use runtime_trail_telemetry_ingestion::{
+    AdmissionSignal, ExportLogsPartialSuccess, ExportLogsServiceResponse,
+    ExportMetricsPartialSuccess, ExportMetricsServiceResponse, ExportOutcome,
+    ExportTracePartialSuccess, ExportTraceServiceResponse,
+};
+use tonic::body::Body as GrpcBody;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codegen::{Service, http};
+use tonic::server::{Grpc, UnaryService};
+use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
+
+use crate::otlp_http::{rejected_count, rejected_summary};
+use crate::runtime::CoreRuntime;
+
+/// The gRPC service prefix the OTLP/HTTP router nests the trace service
+/// under (a gRPC method's path is `/<service>/<method>`).
+pub(crate) const TRACE_SERVICE_PREFIX: &str =
+    "/opentelemetry.proto.collector.trace.v1.TraceService";
+
+/// The gRPC service prefix the metrics service is nested under.
+pub(crate) const METRICS_SERVICE_PREFIX: &str =
+    "/opentelemetry.proto.collector.metrics.v1.MetricsService";
+
+/// The gRPC service prefix the logs service is nested under.
+pub(crate) const LOGS_SERVICE_PREFIX: &str = "/opentelemetry.proto.collector.logs.v1.LogsService";
+
+/// The method suffix, as the nested service sees it once the router has
+/// stripped the service prefix.
+const EXPORT_METHOD: &str = "/Export";
+
+// ------------------------------------------------------------------
+// The passthrough codec
+// ------------------------------------------------------------------
+
+/// A gRPC codec that decodes nothing and encodes prost: the request frame
+/// arrives as raw `Bytes` (the transport's own buffer — no copy, no second
+/// decode; the pipeline owns the one prost decode), and the response
+/// message is prost-encoded for the frame writer.
+struct PassthroughCodec<Res> {
+    _response: PhantomData<fn() -> Res>,
+}
+
+impl<Res> PassthroughCodec<Res> {
+    fn new() -> Self {
+        Self {
+            _response: PhantomData,
+        }
+    }
+}
+
+impl<Res> Codec for PassthroughCodec<Res>
+where
+    // `Message` already implies `Debug + Send + Sync`, which is everything
+    // the `Codec` associated types demand beyond `'static`.
+    Res: Message + 'static,
+{
+    type Encode = Res;
+    type Decode = Bytes;
+    type Encoder = ProtobufEncoder<Res>;
+    type Decoder = PassthroughDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        ProtobufEncoder::new()
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        PassthroughDecoder
+    }
+}
+
+/// The decode half: the gRPC frame's payload, verbatim.
+struct PassthroughDecoder;
+
+impl Decoder for PassthroughDecoder {
+    type Item = Bytes;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        if src.has_remaining() {
+            // Zero-copy: the frame's bytes leave the transport buffer as
+            // the payload the pipeline will decode.
+            Ok(Some(src.copy_to_bytes(src.remaining())))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The encode half: a prost message into the gRPC frame buffer.
+struct ProtobufEncoder<Res> {
+    _response: PhantomData<fn() -> Res>,
+}
+
+impl<Res> ProtobufEncoder<Res> {
+    fn new() -> Self {
+        Self {
+            _response: PhantomData,
+        }
+    }
+}
+
+impl<Res> Encoder for ProtobufEncoder<Res>
+where
+    Res: Message,
+{
+    type Item = Res;
+    type Error = Status;
+
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        item.encode(dst).map_err(|error| {
+            Status::internal(format!("encoding the OTLP response failed: {error}"))
+        })
+    }
+}
+
+// ------------------------------------------------------------------
+// The shared ingest step
+// ------------------------------------------------------------------
+
+/// One export admitted, or the signal that refused it — mapped per
+/// transport by the service below.
+fn ingest(
+    runtime: &CoreRuntime,
+    payload: &[u8],
+    family: Family,
+) -> Result<ExportOutcome, AdmissionSignal> {
+    let now = runtime.now();
+    match family {
+        Family::Traces => runtime.pipeline().ingest_spans(now, payload),
+        Family::Metrics => runtime.pipeline().ingest_metrics(now, payload),
+        Family::Logs => runtime.pipeline().ingest_logs(now, payload),
+    }
+}
+
+/// Which export endpoint a gRPC method admits for.
+#[derive(Clone, Copy, Debug)]
+enum Family {
+    Traces,
+    Metrics,
+    Logs,
+}
+
+/// The three response messages differ in one field name each; the reply is
+/// built per family from the shared outcome mapping.
+fn trace_reply(
+    outcome: Result<ExportOutcome, AdmissionSignal>,
+) -> Result<ExportTraceServiceResponse, Status> {
+    outcome.map_or_else(
+        |signal| match signal {
+            // The transport can carry partial_success, so the whole-export
+            // budget refusal rides the response: nothing was admitted, and
+            // the budget names itself.
+            AdmissionSignal::ExportOverCap { rejection } => Ok(ExportTraceServiceResponse {
+                partial_success: Some(ExportTracePartialSuccess {
+                    rejected_spans: rejected_count(rejection.observed),
+                    error_message: rejection.to_string(),
+                }),
+            }),
+            signal => Err(signal_to_status(signal)),
+        },
+        |outcome| {
+            let (rejected, message) = rejected_summary(&outcome);
+            Ok(ExportTraceServiceResponse {
+                partial_success: Some(ExportTracePartialSuccess {
+                    rejected_spans: rejected_count(rejected),
+                    error_message: message,
+                }),
+            })
+        },
+    )
+}
+
+fn metrics_reply(
+    outcome: Result<ExportOutcome, AdmissionSignal>,
+) -> Result<ExportMetricsServiceResponse, Status> {
+    outcome.map_or_else(
+        |signal| match signal {
+            AdmissionSignal::ExportOverCap { rejection } => Ok(ExportMetricsServiceResponse {
+                partial_success: Some(ExportMetricsPartialSuccess {
+                    rejected_data_points: rejected_count(rejection.observed),
+                    error_message: rejection.to_string(),
+                }),
+            }),
+            signal => Err(signal_to_status(signal)),
+        },
+        |outcome| {
+            let (rejected, message) = rejected_summary(&outcome);
+            Ok(ExportMetricsServiceResponse {
+                partial_success: Some(ExportMetricsPartialSuccess {
+                    rejected_data_points: rejected_count(rejected),
+                    error_message: message,
+                }),
+            })
+        },
+    )
+}
+
+fn logs_reply(
+    outcome: Result<ExportOutcome, AdmissionSignal>,
+) -> Result<ExportLogsServiceResponse, Status> {
+    outcome.map_or_else(
+        |signal| match signal {
+            AdmissionSignal::ExportOverCap { rejection } => Ok(ExportLogsServiceResponse {
+                partial_success: Some(ExportLogsPartialSuccess {
+                    rejected_log_records: rejected_count(rejection.observed),
+                    error_message: rejection.to_string(),
+                }),
+            }),
+            signal => Err(signal_to_status(signal)),
+        },
+        |outcome| {
+            let (rejected, message) = rejected_summary(&outcome);
+            Ok(ExportLogsServiceResponse {
+                partial_success: Some(ExportLogsPartialSuccess {
+                    rejected_log_records: rejected_count(rejected),
+                    error_message: message,
+                }),
+            })
+        },
+    )
+}
+
+/// The wire mapping of the admission signals that refuse an export at the
+/// transport. `ExportOverCap` never reaches here: both transports carry
+/// `partial_success`, so the budget refusal rides the response.
+fn signal_to_status(signal: AdmissionSignal) -> Status {
+    match signal {
+        AdmissionSignal::QueueSaturated {
+            queue,
+            ceiling_bytes,
+            attempted_bytes,
+        } => {
+            tracing::warn!(
+                queue,
+                ceiling_bytes,
+                attempted_bytes,
+                "ingestion queue saturated: refusing the producer retryably"
+            );
+            Status::resource_exhausted(format!(
+                "the {queue} ingestion queue is at its {ceiling_bytes}-byte in-flight \
+                 ceiling and a record of {attempted_bytes} bytes did not fit; the only \
+                 retryable admission signal — retry"
+            ))
+        }
+        AdmissionSignal::PayloadOverCap {
+            bytes,
+            ceiling_bytes,
+        } => Status::invalid_argument(format!(
+            "the OTLP payload of {bytes} bytes exceeds the {ceiling_bytes}-byte \
+             ceiling; refused before parsing, non-retryable"
+        )),
+        AdmissionSignal::MalformedRequest { detail } => Status::invalid_argument(format!(
+            "the payload did not parse as an OTLP export request and cannot be \
+             retried: {detail}"
+        )),
+        AdmissionSignal::Draining => Status::unavailable(
+            "the runtime is draining and admits no new telemetry; re-delivery \
+             after restart will be admitted fresh",
+        ),
+        AdmissionSignal::ExportOverCap { rejection } => Status::internal(format!(
+            "an export-budget refusal must ride partial_success, never a status: \
+             {rejection}"
+        )),
+    }
+}
+
+// ------------------------------------------------------------------
+// The per-service unary handlers
+// ------------------------------------------------------------------
+
+/// The trace export's unary service: raw payload in, collector response
+/// out. Admission is synchronous and non-blocking, so the future is ready.
+struct ExportSpans {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl UnaryService<bytes::Bytes> for ExportSpans {
+    type Response = ExportTraceServiceResponse;
+    type Future = std::future::Ready<Result<GrpcResponse<Self::Response>, Status>>;
+
+    fn call(&mut self, request: GrpcRequest<bytes::Bytes>) -> Self::Future {
+        let outcome = ingest(&self.runtime, &request.into_inner(), Family::Traces);
+        std::future::ready(trace_reply(outcome).map(GrpcResponse::new))
+    }
+}
+
+/// The metrics export's unary service.
+struct ExportMetrics {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl UnaryService<bytes::Bytes> for ExportMetrics {
+    type Response = ExportMetricsServiceResponse;
+    type Future = std::future::Ready<Result<GrpcResponse<Self::Response>, Status>>;
+
+    fn call(&mut self, request: GrpcRequest<bytes::Bytes>) -> Self::Future {
+        let outcome = ingest(&self.runtime, &request.into_inner(), Family::Metrics);
+        std::future::ready(metrics_reply(outcome).map(GrpcResponse::new))
+    }
+}
+
+/// The logs export's unary service.
+struct ExportLogs {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl UnaryService<bytes::Bytes> for ExportLogs {
+    type Response = ExportLogsServiceResponse;
+    type Future = std::future::Ready<Result<GrpcResponse<Self::Response>, Status>>;
+
+    fn call(&mut self, request: GrpcRequest<bytes::Bytes>) -> Self::Future {
+        let outcome = ingest(&self.runtime, &request.into_inner(), Family::Logs);
+        std::future::ready(logs_reply(outcome).map(GrpcResponse::new))
+    }
+}
+
+// ------------------------------------------------------------------
+// The server services
+// ------------------------------------------------------------------
+
+/// The OTLP/gRPC trace service, as the router mounts it.
+///
+/// Mounted under [`TRACE_SERVICE_PREFIX`]: the router strips the service
+/// prefix, so the one RPC this service dispatches is `"/Export"`. Any
+/// other path is answered `UNIMPLEMENTED`, as the gRPC protocol requires.
+#[derive(Clone)]
+pub(crate) struct TraceServiceServer {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl TraceServiceServer {
+    pub(crate) fn new(runtime: Arc<CoreRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
+    type Response = http::Response<GrpcBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            match req.uri().path() {
+                EXPORT_METHOD => {
+                    let mut grpc = Grpc::new(PassthroughCodec::<ExportTraceServiceResponse>::new())
+                        .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
+                    Ok(grpc.unary(ExportSpans { runtime }, req).await)
+                }
+                path => Ok(unimplemented_response(path)),
+            }
+        })
+    }
+}
+
+/// The OTLP/gRPC metrics service, mounted under [`METRICS_SERVICE_PREFIX`].
+#[derive(Clone)]
+pub(crate) struct MetricsServiceServer {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl MetricsServiceServer {
+    pub(crate) fn new(runtime: Arc<CoreRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
+    type Response = http::Response<GrpcBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            match req.uri().path() {
+                EXPORT_METHOD => {
+                    let mut grpc =
+                        Grpc::new(PassthroughCodec::<ExportMetricsServiceResponse>::new())
+                            .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
+                    Ok(grpc.unary(ExportMetrics { runtime }, req).await)
+                }
+                path => Ok(unimplemented_response(path)),
+            }
+        })
+    }
+}
+
+/// The OTLP/gRPC logs service, mounted under [`LOGS_SERVICE_PREFIX`].
+#[derive(Clone)]
+pub(crate) struct LogsServiceServer {
+    runtime: Arc<CoreRuntime>,
+}
+
+impl LogsServiceServer {
+    pub(crate) fn new(runtime: Arc<CoreRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
+    type Response = http::Response<GrpcBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            match req.uri().path() {
+                EXPORT_METHOD => {
+                    let mut grpc = Grpc::new(PassthroughCodec::<ExportLogsServiceResponse>::new())
+                        .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
+                    Ok(grpc.unary(ExportLogs { runtime }, req).await)
+                }
+                path => Ok(unimplemented_response(path)),
+            }
+        })
+    }
+}
+
+/// The `UNIMPLEMENTED` answer for a path no RPC of this service matches —
+/// the trailers-only shape the gRPC protocol puts on the wire.
+fn unimplemented_response(path: &str) -> http::Response<GrpcBody> {
+    tracing::debug!(path, "unimplemented gRPC method");
+    Status::unimplemented(format!("unknown method {path}")).into_http()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use prost::Message;
+    use runtime_trail_storage_memory::MemoryConfig;
+    use runtime_trail_telemetry_ingestion::fixtures as fx;
+    use runtime_trail_telemetry_ingestion::{
+        ExportLogsServiceResponse, ExportMetricsServiceResponse, ExportTraceServiceResponse,
+    };
+    use runtime_trail_telemetry_model::BudgetLimits;
+    use tower::ServiceExt;
+
+    use crate::runtime::{CoreRuntime, RuntimeConfig};
+    use crate::test_support;
+    use crate::{ServerConfig, build_router};
+
+    const TRACE_EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
+    const METRICS_EXPORT: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+    const LOGS_EXPORT: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+    const TRACE_UNKNOWN: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Gather";
+
+    /// One gRPC message frame: uncompressed flag, big-endian length, bytes.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut framed = Vec::with_capacity(5 + payload.len());
+        framed.push(0_u8);
+        framed.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("a test payload fits")
+                .to_be_bytes(),
+        );
+        framed.extend_from_slice(payload);
+        framed
+    }
+
+    /// The percent-decoding `grpc-message` travels with (the gRPC wire
+    /// spec's message encoding, applied by the status writer).
+    fn percent_decode(raw: &str) -> String {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// Everything the wire says about one gRPC answer: the HTTP status, the
+    /// `grpc-status` code (headers for the trailers-only answers, trailers
+    /// otherwise), the decoded `grpc-message`, and the message bytes.
+    struct Answer {
+        http: axum::http::StatusCode,
+        code: Option<u32>,
+        message: String,
+        body: bytes::Bytes,
+    }
+
+    async fn answer(response: axum::response::Response) -> Answer {
+        let (parts, body) = response.into_parts();
+        let read = |map: &axum::http::HeaderMap, name: &str| {
+            map.get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let header_code = read(&parts.headers, "grpc-status");
+        let header_message = read(&parts.headers, "grpc-message");
+        let collected = body.collect().await.expect("the body collects");
+        let trailer_code = collected
+            .trailers()
+            .and_then(|trailers| read(trailers, "grpc-status"));
+        let trailer_message = collected
+            .trailers()
+            .and_then(|trailers| read(trailers, "grpc-message"));
+        let code = header_code.or(trailer_code);
+        let message = header_message.or(trailer_message).unwrap_or_default();
+        Answer {
+            http: parts.status,
+            code: code.and_then(|code| code.parse().ok()),
+            message: percent_decode(&message),
+            body: collected.to_bytes(),
+        }
+    }
+
+    async fn call(router: Router, path: &str, payload: Vec<u8>) -> Answer {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(Body::from(payload))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        answer(response).await
+    }
+
+    fn one_span_payload(trace_id: [u8; 16], span_id: [u8; 8]) -> Vec<u8> {
+        fx::encode(&fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(
+                None,
+                vec![fx::trace_span("handle", trace_id, span_id)],
+            )],
+        )]))
+    }
+
+    fn one_point_payload() -> Vec<u8> {
+        let metric = fx::described_metric(
+            "cpu.seconds",
+            "described",
+            "s",
+            Vec::new(),
+            vec![fx::number_point(fx::as_double(1.0))],
+        );
+        fx::encode(&fx::metrics_request(vec![fx::resource_metrics(
+            None,
+            vec![fx::scope_metrics(None, vec![metric])],
+        )]))
+    }
+
+    fn one_log_payload() -> Vec<u8> {
+        fx::encode(&fx::logs_request(vec![fx::resource_logs(
+            None,
+            vec![fx::scope_logs(
+                Some(fx::scope("app")),
+                vec![fx::log_record()],
+            )],
+        )]))
+    }
+
+    fn wait_for_resident(runtime: &CoreRuntime, expected: u64) {
+        for _ in 0..5_000 {
+            if runtime.store_stats().resident_records == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "residency never reached {expected}: {:?}",
+            runtime.store_stats()
+        );
+    }
+
+    fn saturation_config() -> RuntimeConfig {
+        RuntimeConfig {
+            store: MemoryConfig {
+                max_records: u64::MAX,
+                max_accounted_bytes: u64::MAX,
+                admission_window: Duration::from_secs(3_600),
+                series_cap: u64::MAX,
+            },
+            budgets: BudgetLimits {
+                attributes_per_signal: 1,
+                attributes_per_nested_set: 0,
+                attribute_value_bytes: 64,
+                span_events_per_span: 0,
+                span_links_per_span: 0,
+                exemplars_per_data_point: 0,
+                key_value_list_depth: 1,
+                data_points_per_export: 10,
+            },
+            payload_ceiling_bytes: 64 * 1024,
+            queue_ceiling_bytes: 4096,
+            clock: Box::new(crate::runtime::SystemWallClock),
+        }
+    }
+
+    /// The happy path on all three services: framed OTLP in, an `OK`
+    /// response with the collector message out, and records resident
+    /// behind the pump.
+    #[tokio::test]
+    async fn export_keeps_the_records_and_answers_ok() {
+        let runtime = test_support::runtime();
+
+        let answer = call(
+            build_router(Arc::clone(&runtime), ServerConfig::default()),
+            TRACE_EXPORT,
+            frame(&one_span_payload(fx::T1, fx::S1)),
+        )
+        .await;
+        assert_eq!(answer.http, axum::http::StatusCode::OK);
+        assert_eq!(answer.code, Some(0), "the export is admitted");
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 0);
+        assert_eq!(partial.error_message, "");
+
+        let answer = call(
+            build_router(Arc::clone(&runtime), ServerConfig::default()),
+            METRICS_EXPORT,
+            frame(&one_point_payload()),
+        )
+        .await;
+        assert_eq!(answer.code, Some(0));
+        let reply = ExportMetricsServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        assert_eq!(
+            reply.partial_success.expect("present").rejected_data_points,
+            0
+        );
+
+        let answer = call(
+            build_router(Arc::clone(&runtime), ServerConfig::default()),
+            LOGS_EXPORT,
+            frame(&one_log_payload()),
+        )
+        .await;
+        assert_eq!(answer.code, Some(0));
+        let reply =
+            ExportLogsServiceResponse::decode(&answer.body[5..]).expect("the framed reply decodes");
+        assert_eq!(
+            reply.partial_success.expect("present").rejected_log_records,
+            0
+        );
+
+        wait_for_resident(&runtime, 3);
+        runtime.shutdown();
+    }
+
+    /// Saturation over gRPC is `RESOURCE_EXHAUSTED` — the one retryable
+    /// status — and it names the saturated queue.
+    #[tokio::test]
+    /// The freeze holds a std mutex across the `post`/`call` awaits on
+    /// purpose: the frozen store is the test's determinism device, and the
+    /// awaited handler runs on the router, not the store.
+    #[allow(clippy::await_holding_lock)]
+    async fn saturated_queue_answers_resource_exhausted() {
+        let runtime = CoreRuntime::build(saturation_config()).expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let _frozen = runtime.lock_store_for_test();
+        let mut saturated = false;
+        for i in 0..2_048_u32 {
+            let mut span_id = [0_u8; 8];
+            span_id[..4].copy_from_slice(&i.to_be_bytes());
+            let span = fx::trace_span("saturate", fx::T1, span_id);
+            let request = fx::traces_request(vec![fx::resource_spans(
+                None,
+                vec![fx::scope_spans(None, vec![span])],
+            )]);
+            if runtime
+                .pipeline()
+                .ingest_spans(fx::now(), &fx::encode(&request))
+                .is_err()
+            {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "a 4-KiB queue saturates within 2 Ki spans");
+
+        let answer = call(
+            router,
+            TRACE_EXPORT,
+            frame(&one_span_payload(fx::T2, fx::S2)),
+        )
+        .await;
+        assert_eq!(answer.code, Some(8), "RESOURCE_EXHAUSTED");
+        assert!(
+            answer.message.contains("ingestion"),
+            "the saturated queue is named: {:?}",
+            answer.message
+        );
+    }
+
+    /// Draining over gRPC is `UNAVAILABLE` — the closing signal.
+    #[tokio::test]
+    async fn draining_runtime_answers_unavailable() {
+        let runtime = test_support::runtime();
+        runtime.begin_drain();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let answer = call(
+            router,
+            TRACE_EXPORT,
+            frame(&one_span_payload(fx::T1, fx::S1)),
+        )
+        .await;
+        assert_eq!(answer.code, Some(14), "UNAVAILABLE");
+        assert!(
+            answer.message.contains("draining"),
+            "the closing signal says so: {:?}",
+            answer.message
+        );
+        runtime.shutdown();
+    }
+
+    /// An over-ceiling payload reaches the pipeline's own gate — whose
+    /// answer names the contract ceiling — because the gRPC reader's limit
+    /// is the ceiling plus framing slack, not a bare generic limit.
+    #[tokio::test]
+    async fn over_ceiling_payload_answers_invalid_argument_naming_the_ceiling() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            payload_ceiling_bytes: 1024,
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // 4 KiB of zeros: past the 1-KiB ceiling, but far under the gRPC
+        // reader's ceiling-plus-slack, so the pipeline's gate is what
+        // refuses — as INVALID_ARGUMENT naming 1024.
+        let answer = call(router, TRACE_EXPORT, frame(&vec![0_u8; 4096])).await;
+        assert_eq!(answer.code, Some(3), "INVALID_ARGUMENT");
+        assert!(
+            answer.message.contains("1024"),
+            "the ceiling is named: {:?}",
+            answer.message
+        );
+        runtime.shutdown();
+    }
+
+    /// Bytes that never parse are `INVALID_ARGUMENT` naming the failure —
+    /// non-retryable, as the payload is the problem.
+    #[tokio::test]
+    async fn malformed_payload_answers_invalid_argument() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let answer = call(router, LOGS_EXPORT, frame(&[0xFF, 0xFF, 0xFF, 0xFF, 0x01])).await;
+        assert_eq!(answer.code, Some(3), "INVALID_ARGUMENT");
+        assert!(
+            answer.message.contains("did not parse"),
+            "the failure is named: {:?}",
+            answer.message
+        );
+        runtime.shutdown();
+    }
+
+    /// A path no RPC of the service matches is `UNIMPLEMENTED`, as the gRPC
+    /// protocol requires.
+    #[tokio::test]
+    async fn unknown_method_answers_unimplemented() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let answer = call(
+            router,
+            TRACE_UNKNOWN,
+            frame(&one_span_payload(fx::T1, fx::S1)),
+        )
+        .await;
+        assert_eq!(answer.code, Some(12), "UNIMPLEMENTED");
+        runtime.shutdown();
+    }
+}

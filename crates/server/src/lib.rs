@@ -2,36 +2,57 @@
 //!
 //! This crate is [`layer-app`]: the one place allowed to name concrete
 //! storage drivers and wire the Investigation API to a network. It serves
-//! exactly three things at bootstrap — `/healthz`, `/version`, and (when a
-//! UI build is supplied) the static Loom app. tokio + axum live here and
-//! nowhere else; see `docs/decisions/0001-runtime-language.md` for why the
-//! HTTP stack is confined to the composition root, and
+//! the health and version surfaces, the two OTLP transports, and (when a
+//! UI build is supplied) the static Loom app. tokio + axum + tonic live
+//! here and nowhere else; see `docs/decisions/0001-runtime-language.md`
+//! for why the serving stack is confined to the composition root, and
 //! `docs/architecture/boundaries.md` for the dependency law.
 //!
 //! [`layer-app`]: ../../docs/architecture/boundaries.md
 //!
 //! # Bootstrap status
 //!
-//! Smoke surfaces only: no Investigation API, no UI routes beyond static
-//! serving, no OTLP ingestion. Those land with their phases —
-//! `docs/roadmap/phases.md`.
+//! The core now *serves telemetry*: OTLP ingestion over both transports —
+//! `POST /v1/traces|metrics|logs` (protobuf) and the three OTLP/gRPC
+//! services — admitted through one pipeline into a real (memory) store
+//! under bounded retention. It does *not* yet serve the Investigation API
+//! or the UI: no query surface, no correlation, no MCP. A client that asks
+//! for telemetry in gets it; a client that asks to investigate gets
+//! nothing, because nothing is served yet — `docs/roadmap/phases.md` owns
+//! when that lands.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use runtime_trail_storage_memory::MemoryStore;
 use serde::Serialize;
 use tower_http::services::ServeDir;
+
+use crate::otlp_grpc::{LOGS_SERVICE_PREFIX, METRICS_SERVICE_PREFIX, TRACE_SERVICE_PREFIX};
+use crate::runtime::{CoreRuntime, RunSummary, RuntimeConfig};
+
+mod otlp_grpc;
+mod otlp_http;
+pub mod runtime;
 
 /// The product name reported by the version surface.
 pub const PRODUCT: &str = "runtime-trail";
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The drain deadline: how long the runtime keeps consuming its queue
+/// after shutdown is requested before dropping what is left — observably.
+///
+/// `docs/architecture/runtime-constraints.md`, "Drain deadline": at most
+/// 5 seconds, so a Ctrl-C is a prompt stop, not a hang.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The usage text the CLI prints for `--help`.
 pub const USAGE: &str = "\
@@ -66,17 +87,6 @@ impl Default for ServerConfig {
     }
 }
 
-/// What the composition root selected for this run.
-///
-/// The store is held, not just named: the composition root really constructs
-/// the concrete driver it selected — memory mode is the only selection that
-/// exists at bootstrap, and file-backed mode arrives with Phase 3
-/// (`docs/roadmap/phases.md`).
-#[derive(Debug, Clone, Copy)]
-pub struct CoreState {
-    store: MemoryStore,
-}
-
 /// Server state handed to handlers.
 #[derive(Serialize)]
 struct Health {
@@ -91,13 +101,36 @@ struct VersionInfo {
     storage_mode: &'static str,
 }
 
-/// Builds the application router: health/version surfaces plus static UI
-/// serving when a build directory is configured.
-pub fn build_router(config: ServerConfig) -> Router {
-    let state = CoreState { store: MemoryStore };
-    let router = Router::new()
+/// Builds the application router over one shared runtime graph.
+///
+/// Every route — the health and version surfaces, the three OTLP/HTTP
+/// endpoints and the three OTLP/gRPC services — is bound to the same
+/// [`CoreRuntime`]: one admission pipeline, one bounded queue, one store.
+/// The request-body ceiling is the runtime's payload ceiling, applied at
+/// the transport edge for every route; each endpoint additionally bounds
+/// its own body read with the same number.
+pub fn build_router(runtime: Arc<CoreRuntime>, config: ServerConfig) -> Router {
+    let payload_ceiling = runtime.payload_ceiling_bytes();
+    let router: Router<Arc<CoreRuntime>> = Router::new()
         .route("/healthz", get(health))
-        .route("/version", get(version).with_state(state));
+        .route("/version", get(version))
+        .route("/v1/traces", post(otlp_http::export_traces))
+        .route("/v1/metrics", post(otlp_http::export_metrics))
+        .route("/v1/logs", post(otlp_http::export_logs))
+        .nest_service(
+            TRACE_SERVICE_PREFIX,
+            otlp_grpc::TraceServiceServer::new(Arc::clone(&runtime)),
+        )
+        .nest_service(
+            METRICS_SERVICE_PREFIX,
+            otlp_grpc::MetricsServiceServer::new(Arc::clone(&runtime)),
+        )
+        .nest_service(
+            LOGS_SERVICE_PREFIX,
+            otlp_grpc::LogsServiceServer::new(Arc::clone(&runtime)),
+        )
+        .layer(DefaultBodyLimit::max(payload_ceiling));
+    let router = router.with_state(runtime);
     match config.web_dist {
         Some(dir) => router.fallback_service(ServeDir::new(dir)),
         None => router.fallback(builtin_index),
@@ -111,11 +144,11 @@ async fn health() -> Json<Health> {
     })
 }
 
-async fn version(State(state): State<CoreState>) -> Json<VersionInfo> {
+async fn version(State(runtime): State<Arc<CoreRuntime>>) -> Json<VersionInfo> {
     Json(VersionInfo {
         name: PRODUCT,
         version: VERSION,
-        storage_mode: state.store.mode_name(),
+        storage_mode: runtime.storage_mode(),
     })
 }
 
@@ -125,9 +158,10 @@ async fn builtin_index() -> Html<String> {
     Html(format!(
         "<!doctype html><title>{PRODUCT}</title>\
          <h1>{PRODUCT} {VERSION}</h1>\
-         <p>Native core is running. No UI build was supplied; start the \
-         server with <code>--web-dist &lt;path&gt;</code> to serve the \
-         Loom app.</p>"
+         <p>Native core is running. Telemetry is ingested over OTLP \
+         (HTTP and gRPC); the Investigation API is not served yet. Start \
+         the server with <code>--web-dist &lt;path&gt;</code> to serve a \
+         UI build.</p>"
     ))
 }
 
@@ -136,14 +170,53 @@ async fn builtin_index() -> Html<String> {
 /// # Errors
 ///
 /// Returns the underlying `std::io::Error` when the bind address cannot be
-/// opened, and when the accept loop itself fails.
+/// opened, when the accept loop itself fails, or when the startup
+/// configuration is not buildable.
 pub async fn serve(config: ServerConfig) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let router = build_router(config);
-    tracing::info!(bind = %listener.local_addr()?, "runtime-trail core listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+    serve_with_shutdown(config, shutdown_signal())
         .await
+        .map(|_| ())
+}
+
+/// Serves until `shutdown` resolves, then closes the session down the
+/// drain path and reports what the pump did.
+///
+/// The shutdown sequence is the resource contract, in order: `shutdown`
+/// resolves → the runtime begins draining (new exports are refused with
+/// the closing answer, the pump spends at most [`DRAIN_DEADLINE`]
+/// finishing what admission already queued) → in-flight requests finish →
+/// the workers are joined and whatever the deadline left queued is dropped
+/// observably. The summary is what a clean stop vs. a dropped stop looks
+/// like, in numbers.
+///
+/// # Errors
+///
+/// Returns the underlying `std::io::Error` when the bind address cannot be
+/// opened, when the accept loop itself fails, or when the startup
+/// configuration is not buildable.
+pub async fn serve_with_shutdown(
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<RunSummary> {
+    let runtime = CoreRuntime::build(RuntimeConfig::default()).map_err(|error| {
+        std::io::Error::other(format!(
+            "the startup configuration was refused by the ingestion pipeline: {error}"
+        ))
+    })?;
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let router = build_router(Arc::clone(&runtime), config);
+    tracing::info!(bind = %listener.local_addr()?, "runtime-trail core listening");
+    let drain_runtime = Arc::clone(&runtime);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // Draining starts the moment the stop is requested, not when
+            // the last socket closes: new telemetry must meet the closing
+            // answer immediately, and the pump gets its full deadline.
+            drain_runtime.begin_drain();
+        })
+        .await?;
+    Ok(runtime.shutdown())
 }
 
 /// Resolves when the process is asked to stop.
@@ -221,6 +294,22 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! A runtime for the crate's tests: contract defaults, but no server.
+
+    use std::sync::Arc;
+
+    use crate::runtime::{CoreRuntime, RuntimeConfig};
+
+    /// Builds a fresh runtime graph — one pipeline, one store, its workers
+    /// running. Tests that mutate retention state must drive it themselves
+    /// (the tick period is longer than any test).
+    pub(crate) fn runtime() -> Arc<CoreRuntime> {
+        CoreRuntime::build(RuntimeConfig::default()).expect("the default config is buildable")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -233,9 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn depends_on_the_investigation_api_and_the_memory_driver() {
+    fn composition_root_names_the_investigation_api_and_the_memory_driver() {
         assert!(!runtime_trail_investigation::VERSION.is_empty());
-        assert_eq!(runtime_trail_storage_memory::MemoryStore::NAME, "memory");
+        assert_eq!(
+            test_support::runtime().storage_mode(),
+            "memory",
+            "the composition root's only driver selection at this phase"
+        );
     }
 
     #[test]
@@ -266,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_reports_ok() {
-        let response = build_router(ServerConfig::default())
+        let response = build_router(test_support::runtime(), ServerConfig::default())
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/healthz")
@@ -285,7 +378,8 @@ mod tests {
 
     #[tokio::test]
     async fn version_reports_the_selected_storage_mode() {
-        let response = build_router(ServerConfig::default())
+        let runtime = test_support::runtime();
+        let response = build_router(Arc::clone(&runtime), ServerConfig::default())
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/version")
@@ -300,6 +394,154 @@ mod tests {
             .expect("body reads");
         let info: serde_json::Value = serde_json::from_slice(&body).expect("version is JSON");
         assert_eq!(info["name"], PRODUCT);
-        assert_eq!(info["storage_mode"], MemoryStore::NAME);
+        assert_eq!(
+            info["storage_mode"], "memory",
+            "the version surface reports the real driver's own mode name"
+        );
+        runtime.shutdown();
+    }
+
+    /// A free local port for a real-socket server.
+    fn free_bind() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("an ephemeral bind")
+            .local_addr()
+            .expect("an ephemeral address")
+    }
+
+    /// One HTTP/1.1 request over a real TCP connection; the whole response
+    /// as bytes (headers plus body).
+    async fn http_exchange(
+        bind: SocketAddr,
+        request: &str,
+        body: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(bind).await?;
+        let head = format!(
+            "{request}\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
+        // No write-side half-close here: hyper answers `Connection: close`
+        // by closing first, but a client EOF mid-exchange reads as the
+        // connection ending and the answer is dropped unsent.
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(response)
+    }
+
+    fn utf8(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(bytes)
+    }
+
+    /// The whole lifecycle on real sockets: the server answers health and
+    /// version, keeps a real OTLP export, and on the shutdown trigger
+    /// drains and reports — one graph end to end.
+    #[tokio::test]
+    async fn serves_otlp_and_drains_on_shutdown() {
+        let bind = free_bind();
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_shutdown(
+            ServerConfig {
+                bind,
+                web_dist: None,
+            },
+            async move {
+                let _ = gate.await;
+            },
+        ));
+
+        // Wait for readiness by polling the health surface on the socket.
+        let mut health = None;
+        for _ in 0..500 {
+            match http_exchange(bind, "GET /healthz HTTP/1.1", b"").await {
+                Ok(answer) if utf8(&answer).contains("200 OK") => {
+                    health = Some(answer);
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+        let health = health.expect("the server answers /healthz on a real socket");
+        assert!(
+            utf8(&health).contains("\"status\":\"ok\""),
+            "health is honest JSON: {}",
+            utf8(&health)
+        );
+
+        // The version surface names the real driver.
+        let version = http_exchange(bind, "GET /version HTTP/1.1", b"")
+            .await
+            .expect("version answers");
+        assert!(utf8(&version).contains("\"storage_mode\":\"memory\""));
+
+        // A real OTLP export is admitted and kept behind the pump.
+        let request = runtime_trail_telemetry_ingestion::fixtures::encode(
+            &runtime_trail_telemetry_ingestion::fixtures::traces_request(vec![
+                runtime_trail_telemetry_ingestion::fixtures::resource_spans(
+                    None,
+                    vec![runtime_trail_telemetry_ingestion::fixtures::scope_spans(
+                        None,
+                        vec![runtime_trail_telemetry_ingestion::fixtures::trace_span(
+                            "op", [0x01; 16], [0x11; 8],
+                        )],
+                    )],
+                ),
+            ]),
+        );
+        let export = http_exchange(
+            bind,
+            "POST /v1/traces HTTP/1.1\r\nContent-Type: application/x-protobuf",
+            &request,
+        )
+        .await
+        .expect("the export answers");
+        let export = utf8(&export);
+        assert!(
+            export.starts_with("HTTP/1.1 200 OK"),
+            "the export is admitted: {export}"
+        );
+
+        // The shutdown trigger: drain, join, report.
+        trigger.send(()).expect("the server is still running");
+        let summary = server
+            .await
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
+        assert_eq!(summary.kept, 1, "the export reached storage");
+        assert_eq!(summary.dropped_on_drain, 0, "nothing was dropped");
+    }
+
+    /// The index page is honest about what is and is not served: ingestion
+    /// yes, investigation not yet.
+    #[tokio::test]
+    async fn the_index_does_not_claim_the_investigation_api() {
+        let runtime = test_support::runtime();
+        let response = build_router(Arc::clone(&runtime), ServerConfig::default())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("static request builds"),
+            )
+            .await
+            .expect("in-memory service answers");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains(PRODUCT));
+        assert!(
+            page.contains("OTLP"),
+            "ingestion is served and the page says so: {page}"
+        );
+        assert!(
+            !page.to_lowercase().contains("investigation api is served"),
+            "the page never claims the Investigation API: {page}"
+        );
+        runtime.shutdown();
     }
 }

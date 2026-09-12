@@ -15,6 +15,10 @@ runtime-trail-storage-memory = { workspace = true }
 runtime-trail-telemetry-ingestion = { workspace = true }
 runtime-trail-telemetry-model = { workspace = true }
 axum = { workspace = true }
+# The gRPC passthrough codec hands the OTLP frame's payload to the pipeline
+# as borrowed transport bytes (zero-copy); `bytes::Bytes` is the type the
+# whole admission path (queue, store) accounts with.
+bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -24,6 +28,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# The gRPC tests read status trailers off the served response bodies.
+http-body-util = "0.1"
 serde_json = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 # The same semantic fixtures this crate's own tests admit with — the wire
