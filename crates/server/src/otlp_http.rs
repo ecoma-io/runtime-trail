@@ -317,7 +317,8 @@ mod tests {
     use runtime_trail_storage_memory::MemoryConfig;
     use runtime_trail_telemetry_ingestion::fixtures as fx;
     use runtime_trail_telemetry_ingestion::{
-        ExportLogsServiceResponse, ExportMetricsServiceResponse, ExportTraceServiceResponse,
+        ExportLogsServiceResponse, ExportMetricsServiceResponse, ExportOutcome,
+        ExportTraceServiceResponse, RecordOutcome, RecordRejection, Unrepresentable,
     };
     use runtime_trail_telemetry_model::BudgetLimits;
     use tower::ServiceExt;
@@ -660,5 +661,50 @@ mod tests {
             queue_ceiling_bytes: 4096,
             clock: Box::new(crate::runtime::SystemWallClock),
         }
+    }
+
+    /// The summary's naming bound is the message's only truncation: the
+    /// first 64 rejected positions are named in full, the rest are
+    /// summarized by count — and the rejected count itself is never
+    /// truncated. Both transports encode through this one function.
+    #[test]
+    fn the_summary_names_sixty_four_positions_and_counts_the_rest() {
+        use super::rejected_summary;
+
+        let refused = |count: usize| ExportOutcome {
+            records: (0..count)
+                .map(|_| RecordOutcome::Rejected {
+                    reason: RecordRejection::Unrepresentable(Unrepresentable::IdLength {
+                        field: "trace_id",
+                        expected: 16,
+                        found: 3,
+                    }),
+                })
+                .collect(),
+        };
+
+        let (rejected, message) = rejected_summary(&refused(2));
+        assert_eq!(rejected, 2);
+        assert_eq!(
+            message,
+            "position 0: trace_id carried 3 bytes where the model carries \
+             16; position 1: trace_id carried 3 bytes where the model \
+             carries 16"
+        );
+
+        let (rejected, message) = rejected_summary(&refused(70));
+        assert_eq!(rejected, 70, "the count is complete");
+        assert!(
+            message.contains("position 0") && message.contains("position 63"),
+            "the first and 64th positions are named: {message:?}"
+        );
+        assert!(
+            !message.contains("position 64"),
+            "the 65th position is summarized, not named: {message:?}"
+        );
+        assert!(
+            message.contains("6 further rejected records not named"),
+            "the truncation is stated: {message:?}"
+        );
     }
 }

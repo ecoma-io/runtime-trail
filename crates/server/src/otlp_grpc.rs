@@ -991,4 +991,146 @@ mod tests {
         );
         runtime.shutdown();
     }
+
+    /// The whole-export budget refusal rides `partial_success` on the wire
+    /// exactly as the HTTP transport rides it: `OK`, the whole export
+    /// counted as rejected, and the budget naming itself.
+    #[tokio::test]
+    async fn export_budget_refusal_rides_partial_success() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            budgets: BudgetLimits {
+                data_points_per_export: 1,
+                ..BudgetLimits::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let two_points = fx::described_metric(
+            "cpu.seconds",
+            "described",
+            "s",
+            Vec::new(),
+            vec![
+                fx::number_point(fx::as_double(1.0)),
+                fx::number_point(fx::as_double(2.0)),
+            ],
+        );
+        let request = fx::metrics_request(vec![fx::resource_metrics(
+            None,
+            vec![fx::scope_metrics(None, vec![two_points])],
+        )]);
+        let answer = call(router, METRICS_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.http, axum::http::StatusCode::OK);
+        assert_eq!(answer.code, Some(0), "a budget refusal still answers OK");
+        let reply = ExportMetricsServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_data_points, 2, "the whole export");
+        assert!(
+            !partial.error_message.is_empty(),
+            "the budget names itself: {:?}",
+            partial.error_message
+        );
+        assert_eq!(
+            runtime.store_stats().resident_records,
+            0,
+            "nothing from a refused export reached storage"
+        );
+        runtime.shutdown();
+    }
+
+    /// The poison-position contract over the wire: exactly the refused
+    /// record is named, by its flat document-order position, and the
+    /// healthy rest of the export still keeps.
+    #[tokio::test]
+    async fn partial_success_names_exactly_the_poison_position() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let mut poison = fx::trace_span("poison", fx::T1, fx::S2);
+        poison.trace_id = vec![0x01, 0x02, 0x03]; // a wrong-width id: unrepresentable
+        let request = fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(
+                None,
+                vec![
+                    fx::trace_span("before", fx::T1, fx::S1),
+                    poison,
+                    fx::trace_span("after", fx::T2, fx::S1),
+                ],
+            )],
+        )]);
+
+        let answer = call(router, TRACE_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.code, Some(0), "the export still answers OK");
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 1, "exactly the poison record");
+        assert!(
+            partial.error_message.contains("position 1"),
+            "the refusal names the flat position: {:?}",
+            partial.error_message
+        );
+        assert!(
+            !partial.error_message.contains("position 0")
+                && !partial.error_message.contains("position 2"),
+            "only the poison record is named: {:?}",
+            partial.error_message
+        );
+
+        wait_for_resident(&runtime, 2);
+        runtime.shutdown();
+    }
+
+    /// The naming bound over the wire: an export with more rejections than
+    /// the message will name carries the truncation note and the complete
+    /// rejected count — the count is never truncated, only the naming.
+    #[tokio::test]
+    async fn more_rejections_than_named_carry_the_truncation_note_and_full_count() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // Seventy unrepresentable spans: every one refused, 6 past the
+        // 64-position naming bound.
+        let poison: Vec<_> = (1_u64..=70)
+            .map(|index| {
+                let mut span = fx::trace_span("poison", fx::T1, fx::S1);
+                span.trace_id = vec![0x01, 0x02, 0x03]; // a wrong-width id
+                span.span_id = index.to_be_bytes().to_vec();
+                span
+            })
+            .collect();
+        let request = fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(None, poison)],
+        )]);
+
+        let answer = call(router, TRACE_EXPORT, frame(&fx::encode(&request))).await;
+        assert_eq!(answer.code, Some(0));
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 70, "the count is complete");
+        assert!(
+            partial.error_message.contains("position 63"),
+            "the last named position is the 64th: {:?}",
+            partial.error_message
+        );
+        assert!(
+            !partial.error_message.contains("position 64"),
+            "the 65th position is summarized, not named: {:?}",
+            partial.error_message
+        );
+        assert!(
+            partial
+                .error_message
+                .contains("6 further rejected records not named"),
+            "the truncation is stated: {:?}",
+            partial.error_message
+        );
+        runtime.shutdown();
+    }
 }
