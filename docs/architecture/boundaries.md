@@ -27,6 +27,7 @@ exactly one `layer-*` tag, and the law keys on those tags:
 | `layer-storage`        | `storage` (crates/storage) — the Storage Abstraction                                        |
 | `layer-storage-driver` | `storage-memory`, `storage-sqlite` — concrete storage modes                                 |
 | `layer-ingest`         | `telemetry-ingestion` (crates/telemetry-ingestion) — OTLP ingestion                         |
+| `layer-bench`          | `bench-probes` (crates/bench-probes) — the memory-path measurement harness                  |
 | `layer-app`            | `server` (crates/server), `desktop` (apps/desktop/src-tauri) — composition and distribution |
 
 ## Allowed dependency directions
@@ -39,6 +40,7 @@ layer-model            → (nothing)                      # leaf
 layer-storage          → model
 layer-storage-driver   → storage, model
 layer-ingest           → model, storage
+layer-bench            → model, storage, storage-driver, ingest
 layer-query            → model, storage
 layer-correlation      → model, storage
 layer-api              → query, correlation, model
@@ -65,6 +67,12 @@ Notes on the two rows that look unusual:
   `server` and `desktop` may depend on each other: the desktop shell starts the
   same server core in-process (the same-core invariant in
   [system.md](system.md)).
+- **`layer-bench` measures what the product layers do.** The benchmark probes
+  compose exactly the layers they measure — the model, the storage contract,
+  the memory driver, ingestion — and nothing else: a measurement harness that
+  borrows the real pipeline, never a product surface, and never a shortcut
+  around the Investigation API's law. It may not read stored facts (that is
+  query/correlation's door) and may not bind a network.
 - **`layer-correlation` reads storage like `layer-query`.** Correlation's
   contract is a derived read over the resident telemetry
   ([correlation-model.md](correlation-model.md)): its strategies must see
