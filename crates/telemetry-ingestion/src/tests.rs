@@ -2,14 +2,22 @@
 //! envelope sharing, admission signals, budget limits, the bounded queue,
 //! and the deep-payload guarantee. Metric fixtures live in `tests_metrics`.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
-use runtime_trail_telemetry_model::{Accounted, BudgetName, EntityId, SpanId, TraceFlags, TraceId};
+use runtime_trail_telemetry_model::{
+    Accounted, AdmissionTime, BudgetLimits, BudgetName, EntityId, SpanId, TraceFlags, TraceId,
+    budgets::OTLP_PAYLOAD_BYTES,
+};
 
 use crate::fixtures::*;
 use crate::otlp::opentelemetry::{common::v1 as common, logs::v1 as logs, trace::v1 as trace};
+use crate::pipeline::Pipeline;
 use crate::queue::{
-    PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
+    BoundedQueue, PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
 };
 use crate::signal::{AdmissionSignal, RecordOutcome, RecordRejection, Unrepresentable};
 
@@ -424,6 +432,35 @@ fn attribute_pathologies_are_refused_by_name() {
 }
 
 #[test]
+fn a_string_table_key_is_refused_like_a_missing_value() {
+    let harness = Harness::new();
+    // KeyValue{key: "", key_strindex: 3, value: present}: the Profiling
+    // string-table encoding. A non-Profiling receiver reads the key as
+    // absent, which leaves the attribute keyless — refused, not admitted
+    // with an empty key.
+    let span = trace_span("keyless", T1, S1);
+    let keyless = trace::Span {
+        attributes: vec![common::KeyValue {
+            key: String::new(),
+            value: Some(str_value("present")),
+            key_strindex: 3,
+        }],
+        ..span
+    };
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(keyless))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Unrepresentable(Unrepresentable::MissingValue {
+            field: "span attribute key"
+        })
+    ));
+    assert!(harness.drain().is_empty());
+}
+
+#[test]
 fn a_resource_with_entity_refs_refuses_every_record_beneath_it() {
     let harness = Harness::new();
     let mut refs = resource(Vec::new());
@@ -722,7 +759,7 @@ fn an_identical_span_redelivery_collapses() {
         .expect("admitted");
     let second = harness
         .pipeline
-        .ingest_spans(now(), &payload)
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
         .expect("walked");
 
     assert_eq!(first.admitted(), 1);
@@ -738,26 +775,22 @@ fn an_identical_span_redelivery_collapses() {
     );
     assert_eq!(harness.pipeline.anomalies().total(), 0);
 
-    // The collapse re-delivers the standing record: a re-delivery exists
-    // only because an earlier attempt may not have reached the consumer.
+    // The collapse queues nothing: the standing record's original queue
+    // entry — still resident here — is the whole story. Exactly ONE queue
+    // entry across the two deliveries, stamped with the FIRST delivery's
+    // admission time, never the retry's.
     let drained = harness.drain();
-    assert_eq!(drained.len(), 2, "both deliveries reach the hand-off");
+    assert_eq!(
+        drained.len(),
+        1,
+        "a collapse never re-offers the standing record"
+    );
     assert_eq!(drained[0].entity, first_entity);
-    assert_eq!(drained[1].entity, first_entity);
-    let [
-        QueuedRecord {
-            record: StoredRecord::Span(a),
-            ..
-        },
-        QueuedRecord {
-            record: StoredRecord::Span(b),
-            ..
-        },
-    ] = drained.as_slice()
-    else {
-        panic!()
-    };
-    assert!(Arc::ptr_eq(a, b), "the ledger's own Arc, not a copy");
+    assert_eq!(
+        drained[0].admitted_at,
+        now(),
+        "the standing record keeps its own admission time"
+    );
 }
 
 #[test]
@@ -897,12 +930,13 @@ fn malformed_bytes_reject_without_retry_semantics() {
 
 #[test]
 fn an_oversized_payload_is_refused_before_parsing() {
-    let queue = crate::queue::BoundedQueue::new(PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES);
-    let pipeline = crate::pipeline::Pipeline::with_config(
-        Arc::clone(&queue) as Arc<dyn crate::queue::RecordSink>,
-        runtime_trail_telemetry_model::BudgetLimits::default(),
+    let queue = BoundedQueue::new(PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES);
+    let pipeline = Pipeline::with_config(
+        Arc::clone(&queue) as Arc<dyn RecordSink>,
+        BudgetLimits::default(),
         8,
-    );
+    )
+    .expect("the contract ceiling clears the contract bound");
     let harness = Harness {
         pipeline: Arc::new(pipeline),
         queue,
@@ -958,12 +992,24 @@ fn draining_refuses_everything_with_the_closing_signal() {
 
 #[test]
 fn queue_overflow_is_the_one_retryable_signal() {
-    let harness = Harness::with_queue_ceiling(1);
-    let payload = one_span_export(trace_span("overflow", T1, S1));
-    let signal = harness
+    // At the port itself: a ceiling below the next record's accounted size
+    // refuses the producer with the one retryable signal. A *pipeline* can
+    // only reach saturation by accumulation — construction refuses a
+    // ceiling below the legal-record bound (see
+    // a_queue_ceiling_below_the_legal_maximum_refuses_construction), and
+    // saturation_mid_export_keeps_records_already_admitted walks that
+    // path.
+    let harness = Harness::new();
+    harness
         .pipeline
-        .ingest_spans(now(), &payload)
-        .expect_err("queue of one byte");
+        .ingest_spans(now(), &one_span_export(trace_span("overflow", T1, S1)))
+        .expect("admitted");
+    let record = harness.drain().pop().expect("one queued span");
+
+    let queue = BoundedQueue::new(PIPELINE_QUEUE_NAME, 1);
+    let signal = queue
+        .offer(record)
+        .expect_err("a one-byte queue holds nothing");
     assert!(matches!(
         &signal,
         AdmissionSignal::QueueSaturated {
@@ -973,80 +1019,210 @@ fn queue_overflow_is_the_one_retryable_signal() {
         } if *attempted_bytes > 1
     ));
     assert!(signal.is_retryable(), "overflow rejects the producer");
-    assert!(harness.drain().is_empty());
+}
+
+#[test]
+fn a_queue_ceiling_below_the_legal_maximum_refuses_construction() {
+    let queue = BoundedQueue::new(PIPELINE_QUEUE_NAME, 1024);
+    let Err(error) = Pipeline::with_config(
+        Arc::clone(&queue) as Arc<dyn RecordSink>,
+        BudgetLimits::default(),
+        OTLP_PAYLOAD_BYTES,
+    ) else {
+        panic!("a one-kibibyte queue is below the legal maximum");
+    };
+    assert_eq!(error.ceiling_bytes, 1024);
+    assert!(
+        error.legal_record_bound_bytes > error.ceiling_bytes,
+        "the default budgets' worst case is far above one kibibyte"
+    );
+
+    // The refusal names both numbers: an operator can read the bound they
+    // must clear, at startup, not as an unadmittable record at runtime.
+    let message = error.to_string();
+    assert!(
+        message.contains(&error.legal_record_bound_bytes.to_string()),
+        "the message names the bound: {message}"
+    );
+    assert!(
+        message.contains(&error.ceiling_bytes.to_string()),
+        "the message names the offending ceiling: {message}"
+    );
+
+    // The construction gate's promise: a queue AT the bound takes every
+    // single legal record.
+    let at_bound = Pipeline::with_config(
+        BoundedQueue::new(PIPELINE_QUEUE_NAME, error.legal_record_bound_bytes),
+        BudgetLimits::default(),
+        OTLP_PAYLOAD_BYTES,
+    )
+    .expect("a queue at the bound constructs");
+    let outcome = at_bound
+        .ingest_spans(now(), &one_span_export(trace_span("fits", T1, S1)))
+        .expect("a legal span fits an empty queue at the bound");
+    assert_eq!(outcome.admitted(), 1);
+}
+
+#[test]
+fn the_default_configuration_constructs() {
+    // The contract numbers: the budgets' worst-case spend sits inside the
+    // contract queue ceiling, so the default pipeline starts — and a
+    // default-configured export walks end to end.
+    let bound = Pipeline::legal_record_bound_bytes(&BudgetLimits::default());
+    assert!(
+        bound < QUEUE_CEILING_BYTES,
+        "the contract budgets must fit the contract queue ceiling: \
+         bound {bound}, ceiling {QUEUE_CEILING_BYTES}"
+    );
+    let harness = Harness::new();
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(trace_span("fits", T1, S1)))
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
 }
 
 #[test]
 fn saturation_mid_export_keeps_records_already_admitted() {
-    // A ceiling that fits exactly two of these spans: build one, measure
-    // its accounted size, and use twice that as the ceiling.
-    let measure = Harness::new();
-    let payload = one_span_export(trace_span("sized", T1, S1));
-    measure
-        .pipeline
-        .ingest_spans(now(), &payload)
-        .expect("admitted");
-    let one_span = measure.drain().pop().expect("one queued span");
-    let ceiling = 2 * one_span.record.accounted_size();
+    // Shrunken budgets shrink the legal-record bound, so a queue at the
+    // bound — one the construction gate accepts — can still overflow on a
+    // multi-record export.
+    let limits = BudgetLimits {
+        attributes_per_signal: 1,
+        attributes_per_nested_set: 1,
+        attribute_value_bytes: 256,
+        span_events_per_span: 0,
+        span_links_per_span: 0,
+        exemplars_per_data_point: 0,
+        key_value_list_depth: 8,
+        data_points_per_export: 10_000,
+    };
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
 
-    let harness = Harness::with_queue_ceiling(ceiling);
+    // Every span here carries one attribute at the per-entry cap
+    // (`160 + 1 + 95 == 256 == attribute_value_bytes`): attribute payload is
+    // what makes the span large enough that two fit a bound-sized queue and
+    // three do not.
+    let sized_span = |name: &str, span_id: [u8; 8]| {
+        let mut span = trace_span(name, T1, span_id);
+        span.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
+        span
+    };
+
+    // Measure one of these spans through a queue at the bound — which is
+    // also the construction gate's promise in action: any single legal
+    // record fits an empty queue at the bound.
+    let (measure_queue, measure_pipeline) = pipeline_over(bound, limits);
+    measure_pipeline
+        .ingest_spans(now(), &one_span_export(sized_span("sized", S1)))
+        .expect("one legal span fits an empty queue at the bound");
+    let measured = measure_queue
+        .front()
+        .expect("one queued span")
+        .record
+        .accounted_size();
+    assert!(
+        2 * measured <= bound,
+        "the fixture assumes two of these spans fit a bound-sized queue"
+    );
+    assert!(
+        3 * measured > bound,
+        "the fixture assumes a third span saturates a bound-sized queue"
+    );
+
+    // A bound-sized queue: every single legal record fits, two of these
+    // spans fit, three do not.
+    let (queue, pipeline) = pipeline_over(bound, limits);
     let payload = encode(&traces_request(vec![resource_spans(
         Some(resource(Vec::new())),
         vec![scope_spans(
             Some(scope("test")),
             vec![
-                trace_span("aaa", T1, S1),
-                trace_span("bbb", T1, S2),
-                trace_span("ccc", T1, [0x33; 8]),
+                sized_span("aaa", S1),
+                sized_span("bbb", S2),
+                sized_span("ccc", [0x33; 8]),
             ],
         )],
     )]));
 
-    let signal = harness
-        .pipeline
+    let signal = pipeline
         .ingest_spans(now(), &payload)
-        .expect_err("three spans, two-span queue");
-    assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
-    assert_eq!(
-        harness.queue.len(),
-        2,
-        "the first two records stay handed off"
-    );
-    assert_eq!(harness.drain().len(), 2, "the consumer keeps draining");
-
-    // The producer retries the whole export: every delivery now collapses
-    // onto its standing record, and every collapse is re-offered — so the
-    // retry makes exactly the progress the first attempt did and saturates
-    // on the third span again. Backpressure, not loss.
-    let signal = harness
-        .pipeline
-        .ingest_spans(now(), &payload)
-        .expect_err("three collapses still do not fit a two-span queue");
-    assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
-    assert_eq!(harness.drain().len(), 2);
-
-    // The producer backs off, as the retryable signal tells it to: the
-    // third span alone fits, its collapse re-offers the standing record,
-    // and nothing admitted during the saturation was ever lost.
-    let tail = encode(&traces_request(vec![resource_spans(
-        Some(resource(Vec::new())),
-        vec![scope_spans(
-            Some(scope("test")),
-            vec![trace_span("ccc", T1, [0x33; 8])],
-        )],
-    )]));
-    let outcome = harness.pipeline.ingest_spans(now(), &tail).expect("walked");
+        .expect_err("three spans, a two-span queue");
     assert!(matches!(
-        &outcome.records[0],
+        &signal,
+        AdmissionSignal::QueueSaturated { ceiling_bytes, .. } if *ceiling_bytes == bound
+    ));
+    assert!(signal.is_retryable(), "overflow rejects the producer");
+    assert_eq!(
+        queue.len(),
+        2,
+        "the records offered before saturation stay handed off"
+    );
+
+    // The producer retries the whole export, at a later admission time.
+    // All three re-deliveries collapse onto standing records — aaa and bbb
+    // behind their queue entries, ccc behind its ledger admission whose
+    // one offer was the refusal the signal named — and a collapse queues
+    // NOTHING. The queue keeps exactly the two entries the first attempt
+    // made, with their original admission times.
+    let outcome = pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
+        .expect("a retry of standing records collapses without offering");
+    assert!(
+        outcome
+            .records
+            .iter()
+            .all(|record| matches!(record, RecordOutcome::Collapsed { .. })),
+        "every span of the retry is a collapse: {outcome:?}"
+    );
+    assert_eq!(queue.len(), 2, "a collapse never queues");
+    let drained = drain_queue(&queue);
+    assert_eq!(drained.len(), 2);
+    for record in &drained {
+        assert_eq!(
+            record.admitted_at,
+            now(),
+            "the standing entries keep their own admission times"
+        );
+    }
+
+    // The consumer has drained everything. The third span's standing
+    // record — ledger-admitted, but its one offer was the refusal the
+    // signal named — re-delivers as a collapse that queues nothing. The
+    // signal, not a silent drop, is the record of the delivery that never
+    // happened.
+    let outcome = pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
+        .expect("walked");
+    assert!(matches!(
+        &outcome.records[2],
         RecordOutcome::Collapsed { .. }
     ));
-    let drained = harness.drain();
-    assert_eq!(drained.len(), 1);
-    assert_eq!(
-        drained[0].entity,
-        standing_entity(&outcome, 0),
-        "the record that stood through the saturation is the record delivered"
+    assert!(queue.is_empty());
+}
+
+/// Drains a queue from the consumer side, front to back.
+fn drain_queue(queue: &BoundedQueue) -> Vec<QueuedRecord> {
+    let mut drained = Vec::new();
+    while let Some(record) = queue.pop_timeout(Duration::ZERO) {
+        drained.push(record);
+    }
+    drained
+}
+
+/// A pipeline over a fresh [`BoundedQueue`] with its ceiling at
+/// `ceiling_bytes`, sharing the queue through the [`RecordSink`] port.
+fn pipeline_over(ceiling_bytes: usize, limits: BudgetLimits) -> (Arc<BoundedQueue>, Arc<Pipeline>) {
+    let queue = BoundedQueue::new(PIPELINE_QUEUE_NAME, ceiling_bytes);
+    let pipeline = Arc::new(
+        Pipeline::with_config(
+            Arc::clone(&queue) as Arc<dyn RecordSink>,
+            limits,
+            OTLP_PAYLOAD_BYTES,
+        )
+        .expect("the ceiling clears the bound"),
     );
+    (queue, pipeline)
 }
 
 #[test]
@@ -1110,39 +1286,122 @@ fn the_queue_restores_headroom_on_drain() {
 }
 
 #[test]
-fn a_metric_point_charges_its_stream_identity_in_full() {
+fn pop_timeout_does_not_rearm_the_deadline_on_wakeups_without_work() {
+    // A waker hammers the queue's condition variable every millisecond
+    // without ever adding a record — the noise real consumers make when a
+    // notify's record is taken by someone else first. The drain deadline
+    // is one absolute bound: pop_timeout returns around 50 ms after it was
+    // called, not 50 ms after the LAST wakeup. (The old behaviour re-armed
+    // the full deadline on every wake and only returned once the waker
+    // stopped — ~450 ms here.)
+    let queue = BoundedQueue::new("noisy", QUEUE_CEILING_BYTES);
+    let stop = Arc::new(AtomicBool::new(false));
+    let waker_stop = Arc::clone(&stop);
+    let waker_queue = Arc::clone(&queue);
+    let waker = std::thread::spawn(move || {
+        let ends = Instant::now() + Duration::from_millis(400);
+        while !waker_stop.load(Ordering::Acquire) && Instant::now() < ends {
+            waker_queue.wake_waiters_without_work_for_test();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let started = Instant::now();
+    let popped = queue.pop_timeout(Duration::from_millis(50));
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::Release);
+    waker.join().expect("the waker thread finishes");
+
+    assert!(popped.is_none(), "no record was ever offered");
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "woken every millisecond, pop_timeout(50ms) took {elapsed:?}: \
+         the deadline re-armed on a wakeup without work"
+    );
+}
+
+#[test]
+fn identical_points_share_one_stream_and_a_distinct_stream_pays_its_own_charge() {
     let harness = Harness::new();
+    let point_at = |time: u64| {
+        let mut point = number_point(as_double(1.0));
+        point.time_unix_nano = time;
+        point
+    };
+    // One stream, two points at different times; then a second stream
+    // identical but for its name — the same byte length, so an equal-shaped
+    // identity must charge equally.
     let payload = encode(&metrics_request(vec![resource_metrics(
         Some(resource(Vec::new())),
         vec![scope_metrics(
             Some(scope("test")),
-            vec![metric("charge", gauge(vec![number_point(as_double(1.0))]))],
+            vec![
+                metric("aaaa", gauge(vec![point_at(10), point_at(11)])),
+                metric("bbbb", gauge(vec![point_at(12)])),
+            ],
         )],
     )]));
-    harness
+    let outcome = harness
         .pipeline
         .ingest_metrics(now(), &payload)
         .expect("admitted");
+    assert_eq!(outcome.admitted(), 3);
+
     let queued = harness.drain();
-    let QueuedRecord {
-        record: StoredRecord::Point { stream, point },
+    let [first, second, other] = queued.as_slice() else {
+        panic!("expected three queued points")
+    };
+    let StoredRecord::Point {
+        stream: first_stream,
         ..
-    } = &queued[0]
+    } = &first.record
     else {
-        panic!("expected a queued point")
+        panic!()
+    };
+    let StoredRecord::Point {
+        stream: second_stream,
+        ..
+    } = &second.record
+    else {
+        panic!()
+    };
+    let StoredRecord::Point {
+        stream: other_stream,
+        ..
+    } = &other.record
+    else {
+        panic!()
     };
 
-    // Full charge per point: the point, plus the identity it rides on —
-    // structure fixed bytes, resource, scope, and the stream name.
-    let identity_charge = stream.resource.accounted_size()
-        + stream.scope.accounted_size()
-        + runtime_trail_telemetry_model::STRUCTURE_FIXED_BYTES
-        + runtime_trail_telemetry_model::heap_string_bytes(&stream.name);
-    assert_eq!(
-        queued[0].record.accounted_size(),
-        point.accounted_size() + identity_charge,
-        "sharing is not an accounting event"
+    assert!(
+        Arc::ptr_eq(first_stream, second_stream),
+        "both points of one stream share one interned identity"
     );
+    assert!(
+        !Arc::ptr_eq(first_stream, other_stream),
+        "a distinct name is a distinct stream"
+    );
+    assert_eq!(
+        first.record.accounted_size(),
+        second.record.accounted_size(),
+        "equal points of one stream charge equally"
+    );
+    assert_eq!(
+        other.record.accounted_size(),
+        first.record.accounted_size(),
+        "an equal-shaped identity charges equally"
+    );
+
+    // The whole hand-off carries three point charges, each including a
+    // full charge of its stream: two distinct streams, so the stream
+    // payload is carried twice across the queue — once per stream, not
+    // once per process.
+    let total: usize = queued
+        .iter()
+        .map(|record| record.record.accounted_size())
+        .sum();
+    assert_eq!(total, 3 * first.record.accounted_size());
 }
 
 // ------------------------------------------------------------- the law

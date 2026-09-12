@@ -22,14 +22,15 @@
 //!    record can carry), then hand the record to the
 //!    [`AdmissionLedger`](runtime_trail_telemetry_model::AdmissionLedger):
 //!    the shape law, the information budgets, and the duplicate-delivery
-//!    semantics (collapse, or conflict-recorded). A record that **admitted**
-//!    or **collapsed** is offered to the bounded hand-off queue: a collapse
-//!    is a re-delivery of a record whose first hand-off may not have landed
-//!    (it may have died in a saturated queue), so the standing record is
-//!    re-offered through the ledger's `Arc` — a reference count, and the
-//!    consumer dedupes under the same natural identity. A **conflict** is
-//!    not offered: the conflicting payload is refused, and the record that
-//!    stands travels by its own delivery.
+//!    semantics (collapse, or conflict-recorded). Only a record that
+//!    **admitted** is offered to the bounded hand-off queue. A **collapse**
+//!    is a re-delivery of the record already admitted: its original queue
+//!    entry — still resident, or already consumed by the consumer — is the
+//!    whole story, and offering it again would store a second copy of one
+//!    natural identity and stamp the retry's admission time onto a record
+//!    admitted earlier. A **conflict** is not offered either: the
+//!    conflicting payload is refused, and the record that stands travels
+//!    by its own delivery.
 //! 5. **Outcome** — every record's fate, position by position, as
 //!    [`ExportOutcome`]: the numbering `partial_success` will name.
 //!
@@ -49,13 +50,15 @@
 //!
 //! When the hand-off queue saturates mid-export, the call fails with
 //! [`AdmissionSignal::QueueSaturated`] — the one retryable signal — and
-//! records admitted **before** saturation stay admitted: the ledger keeps
-//! them, and a retry re-delivers them. Spans and metric points collapse
-//! under their natural identities — and the collapse re-offers the
-//! standing record, so it reaches the consumer even if its first offer
-//! died in the saturated queue; log records, which have no natural
-//! identity, re-admit. That is at-least-once delivery, which is how OTLP
-//! producers already behave.
+//! every record admitted **before** saturation was already offered: its
+//! queue entry is resident, and the consumer will receive it whatever the
+//! producer does next. A retry re-delivers the whole export; spans and
+//! metric points collapse onto their standing records and so queue
+//! nothing (the entries already in flight are the delivery), while log
+//! records — no natural identity — are admitted and queued again. The one
+//! record whose own offer the queue refused stands in the ledger with no
+//! queue entry: the signal named that refusal loudly and retryably, and
+//! no later collapse silently resurrects a delivery that never happened.
 
 use std::sync::{
     Arc, Mutex, PoisonError,
@@ -64,9 +67,9 @@ use std::sync::{
 
 use prost::Message;
 use runtime_trail_telemetry_model::{
-    AdmissionAnomalies, AdmissionLedger, AdmissionOutcome, AdmissionTime, BudgetLimits, LogRecord,
-    MetricPoint, Resource, Span, StreamIdentity, budgets::OTLP_PAYLOAD_BYTES,
-    budgets::check_export_point_count,
+    ATTRIBUTE_MAP_NODE_BYTES, AdmissionAnomalies, AdmissionLedger, AdmissionOutcome, AdmissionTime,
+    BudgetLimits, LogRecord, MetricPoint, Resource, Span, StreamIdentity,
+    budgets::OTLP_PAYLOAD_BYTES, budgets::check_export_point_count,
 };
 
 use crate::decode::{self, Envelope};
@@ -121,6 +124,37 @@ impl ExportOutcome {
     }
 }
 
+/// Why a pipeline refused to start: its hand-off sink cannot hold the
+/// largest record its own budgets admit.
+///
+/// A misconfiguration must fail at startup, never as an unadmittable
+/// record at runtime: a queue ceiling below one legal record would refuse
+/// that record forever behind [`AdmissionSignal::QueueSaturated`] — the
+/// one retryable signal — and a retry can never shrink a legal record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipelineConfigError {
+    /// The accounted-byte ceiling the sink declared.
+    pub ceiling_bytes: usize,
+    /// The accounted-byte bound no legal record can exceed —
+    /// [`Pipeline::legal_record_bound_bytes`] over this pipeline's budgets.
+    pub legal_record_bound_bytes: usize,
+}
+
+impl std::fmt::Display for PipelineConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hand-off sink ceiling {} bytes is below the worst-case legal record \
+             bound of {} bytes accounted: a record the budgets admit could never \
+             be queued, and a retry can never shrink it — raise the sink's ceiling \
+             or lower the budgets",
+            self.ceiling_bytes, self.legal_record_bound_bytes
+        )
+    }
+}
+
+impl std::error::Error for PipelineConfigError {}
+
 /// The admission pipeline. One per session.
 pub struct Pipeline {
     limits: BudgetLimits,
@@ -133,27 +167,89 @@ pub struct Pipeline {
 impl Pipeline {
     /// A pipeline over `sink`, with the model's default budgets and the
     /// contract payload ceiling ([`OTLP_PAYLOAD_BYTES`]).
-    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// If `sink`'s ceiling is below the default budgets' legal-record
+    /// bound. The contract numbers guarantee headroom there (a worst-case
+    /// budget-shaped spend of ≈43 MiB against the 64 MiB contract queue
+    /// ceiling), so this fires only on a sink deliberately built below the
+    /// contract — a startup misconfiguration, which is exactly where it
+    /// must be loud.
     pub fn new(sink: Arc<dyn RecordSink>) -> Self {
         Self::with_config(sink, BudgetLimits::default(), OTLP_PAYLOAD_BYTES)
+            .expect("the contract budgets fit the contract queue ceiling")
     }
 
     /// A pipeline with explicit startup configuration: budget limits and
     /// the payload ceiling. Like every number in the resource table, both
     /// are fixed when the session starts and never tuned mid-session.
-    #[must_use]
+    ///
+    /// Construction refuses a sink whose accounted-byte ceiling is below
+    /// the worst-case legal record bound: such a sink could never admit a
+    /// record its own budgets make legal, and the refusal must surface
+    /// here — at startup, with the bound named — rather than at runtime as
+    /// a permanently unadmittable record behind the retryable saturation
+    /// signal.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineConfigError`] when the sink's ceiling is below the
+    /// worst-case legal record bound computed from `limits`.
     pub fn with_config(
         sink: Arc<dyn RecordSink>,
         limits: BudgetLimits,
         payload_ceiling_bytes: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PipelineConfigError> {
+        let legal_record_bound_bytes = Self::legal_record_bound_bytes(&limits);
+        let ceiling_bytes = sink.ceiling_bytes();
+        if ceiling_bytes < legal_record_bound_bytes {
+            return Err(PipelineConfigError {
+                ceiling_bytes,
+                legal_record_bound_bytes,
+            });
+        }
+        Ok(Self {
             limits,
             payload_ceiling_bytes,
             ledger: Mutex::new(AdmissionLedger::new(limits)),
             sink,
             draining: AtomicBool::new(false),
-        }
+        })
+    }
+
+    /// The accounted-byte bound no legal record can exceed — the
+    /// worst-case spend the admission budgets shape.
+    ///
+    /// Every attribute set the gates admit is checked entry by entry (an
+    /// entry is keyed-container overhead + key bytes + value accounted
+    /// size, capped by `attribute_value_bytes`) and by count, so one set's
+    /// accounted size is at most its map's one node charge plus
+    /// `count × attribute_value_bytes`. A record's budget-shaped spend is
+    /// its own attribute set plus its resource's and scope's, and — per
+    /// span — every event's and link's set; per point — every exemplar's.
+    /// Taking the three record kinds' worst case gives the bound: a sink
+    /// below it can refuse a legal record forever, so
+    /// [`Pipeline::with_config`] refuses the sink first.
+    ///
+    /// Everything a record carries *outside* those sets — names, ids,
+    /// timestamps, fixed-width fields, and value payloads the budgets do
+    /// not shape — arrives inside the payload, which the payload ceiling
+    /// bounds; this bound is the budget-shaped part a queue ceiling must
+    /// clear.
+    #[must_use]
+    pub fn legal_record_bound_bytes(limits: &BudgetLimits) -> usize {
+        let attribute_set =
+            |count: usize| ATTRIBUTE_MAP_NODE_BYTES + count * limits.attribute_value_bytes;
+        // Own attributes, the resource's, and the scope's: three per-signal
+        // sets charged to every record kind alike.
+        let signal_sets = 3 * attribute_set(limits.attributes_per_signal);
+        let span = signal_sets
+            + limits.span_events_per_span * attribute_set(limits.attributes_per_nested_set)
+            + limits.span_links_per_span * attribute_set(limits.attributes_per_nested_set);
+        let point = signal_sets
+            + limits.exemplars_per_data_point * attribute_set(limits.attributes_per_nested_set);
+        span.max(point)
     }
 
     /// Begins draining: nothing new is admitted from this moment. The
@@ -414,19 +510,14 @@ impl Pipeline {
                     .map(|()| RecordOutcome::Admitted { entity })
             }
             AdmissionOutcome::Collapsed { entity } => {
-                // The standing record is re-offered: this delivery exists
-                // because an earlier attempt may not have reached the
-                // consumer, and the retry contract promises delivery.
-                let record = admission
-                    .record
-                    .expect("a collapse names the record that stands");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Span(record),
-                    })
-                    .map(|()| RecordOutcome::Collapsed { entity })
+                // The law the queue states and this pipeline keeps: a
+                // collapse is the record already admitted, never a new
+                // delivery. Its original queue entry — resident, or
+                // already consumed — is the whole story; offering it again
+                // would store a second copy of one natural identity and
+                // stamp this retry's admission time onto a record admitted
+                // earlier.
+                Ok(RecordOutcome::Collapsed { entity })
             }
             AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
             AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
@@ -498,22 +589,11 @@ impl Pipeline {
                     .map(|()| RecordOutcome::Admitted { entity })
             }
             AdmissionOutcome::Collapsed { entity } => {
-                // As with spans: the standing point is re-offered, so a
-                // delivery that died in a saturated queue is repaired by
-                // its own producer's retry.
-                let point = admission
-                    .record
-                    .expect("a collapse names the record that stands");
-                let stream = admission
-                    .stream
-                    .expect("a collapse names its interned stream");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Point { stream, point },
-                    })
-                    .map(|()| RecordOutcome::Collapsed { entity })
+                // As with spans: a collapse is the point already admitted.
+                // Its original queue entry is the whole story — offering
+                // it again would store a second copy of one point and
+                // stamp the retry's admission time onto it.
+                Ok(RecordOutcome::Collapsed { entity })
             }
             AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
             AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {

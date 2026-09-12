@@ -42,10 +42,12 @@ pub enum AdmissionSignal {
     /// A bounded hand-off queue is at its accounted-byte ceiling. The one
     /// transient condition in admission, and therefore the one retryable
     /// signal: space may free, so a retry can succeed. Overflow rejects the
-    /// producer — records already admitted *before* saturation stay admitted
-    /// (a retry re-delivers them; spans and metric points collapse, log
-    /// records are admitted again, which is at-least-once delivery as
-    /// OTLP practises it).
+    /// producer — every record admitted *before* saturation was already
+    /// handed off, and its queue entry stays in flight whatever the
+    /// producer does next. A retry's re-deliveries of those records
+    /// collapse (spans, metric points) or re-admit (log records, which
+    /// have no natural identity) — a collapse never queues, so the retry
+    /// adds no second copy of what is already in flight.
     QueueSaturated {
         /// The queue that refused, named for logs and metrics.
         queue: &'static str,
@@ -202,9 +204,13 @@ pub enum Unrepresentable {
         /// The value as sent.
         value: i32,
     },
-    /// A value-shaped field carried no value at all (an attribute key with
-    /// an unset `AnyValue`, a number point without its `as_int`/`as_double`
-    /// oneof). The model has no "key without a value" state to coerce to.
+    /// A field carried nothing the model can represent: a value-shaped
+    /// field with no value at all (an attribute key with an unset
+    /// `AnyValue`, a number point without its `as_int`/`as_double` oneof),
+    /// or an attribute key present only as a Profiling string-table
+    /// reference — absent by the proto's own receiver contract, which
+    /// leaves the attribute keyless. The model has no "half-empty
+    /// attribute" state to coerce to.
     MissingValue {
         /// Which field, for the refusal message.
         field: &'static str,

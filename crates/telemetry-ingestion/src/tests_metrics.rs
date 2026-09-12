@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use runtime_trail_telemetry_model::{
-    BudgetName, DATA_POINT_FLAG_NO_RECORDED_VALUE, MetricNumber, MetricPoint, PointShape,
-    StreamShapeError, Temporality, budgets::OTLP_PAYLOAD_BYTES,
+    AdmissionTime, BudgetName, DATA_POINT_FLAG_NO_RECORDED_VALUE, Float, MetricNumber, MetricPoint,
+    PointShape, StreamShapeError, Temporality, budgets::OTLP_PAYLOAD_BYTES,
 };
 
 use crate::fixtures::*;
@@ -312,7 +312,7 @@ fn a_gauges_start_time_is_normalized_out_of_its_identity() {
         .expect("admitted");
     let second_outcome = harness
         .pipeline
-        .ingest_metrics(now(), &second_payload)
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &second_payload)
         .expect("walked");
 
     assert_eq!(first_outcome.admitted(), 1);
@@ -323,12 +323,18 @@ fn a_gauges_start_time_is_normalized_out_of_its_identity() {
     let drained = harness.drain();
     assert_eq!(
         drained.len(),
-        2,
-        "the collapse re-offers the standing point"
+        1,
+        "a collapse queues nothing: the standing point's entry is the whole story"
     );
     assert_eq!(
-        drained[0].entity, drained[1].entity,
+        drained[0].entity,
+        standing_entity(&second_outcome, 0),
         "one point, one entity"
+    );
+    assert_eq!(
+        drained[0].admitted_at,
+        now(),
+        "the standing point keeps its own admission time, not the retry's"
     );
 }
 
@@ -486,6 +492,238 @@ fn an_export_over_the_point_cap_is_refused_whole() {
         harness.drain().is_empty(),
         "nothing from a refused export is admitted"
     );
+}
+
+#[test]
+fn an_export_at_the_point_cap_admits_in_full() {
+    let harness = Harness::new();
+    // Exactly the contract's per-export budget — the cap admits; only one
+    // past it refuses.
+    let points: Vec<metrics::NumberDataPoint> = (0..10_000)
+        .map(|index| {
+            let mut point = number_point(as_double(1.0));
+            point.time_unix_nano = index;
+            point
+        })
+        .collect();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("cap", gauge(points))],
+        )],
+    )]));
+    assert!(
+        payload.len() < OTLP_PAYLOAD_BYTES,
+        "the legal cap sits far under the payload ceiling"
+    );
+
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("at the cap is legal");
+    assert_eq!(outcome.admitted(), 10_000);
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(harness.drain().len(), 10_000, "every point handed off");
+}
+
+#[test]
+fn a_point_over_the_exemplar_budget_refuses_at_its_position() {
+    let harness = Harness::new();
+    let exemplar = || metrics::Exemplar {
+        filtered_attributes: Vec::new(),
+        time_unix_nano: 11,
+        span_id: Vec::new(),
+        trace_id: Vec::new(),
+        value: Some(metrics::exemplar::Value::AsInt(1)),
+    };
+    let mut fine_first = number_point(as_double(1.0));
+    fine_first.time_unix_nano = 1;
+    let mut over = number_point(as_double(2.0));
+    over.time_unix_nano = 2;
+    over.exemplars = vec![
+        exemplar(),
+        exemplar(),
+        exemplar(),
+        exemplar(),
+        exemplar(), // one past the per-point budget of four
+    ];
+    let mut fine_last = number_point(as_double(3.0));
+    fine_last.time_unix_nano = 3;
+
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric(
+                "exemplared",
+                gauge(vec![fine_first, over, fine_last]),
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    assert_eq!(outcome.len(), 3);
+
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "position 0 carries no exemplars"
+    );
+    assert!(
+        matches!(
+            rejected_reason(&outcome, 1),
+            RecordRejection::Budget(rejection)
+                if rejection.budget == BudgetName::ExemplarsPerDataPoint
+                    && rejection.limit == 4
+                    && rejection.observed == 5
+        ),
+        "position 1 names the exemplar budget, its limit and the observed count"
+    );
+    assert!(
+        matches!(&outcome.records[2], RecordOutcome::Admitted { .. }),
+        "position 2 carries no exemplars"
+    );
+    assert_eq!(
+        harness.drain().len(),
+        2,
+        "only the over-budget point is missing from the hand-off"
+    );
+}
+
+#[test]
+fn a_summary_sum_keeps_negative_zero_and_reads_positive_zero_as_absent() {
+    let harness = Harness::new();
+
+    // Negative zero, on real wire bytes: prost's own encoder skips -0.0
+    // (its zero check is numeric), so the encoding a compliant emitter
+    // sends is written by hand here — `sum` is fixed64 field 5 of
+    // SummaryDataPoint, with the sign bit set.
+    let mut point = vec![0x11]; // start_time_unix_nano, wire type 1
+    point.extend_from_slice(&1_u64.to_le_bytes());
+    point.push(0x19); // time_unix_nano
+    point.extend_from_slice(&10_u64.to_le_bytes());
+    point.push(0x21); // count
+    point.extend_from_slice(&1_u64.to_le_bytes());
+    point.push(0x29); // sum
+    point.extend_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+
+    let mut wire_metric = field(0x0A, b"signed"); // Metric.name
+    // Metric.summary (oneof data, field 11) → Summary.data_points (field 1).
+    wire_metric.extend(field(0x5A, &field(0x0A, &point)));
+    let scope_metrics_bytes = field(0x12, &wire_metric); // ScopeMetrics.metrics
+    let resource_metrics_bytes = field(0x12, &scope_metrics_bytes); // ResourceMetrics.scope_metrics
+    let payload = field(0x0A, &resource_metrics_bytes); // Export.resource_metrics
+
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    assert_eq!(outcome.admitted(), 1);
+
+    let queued = harness.drain();
+    let StoredRecord::Point {
+        point: negative, ..
+    } = &queued[0].record
+    else {
+        panic!("expected a queued summary point")
+    };
+    let MetricPoint::Summary(negative) = negative.as_ref() else {
+        panic!("expected a summary")
+    };
+    assert_eq!(
+        negative.sum.map(Float::bits),
+        Some((-0.0_f64).to_bits()),
+        "-0.0 survives with its sign"
+    );
+
+    // Positive zero through the ordinary path: indistinguishable from
+    // unset on the wire (proto3), so it reads as absent.
+    let summary_at = |sum: f64, time: u64| metrics::SummaryDataPoint {
+        attributes: Vec::new(),
+        start_time_unix_nano: 1,
+        time_unix_nano: time,
+        count: 1,
+        sum,
+        quantile_values: Vec::new(),
+        flags: 0,
+    };
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric(
+                "unsigned",
+                metrics::metric::Data::Summary(metrics::Summary {
+                    data_points: vec![summary_at(0.0, 11)],
+                }),
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    assert_eq!(outcome.admitted(), 1);
+
+    let queued = harness.drain();
+    let StoredRecord::Point {
+        point: positive, ..
+    } = &queued[0].record
+    else {
+        panic!("expected a queued summary point")
+    };
+    let MetricPoint::Summary(positive) = positive.as_ref() else {
+        panic!("expected a summary")
+    };
+    assert_eq!(
+        positive.sum, None,
+        "positive zero is indistinguishable from unset on the wire"
+    );
+}
+
+#[test]
+fn non_finite_measurements_survive_the_round_trip() {
+    let harness = Harness::new();
+    let measurements = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+    let points: Vec<metrics::NumberDataPoint> = measurements
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let mut point = number_point(as_double(*value));
+            point.time_unix_nano = u64::try_from(index + 10).expect("a test time fits");
+            point
+        })
+        .collect();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("non-finite", gauge(points))],
+        )],
+    )]));
+
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 3);
+
+    let queued = harness.drain();
+    for (record, value) in queued.iter().zip(measurements) {
+        let StoredRecord::Point { point, .. } = &record.record else {
+            panic!("expected a queued point")
+        };
+        let MetricPoint::Number(number) = point.as_ref() else {
+            panic!("expected a number point")
+        };
+        assert_eq!(
+            number.value,
+            MetricNumber::Double(Float::new(value)),
+            "{value} round-trips bit-exactly (Float equality is bit pattern)"
+        );
+    }
 }
 
 #[test]

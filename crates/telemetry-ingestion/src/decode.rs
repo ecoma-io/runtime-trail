@@ -24,10 +24,10 @@
 //! `AnyValue.string_value_strindex` and `KeyValue.key_strindex` belong to
 //! the Profiling signal's string-table encoding. The proto's own receiver
 //! contract says non-Profiling receivers treat them as absent. Where that
-//! reading leaves a value-shaped field with no value at all, the record is
-//! **refused** — the model cannot represent an attribute with no value, and
-//! refusing is the honest alternative to silently dropping what the emitter
-//! sent (ADR 0006).
+//! reading leaves a field with nothing to carry — a value-shaped field
+//! with no value, or an attribute with no key — the record is **refused**;
+//! refusing is the honest alternative to silently admitting a half-empty
+//! attribute or dropping what the emitter sent (ADR 0006).
 
 use std::sync::Arc;
 
@@ -126,9 +126,40 @@ fn present_string(text: &str) -> Option<String> {
 fn attributes(pairs: Vec<wire::KeyValue>, field: &'static str) -> Translated<Attributes> {
     let converted: Vec<(String, Value)> = pairs
         .into_iter()
-        .map(|kv| Ok((kv.key, wire_value(kv.value, field)?)))
+        .map(|kv| key_value(kv, field))
         .collect::<Translated<_>>()?;
     Attributes::from_pairs(converted).map_err(RecordRejection::DuplicateKey)
+}
+
+/// One wire `KeyValue` → one model entry. The key is examined exactly like
+/// the value: a key present only as a Profiling string-table reference is
+/// read as absent by the proto's own receiver contract, which leaves the
+/// attribute keyless — refused, in the same `MissingValue` family as a
+/// value-shaped field with no value, naming what is missing.
+fn key_value(kv: wire::KeyValue, field: &'static str) -> Translated<(String, Value)> {
+    if kv.key_strindex != 0 {
+        return unrepresentable(Unrepresentable::MissingValue {
+            field: key_field(field),
+        });
+    }
+    Ok((kv.key, wire_value(kv.value, field)?))
+}
+
+/// The field name a keyless attribute refuses under: the value path's
+/// field name, suffixed with what is missing — the key. The set of field
+/// names is closed; a new call site extends this match.
+fn key_field(field: &'static str) -> &'static str {
+    match field {
+        "resource attribute" => "resource attribute key",
+        "scope attribute" => "scope attribute key",
+        "span attribute" => "span attribute key",
+        "span event attribute" => "span event attribute key",
+        "span link attribute" => "span link attribute key",
+        "log attribute" => "log attribute key",
+        "data point attribute" => "data point attribute key",
+        "exemplar filtered attribute" => "exemplar filtered attribute key",
+        other => other,
+    }
 }
 
 /// Wire `AnyValue` → the model's value union. Homogeneity and key
@@ -157,7 +188,7 @@ fn wire_value(av: Option<wire::AnyValue>, field: &'static str) -> Translated<Val
             let entries: Vec<(String, Value)> = list
                 .values
                 .into_iter()
-                .map(|kv| Ok((kv.key, wire_value(kv.value, field)?)))
+                .map(|kv| key_value(kv, field))
                 .collect::<Translated<_>>()?;
             Value::kv_list(entries).map_err(RecordRejection::DuplicateKey)
         }
@@ -601,7 +632,12 @@ fn summary_point(proto: wire_metrics::SummaryDataPoint) -> Translated<MetricPoin
         start_time_unix_nano,
         time_unix_nano: proto.time_unix_nano,
         count: proto.count,
-        sum: (proto.sum != 0.0).then_some(Float::new(proto.sum)),
+        // proto3 `double` without `optional`: positive zero is
+        // indistinguishable from unset on the wire, so it reads as absent.
+        // Negative zero is a distinct encoding — the model's equality law
+        // makes -0.0 ≠ 0.0 — and any non-zero or non-finite value is a
+        // value: all of them survive with their bits.
+        sum: (proto.sum != 0.0 || proto.sum.is_sign_negative()).then_some(Float::new(proto.sum)),
         quantiles: proto
             .quantile_values
             .into_iter()
