@@ -31,7 +31,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use runtime_trail_telemetry_model::{
     Accounted, AdmissionTime, EntityId, LogRecord, MetricPoint, STRUCTURE_FIXED_BYTES, Span,
@@ -129,6 +129,16 @@ impl Accounted for StoredRecord {
 /// (`layer-ingest → model, storage`) is honoured by construction, and the
 /// port stays unchanged when storage arrives.
 pub trait RecordSink: Send + Sync + 'static {
+    /// The accounted-byte ceiling this sink enforces on what it holds.
+    ///
+    /// [`Pipeline::with_config`](crate::pipeline::Pipeline::with_config)
+    /// checks the worst-case legal record against it at construction, so
+    /// a ceiling below one legal record fails at startup instead of
+    /// stranding records at runtime behind the retryable saturation
+    /// signal. A sink that buffers without a ceiling returns
+    /// [`usize::MAX`].
+    fn ceiling_bytes(&self) -> usize;
+
     /// Hands one admitted record to the next stage. Never blocks: a full
     /// sink refuses the producer with
     /// [`AdmissionSignal::QueueSaturated`] instead of buffering without a
@@ -260,24 +270,51 @@ impl BoundedQueue {
     /// Pops the front record if one arrives within `deadline`, else `None`.
     ///
     /// The drain-deadline shape: the pump waits at most this long for the
-    /// next record before giving up on completeness.
+    /// next record before giving up on completeness. The deadline is one
+    /// absolute `Instant`, computed once: a wakeup without work — a
+    /// spurious `wait_timeout` return, or a notify whose record another
+    /// consumer took — waits out the **remaining** time and never re-arms
+    /// the full deadline, so a noisy queue cannot stretch the drain bound.
     ///
     /// # Panics
     ///
     /// As [`BoundedQueue::accounted_bytes`].
     pub fn pop_timeout(&self, deadline: Duration) -> Option<QueuedRecord> {
         let mut inner = self.lock();
+        let ends_at = Instant::now().checked_add(deadline);
         while inner.items.is_empty() {
-            let (guard, timeout) = self
+            let Some(remaining) =
+                ends_at.and_then(|ends| ends.checked_duration_since(Instant::now()))
+            else {
+                if ends_at.is_none() {
+                    // The deadline cannot be represented (further out than
+                    // `Instant` measures): it is no deadline at all — wait
+                    // without one, exactly as `pop` does.
+                    inner = self
+                        .item_added
+                        .wait(inner)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    continue;
+                }
+                return None;
+            };
+            let (guard, _timed_out) = self
                 .item_added
-                .wait_timeout(inner, deadline)
+                .wait_timeout(inner, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner = guard;
-            if timeout.timed_out() && inner.items.is_empty() {
-                return None;
-            }
         }
         Some(Self::pop_locked(&mut inner))
+    }
+
+    /// Wakes every waiter without adding a record. Test-only: `offer` is
+    /// the sole production notifier, and the drain-deadline law above — a
+    /// wakeup without work never re-arms the deadline — is observable
+    /// only when wakeups arrive without work.
+    #[cfg(test)]
+    pub(crate) fn wake_waiters_without_work_for_test(&self) {
+        let _inner = self.lock();
+        self.item_added.notify_all();
     }
 
     fn pop_locked(inner: &mut QueueInner) -> QueuedRecord {
@@ -291,6 +328,10 @@ impl BoundedQueue {
 }
 
 impl RecordSink for BoundedQueue {
+    fn ceiling_bytes(&self) -> usize {
+        self.ceiling_bytes
+    }
+
     fn offer(&self, record: QueuedRecord) -> Result<(), AdmissionSignal> {
         let bytes = record.record.accounted_size();
         let mut inner = self.lock();
