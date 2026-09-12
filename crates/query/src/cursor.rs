@@ -69,9 +69,11 @@ const SNAPSHOT_TIME_LEN: usize = std::mem::size_of::<u64>();
 /// What a cursor encodes
 /// ([query-model.md](../../docs/architecture/query-model.md),
 /// "Ordering, cursors and pagination"): the engine's position in the total
-/// order where the answer continues, the entity id of the last record of
-/// the page that minted it, the query fingerprint the cursor belongs to,
-/// and the snapshot boundary — the first page's residency frontier, an
+/// order where the answer continues, the entity id of the anchor record
+/// the page continued after — the last *examined* record in the scanned
+/// residency order, which a filter may have excluded from the answer —
+/// the query fingerprint the cursor belongs to, and the snapshot
+/// boundary — the first page's residency frontier, an
 /// [`AdmissionKey`] in the storage contract's residency order.
 ///
 /// The encoded form is opaque to callers — they carry the bytes and hand
@@ -85,8 +87,13 @@ pub struct CursorPayload {
     /// [`AdmissionKey`] exactly, so a resume never re-walks and never
     /// needs the anchor record to still be resident.
     position: u64,
-    /// The entity id of the last record of the page that minted the
-    /// cursor.
+    /// The entity id of the anchor record the cursor continues after:
+    /// the last examined record along the scanned residency order, which
+    /// a filter may have excluded from the answer — at a scan-ceiling
+    /// stop the minting page's walk stopped at a record it examined but
+    /// did not return. With [`Self::position`] it reconstructs the
+    /// anchor's [`AdmissionKey`] exactly, so a resume never re-walks and
+    /// never needs the anchor record to still be resident.
     last_entity: EntityId,
     /// The query fingerprint this cursor is valid for (invariant 3).
     fingerprint: u64,
@@ -179,7 +186,9 @@ impl CursorPayload {
         self.position
     }
 
-    /// The entity id of the last record of the minting page.
+    /// The entity id of the anchor record the cursor continues after:
+    /// the last examined record along the scanned residency order, which
+    /// a filter may have excluded from the answer.
     #[must_use]
     pub const fn last_entity(&self) -> EntityId {
         self.last_entity

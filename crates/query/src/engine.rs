@@ -2899,6 +2899,89 @@ mod tests {
         );
     }
 
+    /// F6's placement, pinned from behind the wall: a filtered-out record
+    /// that sits *after* the byte wall — inside the counting region — is
+    /// still examined and scan-charged, but is never counted into
+    /// `omitted`. Only matching records of the remainder are.
+    ///
+    /// The store puts the wall at e2 (a matching checkout span that does
+    /// not fit), drops e3 and e5 — payments, filtered — directly behind
+    /// it, and resumes with a matching e4 that also does not fit. The
+    /// count is e2 plus e4; e3 and e5 contribute nothing. This is the
+    /// companion to the fixture above, whose filtered-out records all sit
+    /// before the wall and so never enter the counting region: a walk
+    /// that counted before matching would pass that fixture and lie only
+    /// here.
+    #[test]
+    fn a_filtered_record_behind_the_byte_wall_is_examined_and_never_counted() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        let mut sizes = Vec::new();
+        for index in 1_u8..=5_u8 {
+            let service = match index {
+                3 | 5 => "payments",
+                _ => "checkout",
+            };
+            let name = match index {
+                1 => "a".repeat(10),
+                _ => format!("s{index:0>3}").repeat(20),
+            };
+            let mut span = fixture_span(index, index, &name);
+            span.resource = Arc::new(fixture_resource(Some(service)));
+            span.scope = Arc::new(scope.clone());
+            sizes.push(u64::try_from(span.accounted_size()).expect("sizes fit"));
+            keep_span(
+                &mut store,
+                u64::from(index) * 100,
+                span_entity(index, index),
+                span,
+            );
+        }
+        // The ceiling fits e1 exactly, so e2 — matching, and not fitting —
+        // is the wall that opens the counting region. e3 and e5 are
+        // filtered out inside that region; e4 is the second matching
+        // record that does not fit.
+        let ceiling = sizes[0];
+        let query = checkout_query();
+        let budget = budget_with(1_000, ceiling, 5);
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, &query, &mut session, None);
+
+        let truncation = degraded_of(&page);
+        assert_eq!(truncation.dimension, Dimension::Bytes);
+        assert_eq!(
+            truncation.omitted, 2,
+            "only e2 and e4 — the matching records behind the wall; the \
+             filtered-out e3 and e5 are never counted"
+        );
+        let entities: Vec<EntityId> = page
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(entities, vec![span_entity(1, 1)]);
+        assert_eq!(
+            session.ledger().remaining_bytes(),
+            0,
+            "nothing behind the wall was evidence-charged — counted \
+             records are examined, never charged"
+        );
+        assert_eq!(
+            session.ledger().remaining_scan(),
+            0,
+            "all five residents were examined — the filtered-out e3 and \
+             e5 were scan-charged like the rest"
+        );
+        let cursor = page.next_cursor.as_deref().expect("the page continues");
+        let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(1, 1),
+            "the cursor anchors at the last included record — e1, the only \
+             record that fit"
+        );
+    }
+
     /// A dead continuation under filters degrades by echoing the presented
     /// cursor byte for byte — and that echo is anchored at the last
     /// matching included record, because only matches mint cursors (F7).
