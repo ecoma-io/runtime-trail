@@ -36,7 +36,7 @@ use crate::spend::{SpendLedger, TraversalAllowance};
 /// has no `Default` and no argument-free constructor, because a
 /// budgetless query is invalid (invariant 1). A caller that has not
 /// chosen its ceilings has not thought about what its question may cost.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct QueryBudget {
     deadline: Duration,
     max_results: u64,
@@ -105,12 +105,13 @@ impl QueryBudget {
     /// the deadline against `at`, the monotonic reading captured at
     /// admission ("Deadlines").
     ///
-    /// Consuming is literal — the budget moves in and is spent once. More
-    /// sessions come from more budgets (one per query), never from a copy
-    /// of a session's own: [`BudgetSession::budget`] only lends the
-    /// ceilings, and the ledger is crate-private, so a session cannot
-    /// quietly mint a second, unaccounted spend path (invariant 1: the
-    /// engine is the budget's only enforcer).
+    /// Consuming is literal — the budget moves in and is spent once. A
+    /// budget cannot be duplicated: no `Copy`, no `Clone`, no `Default`,
+    /// so a second session requires a second `new`, and constructing a
+    /// budget is the caller declaring another query with its own ceilings.
+    /// [`BudgetSession::budget`] only lends the ceilings, and the ledger
+    /// is crate-private, so no spend path can be minted from a session
+    /// (invariant 1: the engine is the budget's only enforcer).
     #[must_use]
     pub fn admit(self, at: Instant) -> BudgetSession {
         let ledger = SpendLedger::new(
@@ -167,10 +168,12 @@ impl BudgetSession {
     }
 
     /// The budget the query admitted with, ceilings included — the
-    /// envelope's limits block reads them from here. The borrow cannot
-    /// re-admit: `admit` consumes its budget by value, so a session's own
-    /// budget is a read-only fact about the query, not a second spend
-    /// path.
+    /// envelope's limits block reads them from here. The borrow is
+    /// read-only all the way down: the budget behind it cannot be
+    /// duplicated (no `Copy`, no `Clone`), cannot re-admit (`admit`
+    /// consumes by value), and cannot grow a ledger outside the session
+    /// (the ledger is crate-private). The ceilings are facts to read, not
+    /// a spend path to fork.
     #[must_use]
     pub const fn budget(&self) -> &QueryBudget {
         &self.budget

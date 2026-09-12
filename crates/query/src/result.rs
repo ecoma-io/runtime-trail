@@ -88,14 +88,13 @@ pub struct Truncation {
     pub dimension: Dimension,
     /// Where the part stopped.
     pub position: TruncationPoint,
-    /// How much `position` leaves out, in the dimension's own unit —
-    /// entities for `max_results` and `max_scan`, canonical evidence bytes
-    /// for `max_bytes` — when the engine can know it. A byte-ceiling
-    /// truncation always names the true count of records whose evidence
-    /// did not fit: the omission is named by count and position, never
-    /// enumerated (budget table, row `max_bytes`). A deadline cut
-    /// mid-traversal has not counted what it did not visit and carries
-    /// zero here; coverage then names the rest.
+    /// How many entities `position` leaves out — for `max_bytes`, how
+    /// many records' evidence did not fit — when the engine can know it:
+    /// a byte-ceiling omission is named by count and position, never
+    /// enumerated (budget table, row `max_bytes`). Zero means
+    /// *uncounted*, not nothing: a deadline cut mid-traversal and a
+    /// scan-ceiling cut into an unexamined tail have not counted what
+    /// they did not visit, and coverage then names the rest.
     pub omitted: u64,
 }
 

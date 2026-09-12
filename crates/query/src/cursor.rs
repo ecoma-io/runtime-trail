@@ -412,15 +412,16 @@ mod tests {
     /// encoding step, or encodes the two entity variants inconsistently —
     /// a roundtrip through every layout must reproduce every field (the
     /// snapshot frontier included), at the canonical lengths and nothing
-    /// more. The three payload shapes below cover three of the four
-    /// variant combinations and both extremes of the documented length
-    /// range.
+    /// more. The four payload shapes below cover all four variant
+    /// combinations and both extremes of the documented length range
+    /// (42 and 74).
     #[test]
     fn roundtrip_preserves_every_field_for_both_entity_variants() {
         for (payload, total_len) in [
             (span_payload(), 58),
             (assigned_payload(), 58),
             (span_span_payload(), 74),
+            (assigned_assigned_payload(), 42),
         ] {
             let encoded = payload.encode();
             assert_eq!(
