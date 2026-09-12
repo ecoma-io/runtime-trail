@@ -75,5 +75,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # artifacts reproducible (see `crates/telemetry-ingestion/protos/
 # PROVENANCE.md` and `crates/telemetry-ingestion/regenerate.sh`).
 prost = "0.14"
-tonic = "0.14"
+# Pinned exactly: 0.14.5 is the newest 0.14.x whose MSRV is this workspace's
+# floor (1.85, ADR 0001's ambient-toolchain rule); later 0.14.x needs a newer
+# rustc, so a caret range would silently raise the toolchain contract. Only
+# the server side is built: no client transport stack, no TLS. The
+# dependency is confined to `crates/server` (layer-app) by ADR 0001.
+tonic = { version = "=0.14.5", default-features = false, features = ["server"] }
 bytes = "1"
