@@ -20,6 +20,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod budget;
 pub mod cursor;
+pub mod engine;
 pub mod order;
 pub mod result;
 pub mod spend;

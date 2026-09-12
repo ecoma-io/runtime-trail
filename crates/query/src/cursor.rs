@@ -79,7 +79,11 @@ const SNAPSHOT_TIME_LEN: usize = std::mem::size_of::<u64>();
 /// accessors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorPayload {
-    /// The engine's ordinal in the total order where the next page starts.
+    /// The order key value where the next page starts: in the records
+    /// flow, the anchor record's admission-time nanoseconds. With
+    /// [`Self::last_entity`] it reconstructs the anchor's
+    /// [`AdmissionKey`] exactly, so a resume never re-walks and never
+    /// needs the anchor record to still be resident.
     position: u64,
     /// The entity id of the last record of the page that minted the
     /// cursor.
@@ -166,7 +170,10 @@ impl CursorPayload {
         }
     }
 
-    /// The ordinal in the total order where the next page starts.
+    /// The order key value where the next page starts: the anchor
+    /// record's admission-time nanoseconds in the records flow, which
+    /// with [`Self::last_entity`] reconstructs the anchor's admission
+    /// key.
     #[must_use]
     pub const fn position(&self) -> u64 {
         self.position

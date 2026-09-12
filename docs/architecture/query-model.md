@@ -83,7 +83,11 @@ appear twice or vanish between pages.
 
 A **cursor** is opaque to users and callers. It encodes (position in the
 total order, last entity id, query fingerprint, and the snapshot boundary
-the continuation stays within). The engine **rejects a cursor whose
+the continuation stays within). The position is the order key value — for
+the records flow, the anchor record's admission-time nanoseconds — so
+position and last entity id together reconstruct the anchor's admission
+key, and a resume is exact under eviction, needing neither a re-walk nor
+the anchor record's residency. The engine **rejects a cursor whose
 embedded fingerprint differs from the query it is presented to** — a cursor
 belongs to one query's result set (same shape and parameters), and
 presenting it anywhere else is an error. The fingerprint tracks the query,

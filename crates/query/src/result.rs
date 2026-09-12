@@ -127,9 +127,14 @@ pub struct Coverage {
 /// One named fact about what an answer did not cover.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoverageEntry {
-    /// Records the cursor's snapshot knew of are evicted: a hole between
-    /// the two nearest resident neighbors, named by both, never a silent
-    /// skip.
+    /// The record a continuation's cursor points into was evicted: a hole
+    /// named by the cursor's last entity — resident or the evicted record
+    /// the cursor points into — and the first resident successor the
+    /// resumed walk yields, or the snapshot boundary's entity when the
+    /// walk yields nothing before it. A forward scan cannot see a record
+    /// that is missing: mid-window evictions with no cursor expectation
+    /// are invisible to it, and the snapshot boundary entry bounds what
+    /// such a window could hide.
     EvictionGap { after: EntityId, before: EntityId },
     /// The continuation's snapshot boundary: the result set was fixed at
     /// the first page's admission — the records admitted after this
@@ -137,6 +142,18 @@ pub enum CoverageEntry {
     /// continuation. A declared boundary, not a silent skip; a caller
     /// wanting newer data issues a new query.
     SnapshotBoundary { admission: AdmissionKey },
+    /// The walk that counts a byte-ceiling omission stopped here — its
+    /// scan or deadline expired mid-count — so every snapshot record
+    /// after it is uncounted: the truncation's `omitted` stays zero, and
+    /// this entry names the rest instead of dressing a partial number up
+    /// as a count.
+    UncountedTail {
+        /// The last record the counting walk examined; everything the
+        /// snapshot holds after it is uncounted.
+        after: EntityId,
+        /// The dimension whose expiry cut the counting walk.
+        dimension: Dimension,
+    },
 }
 
 /// The run-fact block: what the work cost and what it covered.
