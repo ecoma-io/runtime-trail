@@ -588,8 +588,11 @@ mod tests {
         let runtime = CoreRuntime::build(saturation_config()).expect("the config is buildable");
         let router = build_router(Arc::clone(&runtime), ServerConfig::default());
 
-        // Freeze the pump so nothing frees queue space mid-test.
-        let _frozen = runtime.lock_store_for_test();
+        // Park the pump on the frozen store before the fill so nothing
+        // frees queue space mid-test: a freeze alone leaves the pump one
+        // pop of headroom, and a pop after the fill frees exactly the slot
+        // this export then fits (the filed flake, #9).
+        let _frozen = test_support::freeze_and_park_pump(&runtime);
         let mut saturated = false;
         for i in 0..2_048_u32 {
             let mut span_id = [0_u8; 8];

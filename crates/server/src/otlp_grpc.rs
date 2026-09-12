@@ -813,7 +813,10 @@ mod tests {
         let runtime = CoreRuntime::build(saturation_config()).expect("the config is buildable");
         let router = build_router(Arc::clone(&runtime), ServerConfig::default());
 
-        let _frozen = runtime.lock_store_for_test();
+        // The pump is parked on the freeze before the fill: a freeze alone
+        // leaves the pump one pop of headroom, and a pop after the fill
+        // frees exactly the slot this export then fits (the filed flake).
+        let _frozen = test_support::freeze_and_park_pump(&runtime);
         assert!(
             saturate_until_full(&runtime),
             "a 4-KiB queue saturates within 2 Ki spans"
@@ -1383,9 +1386,10 @@ mod tests {
         );
         wait_for_resident(&runtime, 1);
 
-        // (b) Saturate the queue — the store frozen so the pump frees no
-        // space — and meet the refusal over the same socket.
-        let frozen = runtime.lock_store_for_test();
+        // (b) Saturate the queue — the pump parked on the frozen store so
+        // nothing frees queue space — and meet the refusal over the same
+        // socket.
+        let frozen = test_support::freeze_and_park_pump(&runtime);
         assert!(
             saturate_until_full(&runtime),
             "a 4-KiB queue saturates within 2 Ki spans"

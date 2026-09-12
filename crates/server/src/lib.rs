@@ -297,7 +297,11 @@ where
 pub(crate) mod test_support {
     //! A runtime for the crate's tests: contract defaults, but no server.
 
-    use std::sync::Arc;
+    use std::sync::{Arc, MutexGuard};
+    use std::time::Duration;
+
+    use runtime_trail_storage::TelemetryStore;
+    use runtime_trail_telemetry_ingestion::fixtures as fx;
 
     use crate::runtime::{CoreRuntime, RuntimeConfig};
 
@@ -306,6 +310,63 @@ pub(crate) mod test_support {
     /// (the tick period is longer than any test).
     pub(crate) fn runtime() -> Arc<CoreRuntime> {
         CoreRuntime::build(RuntimeConfig::default()).expect("the default config is buildable")
+    }
+
+    /// Freezes the store and parks the pump on the freeze, returning the
+    /// store guard — the determinism device for the saturation tests, which
+    /// fill the queue after this and must not lose a slot before their
+    /// probe export is offered.
+    ///
+    /// The freeze alone is not enough: the pump pops a record *before* its
+    /// keep takes the store lock, so a freeze taken while the pump is idle
+    /// bounds it to one further pop without bounding when that pop lands —
+    /// a pop after the fill finished frees exactly one record's slot, and
+    /// the probe export (a smaller record than the fill's) fits it. That
+    /// race is the filed flake (#9), reproducible under machine load.
+    ///
+    /// So the park comes first: one sacrificial record (an identity no
+    /// other fixture uses) is offered, and the wait below is for its *pop*
+    /// — the queue emptying — not its keep. Once popped, the pump is
+    /// blocked on the store lock this call's caller holds and can pop no
+    /// more: past that point the queue only ever grows. The bounded poll
+    /// cannot pass early — the queue reached zero only through that pop —
+    /// so it fails loudly rather than ever leaving the race in place.
+    ///
+    /// The park record stays popped-but-unkept until the caller drops the
+    /// guard; the pump then keeps it like any other queued record.
+    ///
+    /// # Panics
+    ///
+    /// If the pump does not pop within 5 seconds — an honest failure: a
+    /// pump that cannot take a notified record in 5 seconds would leave
+    /// the saturation below racy, which this fixture refuses to paper
+    /// over.
+    pub(crate) fn freeze_and_park_pump(
+        runtime: &CoreRuntime,
+    ) -> MutexGuard<'_, Box<dyn TelemetryStore>> {
+        let frozen = runtime.lock_store_for_test();
+        let park = fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(
+                None,
+                vec![fx::trace_span("park", fx::T1, [0xAA_u8; 8])],
+            )],
+        )]);
+        runtime
+            .pipeline()
+            .ingest_spans(fx::now(), &fx::encode(&park))
+            .expect("the park record is admitted");
+        for _ in 0..5_000 {
+            if runtime.queue_len_for_test() == 0 {
+                return frozen;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "the pump never popped the park record: the queue still holds {} \
+             records, so the saturation below would race it",
+            runtime.queue_len_for_test()
+        );
     }
 }
 
