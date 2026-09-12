@@ -54,9 +54,8 @@ pub use signal::{AdmissionSignal, RecordOutcome, RecordRejection, Unrepresentabl
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn exposes_a_version() {
-        assert!(!super::VERSION.is_empty());
-    }
-}
+mod fixtures;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_metrics;
