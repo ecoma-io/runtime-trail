@@ -263,7 +263,11 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   comparison payload with the store; evicting a record also forgets its
   identity entry, and a re-delivery after eviction is admitted as a fresh
   record — first-stands applies within residency, not across it
-  ([ADR 0008](../decisions/0008-admission-ledger-design.md)).
+  ([ADR 0008](../decisions/0008-admission-ledger-design.md)). The same
+  law bounds **stream identities**: the ledger drops a stream's interned
+  identity when the stream's last resident point leaves, so interning
+  never pins content for a session longer than the points that justify
+  it.
 - **Record identity is a model concern; adjacency is not.** That two signals
   are related is a derived, strategy-owned fact
   ([correlation-model.md](correlation-model.md)), which is built on the
@@ -301,6 +305,17 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   be a lie about the machine. How tight the bound is (real ÷ accounted) is
   a measured fact for [docs/benchmarks/README.md](../benchmarks/README.md)
   when measurements land — never a claim made here.
+- **Byte ceilings count what residency pins — stream identities included.**
+  A metric point references a stream identity (resource, scope, name,
+  kind, temporality) whose content the point's own accounted size does not
+  carry. The store therefore charges each distinct resident stream's
+  identity accounted size exactly once — added when the stream's first
+  point enters residency, released when its last point leaves — so a
+  session of single-point streams cannot park unbounded identity content
+  under a ceiling that only saw the points. Admission's per-record gates
+  are unchanged (they judge the record as sent); the residency charge is
+  the store's, owned by
+  [storage-model.md](storage-model.md).
 - **Budgets are admission gates, not mutation triggers.** A record that
   exceeds a budget is refused at admission — as a **non-retryable**
   rejection or a `partial_success` naming the budget

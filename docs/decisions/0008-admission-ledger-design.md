@@ -44,9 +44,17 @@ rule out, because there is no hash.
 **Eviction and identity are one lifecycle.** Evicting a record calls
 `forget(identity)`: the identity entry lives exactly as long as the record's
 residency. A re-delivery after eviction is therefore admitted as a fresh
-record — first-stands applies within residency, not across it. The ledger's
-capacity tracks the store's record count; it cannot outgrow what the store
-retains.
+record — first-stands applies within residency, not across it. **Stream
+identities obey the same law.** The ledger interns a stream identity on the
+stream's first admitted point and drops it when the stream's last resident
+point leaves: the store's eviction hook reports the stream reference
+alongside the entity id, and the composition root releases the stream's
+interning in the ledger at refcount zero. The ledger's capacity therefore
+tracks what the store retains — records _and_ resident streams — and can
+outgrow neither. **The hook must not panic**: it runs after the store's own
+removal completes, and a fallible hook is the composition root's to wrap;
+the store reports evictions and hook deliveries as separate counters, so an
+evicted-but-not-released divergence is observable, never silent.
 
 ## Consequences
 
@@ -54,7 +62,15 @@ retains.
   entry plus interning — a term in the runtime's fixed overhead outside the
   accounted ceilings ([runtime-constraints.md](../architecture/runtime-constraints.md)),
   and a measured one once [../benchmarks/README.md](../benchmarks/README.md)
-  carries numbers.
+  carries numbers. For a **single-point stream** the interned identity's own
+  content is a per-record cost — which is exactly why the byte ceiling
+  charges each resident stream's identity content once
+  ([telemetry-model.md](../architecture/telemetry-model.md)); the interning
+  pointers themselves stay fixed overhead.
+- Interned stream identities are released at refcount zero. The review of
+  the first ledger build proved the un-released variant pins every distinct
+  stream ever seen for the whole session (822 KB for zero resident records
+  at 1,000 streams), so release is load-bearing, not an optimisation.
 - Eviction visibly ends identity: re-delivery after eviction re-admits, which
   is the documented semantics ([telemetry-model.md](../architecture/telemetry-model.md)),
   not an edge case.
