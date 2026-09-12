@@ -508,23 +508,40 @@ fn unimplemented_response(path: &str) -> http::Response<GrpcBody> {
     Status::unimplemented(format!("unknown method {path}")).into_http()
 }
 
-/// Whether the request speaks gRPC: the protocol requires a content-type
-/// that **begins with** `application/grpc` — bare (`application/grpc`),
-/// with a message format (`application/grpc+proto`), or with parameters.
-/// Everything else — a JSON post, a form, a missing header — is not a gRPC
-/// request, and answering it with a gRPC response (which rides HTTP 200)
-/// would hand a plain HTTP/2 client a 200 to read as success. The
-/// gRPC-over-HTTP2 spec ("Content-Type") prescribes the refusal:
+/// Whether the request speaks THIS server's gRPC dialect: proto framing on
+/// `application/grpc` — bare (proto by default), with the proto message
+/// format (`application/grpc+proto`, optionally with parameters), or bare
+/// with parameters. Everything else is not a request this server answers
+/// as gRPC: a JSON post, a form, a missing header — but also the
+/// gRPC-shaped dialects the spec's letter would admit because they *begin
+/// with* `application/grpc` (`application/grpc-web*`,
+/// `application/grpc+json`), whose bodies die in the framing layer as a
+/// baffling INTERNAL (their first body byte is not a legal compression
+/// flag). All of them get the same bare HTTP 415, and the gRPC-over-HTTP2
+/// spec ("Content-Type") prescribes it for the non-gRPC cases:
 ///
 /// > If **Content-Type** does not begin with "application/grpc", gRPC
 /// > servers SHOULD respond with HTTP status of 415 (Unsupported Media
 /// > Type). This will prevent other HTTP/2 clients from interpreting a
 /// > gRPC error response, which uses status 200 (OK), as successful.
+///
+/// Refusing the gRPC-shaped dialects too is a deliberate, documented
+/// deviation from that letter — on the side of naming what is not spoken
+/// instead of answering a foreign dialect with an INTERNAL.
 fn is_grpc_content_type(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/grpc"))
+        .is_some_and(|value| {
+            if !value.starts_with("application/grpc") {
+                return false;
+            }
+            let rest = &value["application/grpc".len()..];
+            rest.is_empty()
+                || rest == "+proto"
+                || rest.starts_with("+proto;")
+                || rest.starts_with(';')
+        })
 }
 
 /// The 415 answer for a request that is not gRPC at all: bare HTTP — no
@@ -942,9 +959,42 @@ mod tests {
         runtime.shutdown();
     }
 
-    /// The drain gate reads nothing from the body: a draining runtime
-    /// answers `UNAVAILABLE` before the export's frame is buffered, so a
-    /// request whose body never completes still gets its closing answer.
+    /// The gRPC-shaped dialects the spec's letter would wave through —
+    /// they *begin with* `application/grpc` — are refused at the HTTP
+    /// layer all the same (the documented deviation): this server speaks
+    /// proto framing only, and `grpc-web`/`grpc+json` bodies would
+    /// otherwise die in framing as a baffling INTERNAL. Bare HTTP 415,
+    /// like any other non-gRPC request.
+    #[tokio::test]
+    async fn foreign_grpc_dialects_answer_unsupported_media_type() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        for dialect in ["application/grpc-web+proto", "application/grpc+json"] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(TRACE_EXPORT)
+                .header("content-type", dialect)
+                .body(Body::from(vec![0, 0, 0, 0, 0]))
+                .expect("a static request builds");
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("the router answers every request");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{dialect} is refused at the HTTP layer, not answered as gRPC"
+            );
+            assert!(
+                response.headers().get("grpc-status").is_none(),
+                "the refusal is bare HTTP, not a gRPC answer: {:?}",
+                response.headers()
+            );
+        }
+        runtime.shutdown();
+    }
     #[tokio::test]
     async fn draining_runtime_refuses_before_buffering_the_frame() {
         let runtime = test_support::runtime();
