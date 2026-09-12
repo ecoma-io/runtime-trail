@@ -60,9 +60,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # optional. `tonic` serves the OTLP/gRPC endpoint and is confined to
 # `crates/server` (layer-app) by ADR 0001: no crate outside layer-app takes a
 # transport dependency. `bytes` is the payload buffer type both edges pass
-# without copying. How OTLP message types are sourced (pre-generated crate
-# vs prost-build codegen) is decided by the ingestion unit landing them, with
-# its architectural justification in the PR.
+# without copying.
+#
+# OTLP message types: sourced as committed `prost-build` codegen inside
+# `crates/telemetry-ingestion` (decision of the ingestion unit). The
+# pre-generated `opentelemetry-proto` crate was rejected: it couples its
+# versioning to the OpenTelemetry SDK release train, compiles transport
+# siblings (`gen-tonic`) this core must never see (ADR 0001), and pins its
+# own prost major — a second protobuf runtime. Build-time codegen
+# (`build.rs` + prost-build) was rejected because it needs `protoc` on every
+# machine, against the ambient-toolchain rule (ADR 0001). Committed output
+# keeps this build graph at exactly `prost`; the vendored, hash-pinned
+# upstream `.proto` sources and the committed regeneration script keep the
+# artifacts reproducible (see `crates/telemetry-ingestion/protos/
+# PROVENANCE.md` and `crates/telemetry-ingestion/regenerate.sh`).
 prost = "0.14"
 tonic = "0.14"
 bytes = "1"

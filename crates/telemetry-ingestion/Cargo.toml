@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-runtime-trail-storage = { workspace = true }
+prost = { workspace = true }
 runtime-trail-telemetry-model = { workspace = true }
 
 [lints]
