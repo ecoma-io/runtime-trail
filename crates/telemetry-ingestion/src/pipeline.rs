@@ -159,7 +159,12 @@ impl std::error::Error for PipelineConfigError {}
 pub struct Pipeline {
     limits: BudgetLimits,
     payload_ceiling_bytes: usize,
-    ledger: Mutex<AdmissionLedger>,
+    /// Shared, not owned outright: the composition root holds the same
+    /// handle (see [`Pipeline::ledger`]) so its eviction hook can end
+    /// identities in *this* ledger — the one admission consults — exactly
+    /// when residency ends (ADR 0008). A second, private ledger would
+    /// split the identity truth.
+    ledger: Arc<Mutex<AdmissionLedger>>,
     sink: Arc<dyn RecordSink>,
     draining: AtomicBool,
 }
@@ -212,7 +217,7 @@ impl Pipeline {
         Ok(Self {
             limits,
             payload_ceiling_bytes,
-            ledger: Mutex::new(AdmissionLedger::new(limits)),
+            ledger: Arc::new(Mutex::new(AdmissionLedger::new(limits))),
             sink,
             draining: AtomicBool::new(false),
         })
@@ -275,6 +280,24 @@ impl Pipeline {
     #[must_use]
     pub fn sink(&self) -> &Arc<dyn RecordSink> {
         &self.sink
+    }
+
+    /// The admission ledger this pipeline admits through, shared with the
+    /// composition root: its eviction-hook wiring (ADR 0008) must call
+    /// `forget` and `release_stream` on *this* ledger — the one admission
+    /// consults — so a re-delivery after eviction is admitted fresh.
+    /// Holding a second ledger would split the identity truth and
+    /// resurrect evicted records as collapses.
+    ///
+    /// The lock discipline that keeps this shared handle deadlock-free:
+    /// code that holds the ledger lock must never take the store's —
+    /// `ingest_*` touches only the ledger and the queue, while the store's
+    /// consumer takes the store lock first and reaches the ledger only
+    /// inside the eviction hook, after its keep has returned. One order,
+    /// store then ledger, everywhere.
+    #[must_use]
+    pub fn ledger(&self) -> Arc<Mutex<AdmissionLedger>> {
+        Arc::clone(&self.ledger)
     }
 
     /// The admission anomalies recorded so far this session — conflicts,

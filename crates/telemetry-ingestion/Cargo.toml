@@ -12,5 +12,13 @@ publish = false
 prost = { workspace = true }
 runtime-trail-telemetry-model = { workspace = true }
 
+[features]
+# Compiles the semantic OTLP fixtures (`crates/telemetry-ingestion/src/
+# fixtures.rs`) into the crate for consumers above admission — the transport
+# tests its wire bytes against the same builders this crate's own tests use.
+# Off by default: a production consumer of admission never links the
+# fixtures.
+fixtures = []
+
 [lints]
 workspace = true

@@ -80,30 +80,6 @@ pub use config::{
 };
 pub use store::InMemoryStore;
 
-/// The bootstrap mode marker, kept from the foundation commit.
-///
-/// This unit struct is what the smoke surfaces (`crates/server`) still hold
-/// while no telemetry flows; it is **not** the memory-mode driver — the
-/// driver is [`InMemoryStore`]. The marker disappears when the composition
-/// root is wired to hold a real `Box<dyn TelemetryStore>`; nothing new may
-/// depend on it.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MemoryStore;
-
-impl MemoryStore {
-    /// The mode name surfaces report for this driver.
-    pub const NAME: &'static str = "memory";
-
-    /// The mode name for this instance, so composition roots report the mode
-    /// of the concrete store they actually hold.
-    #[must_use]
-    pub const fn mode_name(&self) -> &'static str {
-        Self::NAME
-    }
-}
-
-impl runtime_trail_storage::StorageBackend for MemoryStore {}
-
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -112,12 +88,6 @@ mod tests {
     #[test]
     fn exposes_a_version() {
         assert!(!super::VERSION.is_empty());
-    }
-
-    #[test]
-    fn is_a_storage_backend() {
-        fn assert_backend<B: runtime_trail_storage::StorageBackend>() {}
-        assert_backend::<super::MemoryStore>();
     }
 
     #[test]

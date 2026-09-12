@@ -50,11 +50,31 @@ pub use queue::{
 };
 pub use signal::{AdmissionSignal, RecordOutcome, RecordRejection, Unrepresentable};
 
+// The OTLP wire surface, re-exported shallow for the one consumer that
+// speaks the transport: the server's OTLP/gRPC and OTLP/HTTP endpoints
+// encode these response messages and (via the fixtures feature below) test
+// against these request shapes. Admission itself decodes the requests from
+// raw bytes; these are the same types, made reachable instead of mirrored.
+pub use crate::otlp::opentelemetry::collector::logs::v1::{
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+pub use crate::otlp::opentelemetry::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
+pub use crate::otlp::opentelemetry::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
+
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(test)]
-mod fixtures;
+/// The semantic OTLP fixtures, compiled in for consumers (or tests) that
+/// enable the `fixtures` feature: the same builders this crate's own tests
+/// admit with, so a transport's test bytes are the exact OTLP shapes this
+/// crate means — never mirrored structs.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
