@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Case: idle-rss (Phase 1) — the queue + pipeline + store composition,
+# constructed the way the composition root will and then left alone: the
+# settled resident set with no traffic.
+#
+# The probe prints one JSON record on stdout (captured verbatim by
+# run-all.sh) and exits 0 when it ran and measured; build chatter goes to
+# stderr. Phase 1 measures, it does not gate (docs/benchmarks/README.md).
+set -euo pipefail
+cd "$(dirname "$0")/../../.."
+
+cargo build --release --locked -p runtime-trail-bench-probes --bin probe-idle 1>&2
+exec target/release/probe-idle

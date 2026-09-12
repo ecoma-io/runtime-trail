@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Case: retention-bound (Phase 1) — the retention law alone: a small,
+# stated store configuration filled past its ceilings with OTLP log
+# exports, then held under continued load while RSS is sampled across the
+# steady state.
+#
+# The probe prints one JSON record on stdout (captured verbatim by
+# run-all.sh) and exits 0 when it ran and measured; build chatter goes to
+# stderr. Phase 1 measures, it does not gate (docs/benchmarks/README.md).
+set -euo pipefail
+cd "$(dirname "$0")/../../.."
+
+cargo build --release --locked -p runtime-trail-bench-probes --bin probe-retention-bound 1>&2
+exec target/release/probe-retention-bound
