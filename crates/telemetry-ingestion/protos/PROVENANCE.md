@@ -30,8 +30,9 @@ c3fb1385c90b8bc08a2a462e28b5d0c422c7b524a839f75f75e3cd9f64f36956  trace/v1/trace
 ## How these are used
 
 `../regenerate.sh` feeds exactly these files to `prost-build` and writes the
-generated modules under `../src/gen/`. The generated files are committed, so
-nothing in this directory is read at build time; it is the pinned source of
-truth the committed artifacts can be reproduced from. Bumping the pinned tag
-is an architecture-visible change: regenerate, review the generated diff,
-update this note (tag, commit, hashes) in the same PR.
+generated modules over the committed artifacts in `../src/otlp/` (the
+hand-arranged `../src/otlp/mod.rs` is not regenerated). The generated files
+are committed, so nothing in this directory is read at build time; it is the
+pinned source of truth the committed artifacts can be reproduced from.
+Bumping the pinned tag is an architecture-visible change: regenerate, review
+the generated diff, update this note (tag, commit, hashes) in the same PR.

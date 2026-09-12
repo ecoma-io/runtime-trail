@@ -1,13 +1,17 @@
 //! The OTLP protobuf message types, as generated once by `prost-build`.
 //!
-//! These are **checked-in generated artifacts**, not hand-written types: the
-//! five `opentelemetry.proto.*.rs` files beside this module are unmodified
-//! `prost-build` output, byte-identical to what
-//! `crates/telemetry-ingestion/regenerate.sh` produces from the vendored
-//! upstream sources in `crates/telemetry-ingestion/protos/` (pinned, with
-//! hashes, in `protos/PROVENANCE.md`). Nothing here may be edited by hand;
-//! a change to the wire shapes is a change to the pinned upstream version,
-//! regenerated and re-pinned in the open.
+//! These are **checked-in generated artifacts**, not hand-written types:
+//! the eight `opentelemetry.proto.*.rs` files beside this module are
+//! unmodified `prost-build` output, byte-identical to what
+//! `crates/telemetry-ingestion/regenerate.sh` writes back over them from
+//! the vendored upstream sources in `crates/telemetry-ingestion/protos/`
+//! (pinned, with hashes, in `protos/PROVENANCE.md`). This `mod.rs` itself
+//! is the one hand-arranged file here — the script reproduces the eight
+//! generated files and nothing else — and its module nesting and
+//! `include!` list must be kept in step with the proto packages by hand.
+//! Nothing else may be edited by hand; a change to the wire shapes is a
+//! change to the pinned upstream version, regenerated and re-pinned in
+//! the open.
 //!
 //! Why generated-and-committed rather than a third-party proto crate: the
 //! available pre-generated crate (the OpenTelemetry Rust SDK's

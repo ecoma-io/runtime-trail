@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Regenerates the committed OTLP prost types in src/gen/ from the vendored,
+# Regenerates the committed OTLP prost types in src/otlp/ from the vendored,
 # pinned .proto sources in protos/ (see protos/PROVENANCE.md).
 #
-# This is a maintenance step, NOT part of the build: the generated files are
-# committed, so building and testing this crate never needs protoc. Run this
-# only when bumping the pinned upstream tag — then update PROVENANCE.md
-# (tag, commit, per-file hashes) and review the generated diff in the same
-# commit. Never hand-edit anything under src/gen/.
+# What this script writes: the eight `opentelemetry.proto.*.rs` generated
+# files, over the committed ones in src/otlp/. What it does NOT write:
+# src/otlp/mod.rs — the module tree there is hand-arranged (it exists so
+# prost's `super::super::…` cross-references resolve) and must be kept in
+# step with the proto packages by hand.
 #
-# Requirements: cargo (any stable), network for the two pinned codegen
-# crates, and a `protoc` binary — either on PATH or provided by the
-# `protoc-bin-vendored` crate as below.
+# This is a maintenance step, NOT part of the build: the generated files are
+# committed, so building and testing this crate never needs protoc and never
+# runs this script. Run it only when bumping the pinned upstream tag — then
+# update PROVENANCE.md (tag, commit, per-file hashes) and review the
+# generated diff (`git diff -- src/otlp`) in the same commit. Never
+# hand-edit the generated files.
+#
+# Requirements: cargo (any stable) with network access once, to fetch the
+# pinned generator crates. A `protoc` binary is NOT required on this
+# machine: `protoc-bin-vendored` supplies one to the generator, so no
+# system package is needed.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,11 +73,35 @@ mkdir -p "$work/src"
 cp "$work/src.rs" "$work/src/main.rs"
 (cd "$work" && cargo run -q --release -- "$work/out" "$here/protos")
 
-# The five outputs replace the committed artifacts in place. Their names and
-# the module tree in src/gen/mod.rs must stay in step with the proto packages.
-for f in "$work/out"/*.rs; do
-  cp "$f" "$here/src/gen/$(basename "$f")"
+# The eight outputs replace the committed artifacts in place, in the layout
+# the crate actually builds from. Their names must stay in step with the
+# proto packages, and src/otlp/mod.rs's include! list with them.
+expected=(
+  opentelemetry.proto.common.v1.rs
+  opentelemetry.proto.resource.v1.rs
+  opentelemetry.proto.trace.v1.rs
+  opentelemetry.proto.logs.v1.rs
+  opentelemetry.proto.metrics.v1.rs
+  opentelemetry.proto.collector.trace.v1.rs
+  opentelemetry.proto.collector.logs.v1.rs
+  opentelemetry.proto.collector.metrics.v1.rs
+)
+for name in "${expected[@]}"; do
+  if [ ! -f "$work/out/$name" ]; then
+    echo "✗ codegen did not produce $name — the pinned protos and this script disagree" >&2
+    exit 1
+  fi
+  cp "$work/out/$name" "$here/src/otlp/$name"
 done
+unexpected="$(find "$work/out" -maxdepth 1 -name '*.rs' -exec basename {} \; | sort)"
+for name in "${expected[@]}"; do
+  unexpected="$(printf '%s\n' "$unexpected" | grep -vxF "$name" || true)"
+done
+if [ -n "$unexpected" ]; then
+  echo "✗ codegen produced files this script does not install: $unexpected" >&2
+  exit 1
+fi
 
-echo "regenerated into $here/src/gen/ — now: update protos/PROVENANCE.md if the tag moved,"
-echo "review the diff, and never edit the generated files by hand."
+echo "regenerated into $here/src/otlp/ — now: update protos/PROVENANCE.md if the tag moved,"
+echo "review the diff (git diff -- src/otlp), and never edit the generated files by hand."
+echo "src/otlp/mod.rs was NOT touched: it is hand-arranged, not generated."
