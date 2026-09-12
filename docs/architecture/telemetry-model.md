@@ -250,6 +250,14 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   `start_time`, `time`, and flags; for
   gauges the point is (stream, `time`, flags) and a sent `start_time` is
   normalised out of the identity) is the same data point: it collapses.
+- **Provenance drift under a collapse is recorded, not swallowed.** The
+  resource's `schema_url` is provenance outside identity, so a re-delivery
+  whose resource `schema_url` differs from the standing record's still
+  collapses — identical content is one record — and the drift is recorded
+  as a `provenance_mismatches` admission anomaly. The scope's `schema_url`
+  is the opposite: it participates in identity, so the same drift resolves
+  as a conflict (a re-delivered span) or a second stream (a metric point
+  under a rescoped stream), never as a provenance mismatch.
 - **Log records are never collapsed.** OTLP defines no log-record identity,
   and this model refuses to invent a destructive one: two byte-identical log
   records are two admitted records — the emitter sent two. Duplicate

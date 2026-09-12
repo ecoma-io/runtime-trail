@@ -421,6 +421,100 @@ fn a_point_redelivered_under_a_changed_descriptor_is_a_recorded_conflict() {
 }
 
 #[test]
+fn a_resource_schema_url_drift_collapses_points_and_a_scope_drift_is_a_new_stream() {
+    // The schema_url asymmetry on the metrics side, over the wire: the
+    // resource's `schema_url` is provenance outside identity — the drifted
+    // re-delivery collapses onto the standing point and the drift is
+    // counted as its own anomaly. The scope's `schema_url` participates in
+    // identity — the same drift there admits the second stream it is, and
+    // the provenance counter does not move.
+    let harness = Harness::new();
+    let point_at = |time: u64| {
+        let mut point = number_point(as_double(1.0));
+        point.time_unix_nano = time;
+        point
+    };
+    let first_payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let first = harness
+        .pipeline
+        .ingest_metrics(now(), &first_payload)
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let drifted = encode(&metrics_request(vec![resource_metrics_with_schema_url(
+        "https://schema/v2",
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let second = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &drifted)
+        .expect("walked");
+    assert!(
+        matches!(&second.records[0], RecordOutcome::Collapsed { .. }),
+        "equal content across the resource schema drift collapses: {second:?}"
+    );
+    assert_eq!(standing_entity(&second, 0), standing_entity(&first, 0));
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the drift is recorded, observable"
+    );
+    assert_eq!(
+        harness.drain().len(),
+        1,
+        "a collapse never re-offers the standing point"
+    );
+
+    let rescoped = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics_with_schema_url(
+            "https://scope-schema/v2",
+            Some(scope("test")),
+            vec![metric("in-flight", gauge(vec![point_at(10)]))],
+        )],
+    )]));
+    let third = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &rescoped)
+        .expect("walked");
+    assert_eq!(
+        third.admitted(),
+        1,
+        "the scope's schema_url participates in identity: a new stream"
+    );
+    assert_ne!(
+        standing_entity(&third, 0),
+        standing_entity(&first, 0),
+        "a different scope is a different stream"
+    );
+    let queued = harness.drain();
+    assert_eq!(queued.len(), 1);
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.scope.schema_url.as_deref(),
+        Some("https://scope-schema/v2"),
+        "the second stream carries its own scope provenance"
+    );
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the provenance counter is the resource level's alone"
+    );
+}
+
+#[test]
 fn the_descriptor_survives_decode_byte_exact() {
     let harness = Harness::new();
     let payload = encode(&metrics_request(vec![resource_metrics(

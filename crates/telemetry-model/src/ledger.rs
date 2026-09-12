@@ -106,6 +106,7 @@ pub struct PointAdmission {
 pub struct AdmissionAnomalies {
     span_identity_conflicts: u64,
     point_identity_conflicts: u64,
+    provenance_mismatches: u64,
 }
 
 impl AdmissionAnomalies {
@@ -123,10 +124,25 @@ impl AdmissionAnomalies {
         self.point_identity_conflicts
     }
 
+    /// Collapsing re-deliveries whose resource-level `schema_url` differed
+    /// from the standing record's. The collapse itself is correct — the
+    /// resource's `schema_url` is provenance outside identity, so equal
+    /// content across a schema drift is one record — but the drift is
+    /// real: the emitter moved schemas under the same resource, and whose
+    /// provenance moved must stay visible. The scope-level `schema_url`
+    /// never lands here: it participates in identity, so a delivery that
+    /// differs there resolves as a conflict or a second stream instead.
+    #[must_use]
+    pub const fn provenance_mismatches(self) -> u64 {
+        self.provenance_mismatches
+    }
+
     /// Every anomaly recorded this session.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.span_identity_conflicts + self.point_identity_conflicts
+        self.span_identity_conflicts
+            + self.point_identity_conflicts
+            + self.provenance_mismatches
     }
 }
 
@@ -302,10 +318,21 @@ impl AdmissionLedger {
              invariant behind the bounded derived glue is broken"
         );
         match self.spans.get(&key) {
-            Some((standing, admitted)) if **admitted == *span => SpanAdmission {
-                outcome: AdmissionOutcome::Collapsed { entity: *standing },
-                record: Some(Arc::clone(admitted)),
-            },
+            Some((standing, admitted)) if **admitted == *span => {
+                // The resource's `schema_url` is provenance outside
+                // identity, so equal spans across a schema drift still
+                // collapse — and the drift is recorded, never swallowed.
+                // A scope-level `schema_url` differs by being identity:
+                // such a delivery fails the equality guard and takes the
+                // conflict arm below.
+                if admitted.resource.schema_url != span.resource.schema_url {
+                    self.anomalies.provenance_mismatches += 1;
+                }
+                SpanAdmission {
+                    outcome: AdmissionOutcome::Collapsed { entity: *standing },
+                    record: Some(Arc::clone(admitted)),
+                }
+            }
             Some((standing, _)) => {
                 self.anomalies.span_identity_conflicts += 1;
                 SpanAdmission {
@@ -441,6 +468,16 @@ impl AdmissionLedger {
                 // only in a start_time the emitter was told not to
                 // send are the same point, not a conflict.
                 if standing_key.point.identity_payload_eq(&point, stream.kind) {
+                    // The span law applies here too: the resource's
+                    // `schema_url` is provenance outside identity, so the
+                    // collapse stands across a drift — and the drift is
+                    // recorded. The scope-level `schema_url` differs by
+                    // being identity: a stream whose scope `schema_url`
+                    // changed projects to a different key and admits as a
+                    // second stream, never a provenance mismatch.
+                    if interned.resource.schema_url != stream.resource.schema_url {
+                        self.anomalies.provenance_mismatches += 1;
+                    }
                     PointAdmission {
                         outcome: AdmissionOutcome::Collapsed { entity: *standing },
                         record: Some(Arc::clone(&standing_key.point)),
@@ -626,6 +663,69 @@ mod tests {
             &first.record.expect("standing"),
             &again.record.expect("standing")
         ));
+    }
+
+    #[test]
+    fn a_resource_schema_url_drift_collapses_and_records_a_provenance_mismatch() {
+        let mut ledger = ledger();
+        let first = ledger.admit_span(span([1; 16], [2; 8], "op"));
+        let standing = first.outcome.entity().expect("admitted");
+        let mut redelivered = span([1; 16], [2; 8], "op");
+        redelivered.resource = Arc::new(Resource {
+            attributes: Attributes::default(),
+            schema_url: Some("https://schema/v2".to_owned()),
+            dropped_attributes_count: 0,
+        });
+        let second = ledger.admit_span(redelivered);
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Collapsed { entity: standing },
+            "the resource's schema_url is provenance outside identity: \
+             equal spans collapse across the drift"
+        );
+        let standing_record = first.record.expect("standing");
+        assert!(Arc::ptr_eq(
+            &standing_record,
+            &second.record.expect("standing")
+        ));
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            1,
+            "the drift is recorded, observable"
+        );
+        assert_eq!(ledger.anomalies().total(), 1);
+        // Collapse never rewrites: the standing record keeps its own
+        // schema_url.
+        assert_eq!(standing_record.resource.schema_url.as_deref(), None);
+    }
+
+    #[test]
+    fn a_scope_schema_url_change_conflicts_instead_of_recording_provenance() {
+        let mut ledger = ledger();
+        let first = ledger.admit_span(span([1; 16], [2; 8], "op"));
+        let standing = first.outcome.entity().expect("admitted");
+        let mut redelivered = span([1; 16], [2; 8], "op");
+        redelivered.scope = Arc::new(InstrumentationScope {
+            name: String::new(),
+            version: None,
+            attributes: Attributes::default(),
+            schema_url: Some("https://scope-schema/v2".to_owned()),
+            dropped_attributes_count: 0,
+        });
+        let second = ledger.admit_span(redelivered);
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Conflict { entity: standing },
+            "the scope's schema_url participates in identity: a different \
+             scope is a conflict, not a provenance note"
+        );
+        assert!(second.record.is_none());
+        assert_eq!(ledger.anomalies().span_identity_conflicts(), 1);
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            0,
+            "the provenance counter is the resource level's alone"
+        );
     }
 
     #[test]
@@ -1506,6 +1606,73 @@ mod metric_points {
             Some("requests queued at the gate"),
             "the second stream keeps its own descriptor, byte-exact"
         );
+    }
+
+    #[test]
+    fn a_resource_schema_url_drift_collapses_points_and_records_the_mismatch() {
+        // The asymmetry, point half: the resource's schema_url is
+        // provenance outside stream identity, so the drifted re-delivery
+        // interns onto the standing stream and collapses — and the drift
+        // is recorded as its own anomaly, never swallowed.
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let mut drifted = identity.clone();
+        drifted.resource.schema_url = Some("https://schema/v2".to_owned());
+        assert_eq!(
+            drifted, identity,
+            "the resource's schema_url is not stream identity"
+        );
+        let second = ledger.admit_metric_point(&drifted, sum_point(100, 200, 5));
+        assert_eq!(
+            second.outcome,
+            AdmissionOutcome::Collapsed { entity: standing },
+            "equal content across the resource schema drift collapses"
+        );
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            1,
+            "the drift is recorded, observable"
+        );
+        assert_eq!(ledger.anomalies().total(), 1);
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "the drifted delivery interned onto the standing stream"
+        );
+    }
+
+    #[test]
+    fn a_scope_schema_url_change_admits_a_second_stream_never_a_mismatch() {
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let standing = assert_admitted(&first);
+        let mut rescoped = identity.clone();
+        rescoped.scope.schema_url = Some("https://scope-schema/v2".to_owned());
+        assert_ne!(
+            rescoped, identity,
+            "the scope's schema_url participates in identity"
+        );
+        let second = ledger.admit_metric_point(&rescoped, sum_point(100, 200, 5));
+        let second_entity = assert_admitted(&second);
+        assert_ne!(
+            second_entity, standing,
+            "the scope's schema_url made a second stream"
+        );
+        assert_eq!(
+            ledger.anomalies().provenance_mismatches(),
+            0,
+            "the provenance counter is the resource level's alone"
+        );
+        assert_eq!(ledger.resident_streams(), 2);
     }
 
     #[test]

@@ -817,6 +817,75 @@ fn a_differing_redelivery_is_a_recorded_conflict() {
     harness.drain();
 }
 
+#[test]
+fn a_resource_schema_url_drift_collapses_and_a_scope_drift_conflicts() {
+    // The schema_url asymmetry, end to end: the resource's `schema_url` is
+    // provenance outside identity — a re-delivery across the drift
+    // collapses onto the standing span and the drift is counted as its own
+    // anomaly. The scope's `schema_url` participates in identity — the
+    // same drift there is a conflict, and the provenance counter does not
+    // move.
+    let harness = Harness::new();
+    let first = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(trace_span("op", T1, S1)))
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let drifted = encode(&traces_request(vec![resource_spans_with_schema_url(
+        "https://schema/v2",
+        Some(resource(Vec::new())),
+        vec![scope_spans(Some(scope("test")), vec![trace_span("op", T1, S1)])],
+    )]));
+    let second = harness
+        .pipeline
+        .ingest_spans(now(), &drifted)
+        .expect("walked");
+    assert!(
+        matches!(&second.records[0], RecordOutcome::Collapsed { .. }),
+        "equal content across the resource schema drift collapses: {second:?}"
+    );
+    assert_eq!(standing_entity(&second, 0), standing_entity(&first, 0));
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the drift is recorded, observable"
+    );
+    assert_eq!(harness.pipeline.anomalies().span_identity_conflicts(), 0);
+
+    let rescoped = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![scope_spans_with_schema_url(
+            "https://scope-schema/v2",
+            Some(scope("test")),
+            vec![trace_span("op", T1, S1)],
+        )],
+    )]));
+    let third = harness
+        .pipeline
+        .ingest_spans(now(), &rescoped)
+        .expect("walked");
+    assert!(
+        matches!(&third.records[0], RecordOutcome::Conflict { .. }),
+        "the scope's schema_url participates in identity: {third:?}"
+    );
+    assert_eq!(standing_entity(&third, 0), standing_entity(&first, 0));
+    assert_eq!(harness.pipeline.anomalies().span_identity_conflicts(), 1);
+    assert_eq!(
+        harness.pipeline.anomalies().provenance_mismatches(),
+        1,
+        "the provenance counter is the resource level's alone"
+    );
+
+    let drained = harness.drain();
+    assert_eq!(
+        drained.len(),
+        1,
+        "collapse and conflict queue nothing: the standing span is the story"
+    );
+    assert_eq!(drained[0].entity, standing_entity(&first, 0));
+}
+
 // ---------------------------------------------------- resource envelopes
 
 #[test]
