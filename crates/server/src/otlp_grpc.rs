@@ -528,19 +528,30 @@ fn unimplemented_response(path: &str) -> http::Response<GrpcBody> {
 /// Refusing the gRPC-shaped dialects too is a deliberate, documented
 /// deviation from that letter — on the side of naming what is not spoken
 /// instead of answering a foreign dialect with an INTERNAL.
+///
+/// Two pieces of legal HTTP syntax the prefix check must survive (RFC 9110
+/// §8.3): the type and subtype are case-insensitive, and optional whitespace
+/// may separate the media type from the `;` that opens its parameters
+/// (`application/grpc ; charset=utf-8`). Both are accepted; a foreign
+/// dialect stays foreign however it is spelled.
 fn is_grpc_content_type(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
-            if !value.starts_with("application/grpc") {
+            // The type and subtype are case-insensitive (RFC 9110 §8.3.2),
+            // so the dialect is matched on the lowercased value; parameters
+            // are never inspected, only the spelling in front of them.
+            let lower = value.to_ascii_lowercase();
+            if !lower.starts_with("application/grpc") {
                 return false;
             }
-            let rest = &value["application/grpc".len()..];
-            rest.is_empty()
-                || rest == "+proto"
-                || rest.starts_with("+proto;")
-                || rest.starts_with(';')
+            let rest = &lower["application/grpc".len()..];
+            let after_dialect = rest.strip_prefix("+proto").unwrap_or(rest);
+            // Optional whitespace (OWS) may precede the `;` that opens the
+            // parameter list.
+            let after_dialect = after_dialect.trim_start_matches([' ', '\t']);
+            after_dialect.is_empty() || after_dialect.starts_with(';')
         })
 }
 
@@ -970,7 +981,11 @@ mod tests {
         let runtime = test_support::runtime();
         let router = build_router(Arc::clone(&runtime), ServerConfig::default());
 
-        for dialect in ["application/grpc-web+proto", "application/grpc+json"] {
+        for dialect in [
+            "application/grpc-web+proto",
+            "application/grpc+json",
+            "application/grpc+json ; charset=utf-8",
+        ] {
             let request = axum::http::Request::builder()
                 .method("POST")
                 .uri(TRACE_EXPORT)
@@ -995,6 +1010,56 @@ mod tests {
         }
         runtime.shutdown();
     }
+
+    /// The legal HTTP spellings a prefix check must survive —
+    /// case-insensitive type/subtype and optional whitespace before the
+    /// parameter list (RFC 9110 §8.3) — reach the gRPC layer and get real
+    /// gRPC answers, not the bare-HTTP 415 the foreign dialects get.
+    #[tokio::test]
+    async fn legal_media_type_spellings_are_answered_as_grpc() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        for (trace, span, spelling) in [
+            ([0x01_u8; 16], [0x11_u8; 8], "Application/Grpc"),
+            ([0x02_u8; 16], [0x12_u8; 8], "application/grpc+PROTO"),
+            (
+                [0x03_u8; 16],
+                [0x13_u8; 8],
+                "application/grpc ; charset=utf-8",
+            ),
+            (
+                [0x04_u8; 16],
+                [0x14_u8; 8],
+                "application/grpc+proto ; charset=utf-8",
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(TRACE_EXPORT)
+                .header("content-type", spelling)
+                .header("te", "trailers")
+                .body(Body::from(frame(&one_span_payload(trace, span))))
+                .expect("a static request builds");
+            let answer = answer(
+                router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("the router answers every request"),
+            )
+            .await;
+            assert_eq!(
+                answer.code,
+                Some(0),
+                "{spelling} is answered as gRPC, not refused at the HTTP \
+                 layer: {}",
+                answer.message
+            );
+        }
+        runtime.shutdown();
+    }
+
     #[tokio::test]
     async fn draining_runtime_refuses_before_buffering_the_frame() {
         let runtime = test_support::runtime();
