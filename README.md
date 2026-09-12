@@ -122,17 +122,16 @@ and enforced mechanically by [Archkeep](https://github.com/ecoma-io/archkeep).
 
 ## Current status
 
-**Bootstrap.** The engineering foundation is in place — toolchain,
-architecture contracts (mechanically enforced, with canary fixtures proving
-the enforcement bites), agent workflow, CI, documentation, governance — and
-the core skeleton boots: one binary that binds loopback by default, answers
-`/healthz` and `/version`, serves the bootstrap web app statically, and runs
-against its in-memory store. There is **no
-telemetry capability yet**: no OTLP ingestion, no telemetry model beyond the
-skeleton's own types, no query or correlation engine, and no MCP server. The
-web and desktop apps are bootstrap shells around a status page, not the
-product UI. Delivery status is tracked in
-[docs/roadmap/README.md](docs/roadmap/README.md).
+**Phase 1 (telemetry ingestion) is in progress.** The engineering foundation
+of Phase 0 is in place — toolchain, architecture contracts (mechanically
+enforced, with canary fixtures proving the enforcement bites), agent workflow,
+CI, documentation, governance — and the core now **ingests OpenTelemetry**: one
+binary binds loopback by default, serves OTLP/HTTP and OTLP/gRPC traces, logs
+and metrics into a bounded in-memory queue and store under backpressure, and
+answers `/healthz` and `/version`. What does **not** yet exist: query,
+correlation, investigation UI, MCP, and file-backed persistence. The web and
+desktop apps remain bootstrap shells around a status page, not the product UI.
+Delivery status is tracked in [docs/roadmap/README.md](docs/roadmap/README.md).
 
 ## Documentation
 

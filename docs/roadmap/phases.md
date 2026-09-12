@@ -12,17 +12,28 @@ and a minimal executable skeleton (native server with health/version surfaces,
 Loom web app, desktop shell, Docker image — all smoke-level only).
 
 **Acceptance:** the foundation commit builds and tests green locally and in CI;
-Archkeep enforces the documented boundaries; no telemetry capability exists.
+Archkeep enforces the documented boundaries; the phase-1 routing document.
+Phase 0 shipped that; the OTLP ingestion capability it defined as _not yet
+existing_ has since landed with Phase 1.
 
-## Phase 1 — Telemetry ingestion — `planned`
+## Phase 1 — Telemetry ingestion — `in progress`
 
 OTLP ingestion of traces, logs and metrics into the in-memory runtime:
 OTLP/gRPC and OTLP/HTTP receivers, bounded ingestion queues, backpressure
 signals, and the first real population of the telemetry model.
 
-**Acceptance sketch:** an OTLP SDK configured against a locally started
-`runtime-trail` has its traces/logs/metrics queryable through the internal
-API; overload produces backpressure instead of unbounded memory growth. The
+**Landed so far** (2026-09-12): the sanctioned Phase-1 slice is landed,
+adversarially reviewed and benchmarked — telemetry model with the
+admission ledger (ADR 0008); OTLP/HTTP and OTLP/gRPC receivers with the
+bounded queue/backpressure wire gates; bounded memory driver, composition
+root, and the memory-path measurements under
+[`docs/benchmarks/README.md`](../benchmarks/README.md).
+
+**Acceptance (open):** an OTLP SDK configured against a locally started
+`runtime-trail` has its traces/logs/metrics **queryable through the internal
+API**; overload produces backpressure instead of unbounded memory growth. The
+queryable-through-internal-API half is Phase 2's Investigation-runtime work;
+this phase closes when the full acceptance sketch is met. The
 [telemetry model](../architecture/telemetry-model.md) and
 [numeric-limit](../architecture/runtime-constraints.md) contracts are
 binding for this phase.

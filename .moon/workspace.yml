@@ -21,5 +21,6 @@ projects:
   telemetry-ingestion: crates/telemetry-ingestion
   mcp: crates/mcp
   server: crates/server
+  bench-probes: crates/bench-probes
   web: apps/web
   desktop: apps/desktop/src-tauri

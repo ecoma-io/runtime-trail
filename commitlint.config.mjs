@@ -23,6 +23,7 @@ export default {
         "telemetry-ingestion",
         "mcp",
         "server",
+        "bench-probes",
         // apps/
         "desktop",
         "web",

@@ -27,6 +27,7 @@ exactly one `layer-*` tag, and the law keys on those tags:
 | `layer-storage`        | `storage` (crates/storage) — the Storage Abstraction                                        |
 | `layer-storage-driver` | `storage-memory`, `storage-sqlite` — concrete storage modes                                 |
 | `layer-ingest`         | `telemetry-ingestion` (crates/telemetry-ingestion) — OTLP ingestion                         |
+| `layer-bench`          | `bench-probes` (crates/bench-probes) — the memory-path measurement harness                  |
 | `layer-app`            | `server` (crates/server), `desktop` (apps/desktop/src-tauri) — composition and distribution |
 
 ## Allowed dependency directions
@@ -39,12 +40,13 @@ layer-model            → (nothing)                      # leaf
 layer-storage          → model
 layer-storage-driver   → storage, model
 layer-ingest           → model, storage
+layer-bench            → model, storage, storage-driver, ingest
 layer-query            → model, storage
 layer-correlation      → model, storage
 layer-api              → query, correlation, model
 layer-view             → (nothing internal)             # HTTP via the server (layer-app)
 layer-agent            → api
-layer-app              → api, storage-driver, ingest, app
+layer-app              → api, storage, storage-driver, ingest, model, app
 ```
 
 Notes on the two rows that look unusual:
@@ -53,10 +55,24 @@ Notes on the two rows that look unusual:
   core is the Investigation API over HTTP. A compile-time dependency from the
   UI onto any Rust crate is a violation — there is no legitimate one.
 - **`layer-app` is the composition root.** Only it may name concrete storage
-  drivers and ingestion, because choosing them at startup is precisely its job.
+  drivers and ingestion, because choosing them at startup is precisely its job
+  — and choosing a driver means speaking the abstraction it implements
+  ([ADR 0003](../decisions/0003-storage-strategy.md)): the composition root
+  constructs the store behind `layer-storage`'s trait, implements the
+  eviction hook that releases ledger identity
+  ([ADR 0008](../decisions/0008-admission-ledger-design.md)), moves admitted
+  records from ingestion's queue into the store, and owns the retention
+  clock. The storage contract and the telemetry model are its raw material,
+  so both are allowed imports here and nowhere else above storage.
   `server` and `desktop` may depend on each other: the desktop shell starts the
   same server core in-process (the same-core invariant in
   [system.md](system.md)).
+- **`layer-bench` measures what the product layers do.** The benchmark probes
+  compose exactly the layers they measure — the model, the storage contract,
+  the memory driver, ingestion — and nothing else: a measurement harness that
+  borrows the real pipeline, never a product surface, and never a shortcut
+  around the Investigation API's law. It may not read stored facts (that is
+  query/correlation's door) and may not bind a network.
 - **`layer-correlation` reads storage like `layer-query`.** Correlation's
   contract is a derived read over the resident telemetry
   ([correlation-model.md](correlation-model.md)): its strategies must see

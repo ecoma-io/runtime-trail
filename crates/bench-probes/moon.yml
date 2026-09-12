@@ -1,0 +1,35 @@
+# `moon` project for the Phase 1 memory-path benchmark probes.
+#
+# Every cargo task is `cache: false` on purpose — see the comment in
+# crates/telemetry-model/moon.yml.
+#
+# `layer: library` (moon's graph taxonomy) is exact: the probes are three
+# thin binaries over one library (the composition, the pump, the readers);
+# nothing imports this crate — `scripts/bench/cases/*` execute its built
+# binaries. Its architectural vocabulary is the `layer-bench` tag below,
+# which is what the boundary table judges: a measurement harness composes
+# the real layers it measures (model, storage contract, the memory driver,
+# ingestion) and nothing else in the workspace, and it is not a product
+# surface — no transport, no API, no UI, and it never ships.
+language: rust
+layer: library
+stack: backend
+tags:
+  - layer-bench
+tasks:
+  lint:
+    script: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
+    options:
+      cache: false
+  typecheck:
+    command: cargo check --locked --all-targets
+    options:
+      cache: false
+  test:
+    command: bash $MOON_WORKING_DIR/scripts/cargo-test.sh
+    options:
+      cache: false
+  build:
+    command: cargo build --locked --release
+    options:
+      cache: false

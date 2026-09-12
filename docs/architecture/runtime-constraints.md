@@ -45,26 +45,50 @@ operator may tune them at startup only — never mid-session — and changing a
 default is an architecture change (the PR states its effect on the table
 above).
 
-| Limit                                       | Default                                             | Applies to                                                                                                                                         |
-| ------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OTLP payload ceiling                        | 4 MiB                                               | one OTLP export request; rejected non-retryably at the transport edge                                                                              |
-| Attributes per signal                       | ≤ 256                                               | per span, log record, data point, resource                                                                                                         |
-| Attributes per span event, link or exemplar | ≤ 64                                                | each carries its own attribute set                                                                                                                 |
-| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — keys and names count)                                                         |
-| Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                        |
-| Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                   |
-| Key-value list depth                        | ≤ 8                                                 | nested kvlist inside attribute values                                                                                                              |
-| Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                  |
-| Series cap (active)                         | ≤ 100,000                                           | per runtime session; new series rejected with an observable counter; a slot frees when its last point is [evicted](storage-model.md)               |
-| In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal |
-| Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                         |
-| File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                  |
-| Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                       |
+| Limit                                       | Default                                             | Applies to                                                                                                                                                                                                                                      |
+| ------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OTLP payload ceiling                        | 4 MiB                                               | one OTLP export request; rejected non-retryably at the transport edge                                                                                                                                                                           |
+| Attributes per signal                       | ≤ 256                                               | per span, log record, data point, resource, scope                                                                                                                                                                                               |
+| Attributes per span event, link or exemplar | ≤ 64                                                | each carries its own attribute set                                                                                                                                                                                                              |
+| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — key, entry overhead and payload all count)                                                                                                                                 |
+| Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                                                                                                                     |
+| Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                                                                                                                |
+| Key-value list depth                        | ≤ 8                                                 | every container nesting a record carries — key-value lists and arrays alike, in attribute values, log bodies, exemplar filtered attributes, metric metadata and event/link attributes                                                           |
+| Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                               |
+| Series cap (active)                         | ≤ 100,000                                           | distinct resident streams; enforced by the store at keep time ([mechanism](storage-model.md)); refusal names the cap and is non-retryable, with an observable counter; a slot frees when the stream's last point is [evicted](storage-model.md) |
+| In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                                              |
+| Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                      |
+| File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                                                                                                               |
+| Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                                                                                                                    |
 
 Byte-bounded queues are why these numbers compose: a queue holds at most
 64 MiB regardless of how large any single legal record is, so in-flight
 memory is bounded by the queue ceilings — not by a record count multiplied by
 a worst case.
+
+The retention ceilings bound **accounted** bytes, and accounted size
+deliberately over-counts record content ([telemetry-model.md](telemetry-model.md))
+— so real content residency sits under the ceiling by design, not by luck.
+The byte ceiling also charges each distinct resident stream's identity
+exactly once ([storage-model.md](storage-model.md)), so identity content
+cannot hide behind the per-record formula — and a stream identity whose
+accounted size alone exceeds the ceiling is refused at keep time,
+non-retryable and never evicting into
+([mechanism](storage-model.md)), the series-cap refusal's sibling. Every
+refusal that inserts nothing is also a hook delivery: the store's hook
+carries three kinds — evicted record, stream release, keep refusal — and
+the composition root ends the refused record's ledger identity through it
+exactly as for eviction
+([ADR 0008](../decisions/0008-admission-ledger-design.md)), so the ledger's
+overhead tracks what residency and the refusals actually hold. Evictions,
+keep refusals and their hook deliveries are separately counted, so a
+delivery that does not complete is observable, never silent. On top
+of the ceiling stand the admission ledger's per-record entries
+([ADR 0008](../decisions/0008-admission-ledger-design.md) — bounded overhead
+per retained record, sharing ownership with the record it pins) and the
+runtime's fixed overhead; how large the real-to-accounted margin actually is
+is a measurement for [../benchmarks/README.md](../benchmarks/README.md) once
+Phase 1 lands — never an assertion made here.
 
 ## The backpressure architecture
 

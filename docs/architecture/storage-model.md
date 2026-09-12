@@ -63,6 +63,66 @@ model's added metadata ([telemetry-model.md](telemetry-model.md)) — never
 by emitter event time, which out-of-order emitters would make
 unpredictable.
 
+**The byte ceiling counts what residency pins — including stream
+identities.** A metric point references a stream identity (resource,
+scope, name, kind, temporality) whose content the record's own accounted
+size does not carry. The store therefore charges each distinct resident
+stream's identity accounted size **exactly once** — added when the
+stream's first point enters residency, released when its last point
+leaves — so a session of single-point streams cannot park unbounded
+identity content under a byte ceiling that only saw the points
+([telemetry-model.md](telemetry-model.md) owns the definition;
+[ADR 0008](../decisions/0008-admission-ledger-design.md) owns the
+lifecycle). An identity the ceiling cannot hold on its own is refused,
+not evicted into: a keep whose stream identity's accounted size alone
+exceeds the byte ceiling is refused before anything is inserted —
+non-retryable, naming the ceiling and the identity's size, with an
+observable counter — because no amount of eviction could make room for a
+charge that is over the cap by itself. The **series cap**
+([runtime-constraints.md](runtime-constraints.md))
+is the second half of the same law: the store refuses a keep that would
+establish a new distinct stream beyond the cap, with an observable
+counter, and a slot frees when the stream's last point is evicted. Both
+refusals end the refused record's ledger identity through the hook
+(below), so a re-delivery after a refusal re-admits as a fresh admission —
+a re-attempt is measured against the ceilings as they stand then, never
+shadowed by an identity whose record never entered residency.
+
+Descriptor content — a stream's `description`, `unit` and `metadata` — is
+bounded by this ceiling and by nothing smaller: admission gates the
+descriptor's attribute budgets (metadata count and per-value size) but sets
+no aggregate size gate on the descriptor, and `description` and `unit` carry
+no size gate at all. The identity is therefore charged to the byte ceiling
+byte-exactly once resident, and refused whole at keep when it cannot fit —
+never truncated and never silently clipped.
+
+**The store owns no clock.** Window expiry is evaluated against the
+composition root's reading of time (`enforce_retention(now)`); the
+composition root therefore owns the retention timer and must call it
+periodically — at a granularity well inside the shortest configured
+window — so an idle session still expires records. Ceilings on records
+and bytes bound memory while idle regardless; the timer exists so the
+_window_ stays truthful, not to prevent unbounded growth.
+
+**The hook runs after the store's own state settles, and it must not
+panic.** The hook carries three delivery kinds, and every one fires only
+after the store's own bookkeeping is complete — for an eviction, counters
+and indexes updated; for a keep refusal, the refusal counted with
+residency exactly as it was, nothing having been inserted. The kinds: an
+**evicted record** (`evicted`), a **stream whose last resident point
+left** (`stream_released`), and a **keep refusal that inserted nothing**
+(`keep_refused` — the oversized, series-cap and identity-over-ceiling
+refusals, with the refused record's interned stream when it carries one; a
+duplicate keep reports nothing, the record it names being resident). A
+misbehaving hook can never corrupt the store — but the hook is where the
+composition root releases the record's ledger identity
+([ADR 0008](../decisions/0008-admission-ledger-design.md)), so a panicking
+hook would leave identity behind after its record's story ended. A
+fallible hook is the composition root's to wrap; the store reports
+evictions, hook deliveries, keep refusals and refusal deliveries as
+separate counters, so a delivery that does not complete — evicted but not
+released, refused but not released — is observable, not silent.
+
 When the file-backed store's disk is full, the runtime degrades durability
 and observability — it never blocks admission and never blocks the hot path
 ([persistence rule](#persistence-is-never-on-the-ingestion-critical-path),
@@ -79,6 +139,7 @@ engine is what makes "copy one file, reopen the session" possible.
 
 ## Status
 
-**Bootstrap.** All three crates exist as declared boundaries with scaffolding
-only. The abstraction's real trait surface lands with Phase 1 (memory mode)
-and Phase 3 (file-backed mode) per [../roadmap/phases.md](../roadmap/phases.md).
+**Phase 1 implements the abstraction and memory mode** — the retention
+contract above has a real trait surface and an in-memory driver enforced
+against it. File-backed mode lands with Phase 3 per
+[../roadmap/phases.md](../roadmap/phases.md).

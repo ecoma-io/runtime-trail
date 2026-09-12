@@ -11,6 +11,7 @@ members = [
     "crates/storage-sqlite",
     "crates/mcp",
     "crates/server",
+    "crates/bench-probes",
     "apps/desktop/src-tauri",
 ]
 
@@ -53,3 +54,38 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Phase 1 (OTLP ingestion). `prost` is the protobuf runtime the OTLP wire
+# payloads are decoded with — OTLP is the only ingestion contract
+# (docs/product/non-goals.md), so a protobuf runtime is load-bearing, not
+# optional. `tonic` serves the OTLP/gRPC endpoint and is confined to
+# `crates/server` (layer-app) by ADR 0001: no crate outside layer-app takes a
+# transport dependency. `bytes` is the payload buffer type both edges pass
+# without copying.
+#
+# OTLP message types: sourced as committed `prost-build` codegen inside
+# `crates/telemetry-ingestion` (decision of the ingestion unit). The
+# pre-generated `opentelemetry-proto` crate was rejected: it couples its
+# versioning to the OpenTelemetry SDK release train, compiles transport
+# siblings (`gen-tonic`) this core must never see (ADR 0001), and pins its
+# own prost major — a second protobuf runtime. Build-time codegen
+# (`build.rs` + prost-build) was rejected because it needs `protoc` on every
+# machine, against the ambient-toolchain rule (ADR 0001). Committed output
+# keeps this build graph at exactly `prost`; the vendored, hash-pinned
+# upstream `.proto` sources and the committed regeneration script keep the
+# artifacts reproducible (see `crates/telemetry-ingestion/protos/
+# PROVENANCE.md` and `crates/telemetry-ingestion/regenerate.sh`).
+prost = "0.14"
+# Pinned exactly: 0.14.5 declares `rust-version = 1.75`, which fits the
+# workspace's 1.85 floor (ADR 0001's ambient-toolchain rule), while 0.14.6
+# declares 1.88 — above the floor — so a caret range would silently raise
+# the toolchain contract the workspace commits to. Only the server side is
+# built: no client transport stack, no TLS. `codegen` (one extra
+# dependency, async-trait) is what the hand-written service glue compiles
+# against. The dependency is confined to `crates/server` (layer-app) by
+# ADR 0001.
+tonic = { version = "=0.14.5", default-features = false, features = [
+  "server",
+  "codegen",
+] }
+bytes = "1"
