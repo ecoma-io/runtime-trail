@@ -301,7 +301,7 @@ pub(crate) mod test_support {
     use std::time::Duration;
 
     use runtime_trail_storage::TelemetryStore;
-    use runtime_trail_telemetry_ingestion::fixtures as fx;
+    use runtime_trail_telemetry_ingestion::{RecordOutcome, fixtures as fx};
 
     use crate::runtime::{CoreRuntime, RuntimeConfig};
 
@@ -352,10 +352,15 @@ pub(crate) mod test_support {
                 vec![fx::trace_span("park", fx::T1, [0xAA_u8; 8])],
             )],
         )]);
-        runtime
+        let park_outcome = runtime
             .pipeline()
             .ingest_spans(fx::now(), &fx::encode(&park))
             .expect("the park record is admitted");
+        // The park is only sound if the sacrificial record actually entered the queue.
+        assert!(matches!(
+            park_outcome.records[0],
+            RecordOutcome::Admitted { .. }
+        ));
         for _ in 0..5_000 {
             if runtime.queue_len_for_test() == 0 {
                 return frozen;
