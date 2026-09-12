@@ -13,7 +13,16 @@
 //! The codec is a passthrough: the gRPC frame's payload is taken as raw
 //! `Bytes` — zero-copy — straight into `pipeline.ingest_*`, which does the
 //! one authoritative prost decode. Requests are decoded exactly once;
-//! responses are prost-encoded collector messages.
+//! responses are prost-encoded collector messages. An empty frame payload
+//! is a legal empty request: the default OTLP export decodes from zero
+//! bytes, so an empty export is `OK` with an empty `partial_success` —
+//! never an internal error.
+//!
+//! Two answers are protocol gates, not admission signals: a request whose
+//! content-type does not begin with `application/grpc` is refused with
+//! HTTP 415 before the body is read (the gRPC-over-HTTP2 spec's rule,
+//! quoted at [`is_grpc_content_type`]), and a draining runtime refuses an
+//! export before its frame is buffered — still `UNAVAILABLE`.
 //!
 //! The wire behaviour of every refusal is the backpressure architecture's
 //! contract (runtime-constraints.md; the signal table in the ingestion
@@ -114,13 +123,12 @@ impl Decoder for PassthroughDecoder {
     type Error = Status;
 
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        if src.has_remaining() {
-            // Zero-copy: the frame's bytes leave the transport buffer as
-            // the payload the pipeline will decode.
-            Ok(Some(src.copy_to_bytes(src.remaining())))
-        } else {
-            Ok(None)
-        }
+        // Zero-copy: the frame's bytes leave the transport buffer as the
+        // payload the pipeline will decode. An empty frame payload is
+        // handed through too, as an empty item — it is a legal export, and
+        // returning `None` here would report the message as *missing*
+        // (an internal error) instead of empty.
+        Ok(Some(src.copy_to_bytes(src.remaining())))
     }
 }
 
@@ -382,10 +390,18 @@ impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportTraceServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
                     Ok(grpc.unary(ExportSpans { runtime }, req).await)
@@ -418,10 +434,18 @@ impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc =
                         Grpc::new(PassthroughCodec::<ExportMetricsServiceResponse>::new())
                             .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
@@ -455,10 +479,18 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
+        if !is_grpc_content_type(req.headers()) {
+            return Box::pin(std::future::ready(Ok(unsupported_media_type(
+                req.uri().path(),
+            ))));
+        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
+                    if runtime.is_draining() {
+                        return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportLogsServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
                     Ok(grpc.unary(ExportLogs { runtime }, req).await)
@@ -474,6 +506,37 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
 fn unimplemented_response(path: &str) -> http::Response<GrpcBody> {
     tracing::debug!(path, "unimplemented gRPC method");
     Status::unimplemented(format!("unknown method {path}")).into_http()
+}
+
+/// Whether the request speaks gRPC: the protocol requires a content-type
+/// that **begins with** `application/grpc` — bare (`application/grpc`),
+/// with a message format (`application/grpc+proto`), or with parameters.
+/// Everything else — a JSON post, a form, a missing header — is not a gRPC
+/// request, and answering it with a gRPC response (which rides HTTP 200)
+/// would hand a plain HTTP/2 client a 200 to read as success. The
+/// gRPC-over-HTTP2 spec ("Content-Type") prescribes the refusal:
+///
+/// > If **Content-Type** does not begin with "application/grpc", gRPC
+/// > servers SHOULD respond with HTTP status of 415 (Unsupported Media
+/// > Type). This will prevent other HTTP/2 clients from interpreting a
+/// > gRPC error response, which uses status 200 (OK), as successful.
+fn is_grpc_content_type(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"))
+}
+
+/// The 415 answer for a request that is not gRPC at all: bare HTTP — no
+/// `grpc-status`, no trailers, no body — because there is no gRPC exchange
+/// to answer. (The spec prescribes only the status; see
+/// [`is_grpc_content_type`] for why a gRPC-shaped answer must not ride it.)
+fn unsupported_media_type(path: &str) -> http::Response<GrpcBody> {
+    tracing::debug!(path, "non-gRPC content-type refused at the HTTP layer");
+    http::Response::builder()
+        .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        .body(GrpcBody::empty())
+        .expect("a static 415 response always builds")
 }
 
 #[cfg(test)]
@@ -835,6 +898,97 @@ mod tests {
         )
         .await;
         assert_eq!(answer.code, Some(12), "UNIMPLEMENTED");
+        runtime.shutdown();
+    }
+
+    /// A legal empty export — a gRPC frame whose payload is zero bytes —
+    /// decodes as the default request: nothing is admitted, and the answer
+    /// is `OK` with an empty `partial_success`. Not an internal error: the
+    /// message is *empty*, not *missing*.
+    #[tokio::test]
+    async fn empty_payload_frame_answers_ok() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let answer = call(router, TRACE_EXPORT, frame(&[])).await;
+        assert_eq!(answer.http, axum::http::StatusCode::OK);
+        assert_eq!(answer.code, Some(0), "the empty export is admitted");
+        let reply = ExportTraceServiceResponse::decode(&answer.body[5..])
+            .expect("the framed reply decodes");
+        let partial = reply.partial_success.expect("partial_success is present");
+        assert_eq!(partial.rejected_spans, 0);
+        assert_eq!(partial.error_message, "");
+        assert_eq!(
+            runtime.store_stats().resident_records,
+            0,
+            "an empty export admits nothing"
+        );
+        runtime.shutdown();
+    }
+
+    /// A request whose content-type does not begin with `application/grpc`
+    /// is refused at the HTTP layer with 415 — bare, with no `grpc-status`
+    /// on it — so a plain HTTP/2 client can never read a gRPC answer's
+    /// status-200 envelope as success.
+    #[tokio::test]
+    async fn non_grpc_content_type_answers_unsupported_media_type() {
+        let runtime = test_support::runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"resource_spans": []}"#.to_vec()))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert!(
+            response.headers().get("grpc-status").is_none(),
+            "the refusal is bare HTTP, not a gRPC answer: {:?}",
+            response.headers()
+        );
+        runtime.shutdown();
+    }
+
+    /// The drain gate reads nothing from the body: a draining runtime
+    /// answers `UNAVAILABLE` before the export's frame is buffered, so a
+    /// request whose body never completes still gets its closing answer.
+    #[tokio::test]
+    async fn draining_runtime_refuses_before_buffering_the_frame() {
+        let runtime = test_support::runtime();
+        runtime.begin_drain();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // A body that never yields a byte: buffering a frame from it would
+        // never finish, so the answer proves the gate fires first.
+        let endless = Body::from_stream(tonic::codegen::tokio_stream::pending::<
+            Result<bytes::Bytes, std::convert::Infallible>,
+        >());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(endless)
+            .expect("a static request builds");
+        let response = tokio::time::timeout(Duration::from_secs(5), router.oneshot(request))
+            .await
+            .expect("the drain gate answers without reading the body")
+            .expect("the router answers every request");
+        let answer = answer(response).await;
+        assert_eq!(answer.code, Some(14), "UNAVAILABLE");
+        assert!(
+            answer.message.contains("draining"),
+            "the closing signal says so: {:?}",
+            answer.message
+        );
         runtime.shutdown();
     }
 }
