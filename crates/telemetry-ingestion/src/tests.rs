@@ -15,7 +15,7 @@ use runtime_trail_telemetry_model::{
 
 use crate::fixtures::*;
 use crate::otlp::opentelemetry::{common::v1 as common, logs::v1 as logs, trace::v1 as trace};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{LedgerReleaser, Pipeline};
 use crate::queue::{
     BoundedQueue, PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
 };
@@ -1282,7 +1282,7 @@ fn a_queue_refusal_ends_the_refused_spans_identity() {
     // Saturate the bound-sized queue with distinct single-span exports.
     // The export that saturated it was refused, and — the law under test —
     // its span's identity ended at that refusal.
-    let queued = saturate_with_spans(&pipeline, &queue);
+    let queued = saturate_with_spans(&pipeline);
     assert!(queued >= 1, "the fixture needs queued spans in flight");
 
     // The refused span, re-delivered while the queue is still full: it
@@ -1327,7 +1327,7 @@ fn a_refusal_undoes_only_what_that_admission_created() {
     let entity_a = standing_entity(&first, 0);
 
     // The queue saturates on the filler spans.
-    let queued = saturate_with_spans(&pipeline, &queue);
+    let queued = saturate_with_spans(&pipeline);
     assert!(queued >= 1, "the fixture needs more than A in flight");
     let in_flight = queue.len();
 
@@ -1470,6 +1470,9 @@ fn a_refusal_releases_only_the_intern_its_own_admission_created() {
 /// counter. No new observability was added for this.
 #[test]
 fn a_saturation_storm_leaves_no_ledger_residue() {
+    /// The storm count: refused exports, one new stream each, asserted one
+    /// by one.
+    const STORM: u64 = 8;
     let limits = shrunken_limits();
     let bound = Pipeline::legal_record_bound_bytes(&limits);
     let (queue, pipeline) = pipeline_over(bound, limits);
@@ -1491,7 +1494,6 @@ fn a_saturation_storm_leaves_no_ledger_residue() {
     // creates the entry and interns the stream, the queue refuses, and the
     // undo must put both back. Eight storms, asserted one by one: the
     // interned count returns to `before` after every refusal.
-    const STORM: u64 = 8;
     for storm in 0..STORM {
         let signal = pipeline
             .ingest_metrics(
@@ -1535,6 +1537,59 @@ fn a_saturation_storm_leaves_no_ledger_residue() {
         "nothing in the storm was recorded as a conflict"
     );
     drain_queue(&queue);
+}
+
+/// The narrow releaser forwards exactly its two endings — and recovers a
+/// poisoned ledger lock rather than unwinding. The composition root's
+/// eviction hook runs inside the store's keep, where a panic must not
+/// propagate, so the mutex recovery lives behind this handle and is
+/// proven here, where the lock is reachable.
+#[test]
+fn a_releaser_forwards_its_endings_through_a_poisoned_ledger() {
+    let harness = Harness::new();
+    let span_payload = one_span_export(trace_span("released", T1, S1));
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &span_payload)
+        .expect("admitted");
+    let entity = standing_entity(&outcome, 0);
+
+    harness
+        .pipeline
+        .ingest_metrics(now(), &one_point_export_of("doomed", 1))
+        .expect("admitted");
+    assert_eq!(resident_streams(&harness.pipeline), 1);
+
+    // Poison the ledger the way a panic elsewhere under it would.
+    let ledger = harness.pipeline.ledger();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ledger.lock().expect("a fresh lock");
+        panic!("poison the ledger mutex");
+    }));
+    assert!(poisoned.is_err(), "the poisoner panicked");
+
+    let releaser = LedgerReleaser::new(harness.pipeline.ledger());
+    let drained = harness.drain();
+    let StoredRecord::Point { stream, .. } = &drained[1].record else {
+        panic!("expected the queued point record");
+    };
+    releaser.release_stream(stream);
+    assert_eq!(
+        resident_streams(&harness.pipeline),
+        0,
+        "the release went through the poisoned lock"
+    );
+    releaser.forget(entity);
+    let again = harness
+        .pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(99), &span_payload)
+        .expect("the re-delivery walks");
+    assert!(
+        matches!(&again.records[0], RecordOutcome::Admitted { .. }),
+        "the forget went through the poisoned lock — the identity is \
+         gone, so the re-delivery is fresh: {again:?}"
+    );
+    drain_queue(&harness.queue);
 }
 
 /// Drains a queue from the consumer side, front to back.
@@ -1608,16 +1663,17 @@ fn resident_streams(pipeline: &Pipeline) -> u64 {
         .resident_streams()
 }
 
-/// Fills `queue` to saturation through `pipeline`, one fresh span per
-/// export, and returns the number of queued records. The export that
-/// saturated the queue was refused — and, by the law the saturation tests
-/// build on, its span's identity was ended by the pipeline.
+/// Fills the pipeline's queue to saturation with distinct single-span
+/// exports, and returns how many of those exports queued a record. The
+/// export that saturated the queue was refused — and, by the law the
+/// saturation tests build on, its span's identity was ended by the
+/// pipeline.
 ///
 /// # Panics
 ///
-/// Panics if the queue never saturates within 1_000 exports, or if any
+/// Panics if the queue never saturates within `1_000` exports, or if any
 /// export is refused by anything but saturation — a misbuilt fixture.
-fn saturate_with_spans(pipeline: &Pipeline, queue: &BoundedQueue) -> usize {
+fn saturate_with_spans(pipeline: &Pipeline) -> usize {
     let mut queued = 0;
     for index in 0..1_000_u32 {
         let mut span_id = [0_u8; 8];

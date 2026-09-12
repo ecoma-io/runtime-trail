@@ -41,11 +41,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use runtime_trail_storage::{EvictionHook, KeepOutcome, StoreStats, TelemetryStore};
 use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
 use runtime_trail_telemetry_ingestion::{
-    BoundedQueue, PIPELINE_QUEUE_NAME, Pipeline, PipelineConfigError, QueuedRecord, RecordSink,
-    StoredRecord,
+    BoundedQueue, LedgerReleaser, PIPELINE_QUEUE_NAME, Pipeline, PipelineConfigError, QueuedRecord,
+    RecordSink, StoredRecord,
 };
 use runtime_trail_telemetry_model::{
-    AdmissionLedger, AdmissionTime, Admitted, BudgetLimits, EntityId, StreamIdentity,
+    AdmissionTime, Admitted, BudgetLimits, EntityId, StreamIdentity,
 };
 
 use crate::DRAIN_DEADLINE;
@@ -197,12 +197,12 @@ impl std::fmt::Debug for RuntimeConfig {
 /// The eviction hook: the store's removals end identities in the ledger.
 ///
 /// This is the ADR 0008 loop, closed: a record evicted from residency
-/// calls [`AdmissionLedger::forget`] and a stream whose last resident
-/// point left calls [`AdmissionLedger::release_stream`] — on the *same*
-/// ledger the pipeline admits through, which is why
-/// [`Pipeline::ledger`](runtime_trail_telemetry_ingestion::Pipeline::ledger)
-/// shares it out. A re-delivery after eviction is therefore admitted
-/// fresh, and interning memory ends exactly when residency does.
+/// ends its identity through [`LedgerReleaser::forget`] and a stream
+/// whose last resident point left through [`LedgerReleaser::release_stream`]
+/// — on the *same* ledger the pipeline admits through, shared out through
+/// the pipeline's narrow releaser handle. A re-delivery after eviction is
+/// therefore admitted fresh, and interning memory ends exactly when
+/// residency does.
 ///
 /// A keep the store *refused* ends identity the same way: the refused
 /// record never entered residency, but admission had already given it a
@@ -221,40 +221,31 @@ impl std::fmt::Debug for RuntimeConfig {
 /// identity resident after its record is gone — the one divergence the
 /// storage contract calls out as never silent. Structurally, there is
 /// nothing here that can unwind: no indexing, no arithmetic that can
-/// overflow, no allocation, and the ledger calls are total map removals.
-/// The one fallible step is the ledger mutex, and poisoning is recovered
-/// from (`PoisonError::into_inner`) rather than unwound: the data the
-/// guard protects is a map whose every entry is independently valid, so a
-/// panic *elsewhere* under it does not make a `forget` unsafe to
-/// complete.
+/// overflow, no allocation, and the releaser's two calls are total map
+/// removals. The one fallible step is the ledger mutex, and poisoning is
+/// recovered from (`PoisonError::into_inner`, inside
+/// [`LedgerReleaser`]) rather than unwound: the data the guard protects
+/// is a map whose every entry is independently valid, so a panic
+/// *elsewhere* under it does not make a `forget` unsafe to complete.
 struct LedgerHook {
-    ledger: Arc<Mutex<AdmissionLedger>>,
+    releaser: LedgerReleaser,
     /// Shared with the runtime: refusals whose identity this hook ended.
     refused_forwards: Arc<AtomicU64>,
 }
 
-impl LedgerHook {
-    fn lock(&self) -> MutexGuard<'_, AdmissionLedger> {
-        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
 impl EvictionHook for LedgerHook {
     fn evicted(&mut self, entity: EntityId) {
-        self.lock().forget(entity);
+        self.releaser.forget(entity);
     }
 
     fn stream_released(&mut self, stream: &Arc<StreamIdentity>) {
-        self.lock().release_stream(stream);
+        self.releaser.release_stream(stream);
     }
 
     fn keep_refused(&mut self, entity: EntityId, stream: Option<&Arc<StreamIdentity>>) {
-        {
-            let mut ledger = self.lock();
-            ledger.forget(entity);
-            if let Some(stream) = stream {
-                ledger.release_stream(stream);
-            }
+        self.releaser.forget(entity);
+        if let Some(stream) = stream {
+            self.releaser.release_stream(stream);
         }
         self.refused_forwards.fetch_add(1, Ordering::Relaxed);
     }
@@ -417,7 +408,7 @@ impl CoreRuntime {
         )?);
         let refused_forwards = Arc::new(AtomicU64::new(0));
         let hook = LedgerHook {
-            ledger: pipeline.ledger(),
+            releaser: pipeline.ledger_releaser(),
             refused_forwards: Arc::clone(&refused_forwards),
         };
         let store: Box<dyn TelemetryStore> =
@@ -759,7 +750,6 @@ fn retention_loop(runtime: &CoreRuntime, stop: &(Mutex<bool>, Condvar)) {
 mod tests {
     use std::time::Duration;
 
-    use runtime_trail_storage::EvictionHook;
     use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
     use runtime_trail_telemetry_ingestion::fixtures as fx;
     use runtime_trail_telemetry_ingestion::{RecordOutcome, StoredRecord};
@@ -821,20 +811,18 @@ mod tests {
         }
     }
 
-    /// The ADR 0008 loop, through the real wiring: keeps that evict end the
-    /// evicted records' identity, and the last resident point leaving a
-    /// stream releases the stream's identity — on the same ledger the
-    /// pipeline admitted through.
+    /// The ADR 0008 loop, through the real wiring: when the store evicts,
+    /// the hook ends the evicted record's identity in the ledger the
+    /// pipeline admitted through. The behavioral proof is the fresh
+    /// re-admission of the exact evicted point; the store-side counters
+    /// prove residency and identity ended together. (The ledger-side
+    /// counterpart — the interned stream released exactly when its last
+    /// point leaves — is asserted where the ledger is reachable: the
+    /// ingestion crate's release and storm tests, over the model's own
+    /// release law.)
     #[test]
-    fn hook_forwards_eviction_and_release_to_the_ledger() {
+    fn an_eviction_ends_identity_through_the_hook() {
         let runtime = CoreRuntime::build(two_record_config()).expect("the config is buildable");
-        let ledger = runtime.pipeline().ledger();
-        let resident_streams = || {
-            ledger
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .resident_streams()
-        };
         let ingest_point = |name: &str, at: u64| {
             runtime
                 .pipeline()
@@ -847,32 +835,50 @@ mod tests {
 
         // Keep two points of stream "a", then one of stream "b". The third
         // keep evicts stream "a"'s first point; "a" still has a resident
-        // point, so its identity stays interned.
+        // point, so the stream itself stays.
         ingest_point("a", 1);
         ingest_point("a", 2);
         ingest_point("b", 3);
         wait_for_pump(&runtime, |summary| summary.kept == 3);
         assert_eq!(runtime.counters().evicted_on_keep, 1);
-        assert_eq!(resident_streams(), 2, "both streams still have points");
 
-        // The fourth keep evicts stream "a"'s last point: the stream leaves
-        // residency, and the hook must release its identity.
+        // The next keep evicts stream "a"'s last point: the stream leaves
+        // residency on the store side with it.
         ingest_point("b", 4);
         wait_for_pump(&runtime, |summary| summary.kept == 4);
         assert_eq!(runtime.counters().evicted_on_keep, 2);
+        let stats = runtime.store_stats();
+        assert_eq!(stats.resident_records, 2);
         assert_eq!(
-            resident_streams(),
-            1,
-            "stream a's last point left: its identity must be released, not stranded"
+            stats.resident_streams, 1,
+            "stream a's last point left: it is resident no more"
         );
-        assert_eq!(runtime.store_stats().resident_records, 2);
+
+        // The proof the evictions ended the evicted point's identity: the
+        // exact same point, re-delivered, is admitted FRESH — a `Collapsed`
+        // outcome would mean the ledger still held the evicted entry
+        // behind it.
+        let again = ingest_point("a", 1);
+        assert!(
+            matches!(&again.records[0], RecordOutcome::Admitted { .. }),
+            "the re-delivery must be fresh, not collapsed onto the evicted \
+             entry: {:?}",
+            again.records[0]
+        );
+        wait_for_pump(&runtime, |summary| summary.kept == 5);
+        // Every removal was reported: identity ended wherever residency
+        // did, with no divergence between the store's removals and the
+        // hook's deliveries.
+        let stats = runtime.store_stats();
+        assert_eq!(stats.hook_deliveries, stats.total_evictions());
     }
 
     /// The refusal side of the ADR 0008 edge, through the same wiring: a
     /// keep the store refuses inserted nothing, and the hook ends the
-    /// identity admission had already handed out — so a span's re-delivery
-    /// is admitted **fresh** (not collapsed onto the refused entry's
-    /// phantom) and a refused point's stream identity leaves the ledger.
+    /// identity admission had already handed out — so a re-delivery is
+    /// admitted **fresh**, not collapsed onto the refused entry's phantom.
+    /// (The refused point's stream release, the `Some(stream)` arm, is
+    /// asserted at the ledger: the ingestion crate's release tests.)
     #[test]
     fn a_refused_keep_ends_identity_through_the_hook() {
         // A byte ceiling no record can fit: every keep is refused with
@@ -885,13 +891,6 @@ mod tests {
             ..RuntimeConfig::default()
         })
         .expect("the config is buildable");
-        let ledger = runtime.pipeline().ledger();
-        let resident_streams = || {
-            ledger
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .resident_streams()
-        };
         let payload = one_span_export(fx::T1, fx::S1);
 
         // Admission has no store-side opinion: the span is admitted,
@@ -924,22 +923,20 @@ mod tests {
             again.records[0]
         );
 
-        // The `Some(stream)` arm: a refused point's stream identity is
-        // released the same way, so the ledger holds no interned stream.
+        // The `Some(stream)` arm rides the same hook: a refused point's
+        // store refusal carries its stream, and the forward is counted
+        // like every other.
         runtime
             .pipeline()
             .ingest_metrics(AdmissionTime::from_unix_nano(3), &one_point_export("a", 3))
             .expect("admission admits the point");
-        // Three forwards so far: both span deliveries and the point were
-        // all refused by the 1-byte ceiling, and every one of them ended
-        // identity through the hook.
+        // Three forwards: both span deliveries and the point were all
+        // refused by the 1-byte ceiling, and every refusal was reported to
+        // the hook — no divergence between refusals and forwards.
         wait_for_pump(&runtime, |summary| summary.refused_forwards == 3);
-        assert_eq!(
-            resident_streams(),
-            0,
-            "the refused point's stream identity was released, not stranded"
-        );
-        assert_eq!(runtime.store_stats().resident_records, 0);
+        let stats = runtime.store_stats();
+        assert_eq!(stats.refused_hook_deliveries, stats.total_keep_refusals());
+        assert_eq!(stats.resident_records, 0);
     }
 
     /// The retention tick is the composition root's clock handed to the
@@ -1066,43 +1063,5 @@ mod tests {
         assert_eq!(second, 101, "a stalled wall clock still advances");
         assert_eq!(third, 102, "a backwards step never turns the clock back");
         assert_eq!(fourth, 200, "a real step forward is taken");
-    }
-
-    /// The hook recovers a poisoned ledger lock rather than unwinding
-    /// inside the store's keep — the one way the hook could be fallible,
-    /// and the store contract's never-silent divergence.
-    #[test]
-    fn the_hook_survives_a_poisoned_ledger() {
-        let runtime = CoreRuntime::build(two_record_config()).expect("the config is buildable");
-        let ledger = runtime.pipeline().ledger();
-
-        // Fabricate a real admitted entity, then poison the ledger mutex
-        // the way a panic elsewhere under it would.
-        let harness = fx::Harness::new();
-        let payload = one_span_export(fx::T1, fx::S1);
-        let outcome = harness
-            .pipeline
-            .ingest_spans(AdmissionTime::from_unix_nano(1_000), &payload)
-            .expect("a one-span export is legal");
-        let entity = fx::standing_entity(&outcome, 0);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ledger.lock().expect("a fresh lock");
-            panic!("poison the ledger mutex");
-        }));
-        assert!(poisoned.is_err(), "the poisoner panicked");
-
-        // The hook fires after the poison and completes the release anyway.
-        let mut hook = LedgerHook {
-            ledger: Arc::clone(&ledger),
-            refused_forwards: Arc::new(AtomicU64::new(0)),
-        };
-        hook.evicted(entity);
-        assert_eq!(
-            ledger
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .resident_streams(),
-            0
-        );
     }
 }
