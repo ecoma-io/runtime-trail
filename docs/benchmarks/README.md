@@ -41,7 +41,7 @@ scripts/bench/
 The [roadmap](../roadmap/phases.md) starts Phase 1 with the first real
 measurement of the memory path — payload → decode → model conversion →
 queue → storage. The three cases below execute the probe binaries of
-[`crates/bench-probes`](../../crates/bench-probes/), which compose exactly
+`crates/bench-probes`, which compose exactly
 the layers they measure (the OTLP ingestion pipeline, the bounded queue,
 the in-memory store and the telemetry model — nothing else in the
 workspace). Phase 1 **measures, it does not gate**: every case below
