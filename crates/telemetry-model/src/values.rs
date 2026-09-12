@@ -37,6 +37,15 @@ use std::hash::{Hash, Hasher};
 /// well-defined for payloads that carry floats — a re-delivered NaN is the
 /// same value, not an incomparable one. The bits are the preserved value;
 /// numeric comparison is a view concern and is not modelled here.
+///
+/// The [`Ord`] implementation orders by IEEE-754 bit pattern. It exists so
+/// identity keys built on these types can live in ordered — never hashed —
+/// maps (ADR 0008); it is a **comparison order, not a canonical encoding**:
+/// nothing here asserts that `0.0` "sorts before" `-0.0` is a meaningful
+/// numeric or wire fact, only that the order is total and agrees exactly
+/// with [`PartialEq`] (equal bits compare `Equal`, different bits never
+/// do). Any total order over the bits would serve identity; this one is
+/// the bits read as `u64`.
 #[derive(Clone, Copy, Debug)]
 pub struct Float(f64);
 
@@ -67,6 +76,22 @@ impl PartialEq for Float {
 }
 
 impl Eq for Float {}
+
+impl PartialOrd for Float {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Float {
+    /// Bit-pattern order: equal bits compare `Equal`, different bits are
+    /// ordered as their `u64` patterns are — a total order that agrees
+    /// with the bit-pattern [`PartialEq`]. This is a comparison order for
+    /// ordered identity maps, not a canonical encoding of numeric order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.to_bits().cmp(&other.0.to_bits())
+    }
+}
 
 impl Hash for Float {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -149,7 +174,7 @@ impl std::error::Error for MixedKindArray {}
 /// arrays of key-value lists are common structured-log bodies). An empty
 /// array is a value: it is distinct from the key being absent, and it
 /// carries no kind.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HomogeneousArray {
     items: Vec<Value>,
 }
@@ -254,7 +279,7 @@ fn drop_values(values: Vec<Value>) {
 ///
 /// Dropping a deeply nested list is iterative (see [`Self::drop`]), so a
 /// value the depth gate refused cannot overflow the stack on its way out.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyValueList {
     entries: Vec<(String, Value)>,
 }
@@ -338,7 +363,12 @@ impl<'a> IntoIterator for &'a KeyValueList {
 ///
 /// The map is a [`BTreeMap`]; its node cost is what [`crate::size`]'s
 /// per-map base and per-entry charges cover.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+///
+/// The derived [`Ord`] walks the map's own key-sorted entries, so it is a
+/// total order consistent with the map equality above: reordered but
+/// equal maps compare `Equal`. This is what lets identity content carry
+/// into ordered — never hashed — maps (ADR 0008).
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Attributes {
     entries: BTreeMap<String, Value>,
 }
@@ -416,7 +446,12 @@ impl<'a> IntoIterator for &'a Attributes {
 /// nesting; the walks this crate runs over values (nesting depth, accounted
 /// size, drop) are all iterative, so a deeply nested value cannot overflow
 /// the stack before the depth gate refuses it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The derived [`Ord`] is a total order consistent with the derived
+/// [`PartialEq`] (variant order first, then fields, [`Float`] by bit
+/// pattern) — the order identity keys need for ordered maps, never a
+/// numeric or semantic ranking of values.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Value {
     String(String),
     Bool(bool),

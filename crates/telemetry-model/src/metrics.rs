@@ -52,7 +52,7 @@ pub const DATA_POINT_FLAG_NO_RECORDED_VALUE: u32 = 1;
 ///
 /// No kind is collapsed into another; a sum's monotonicity flag is part of
 /// the kind and is never inferred.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StreamKind {
     Gauge,
     Sum {
@@ -100,7 +100,7 @@ pub enum PointShape {
 /// with the same name are different series — never merged, split, or
 /// converted. Conversion is a transformation pipeline, which the product's
 /// non-goals exclude.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Temporality {
     Delta,
     Cumulative,
@@ -509,7 +509,13 @@ impl std::error::Error for StreamShapeError {}
 ///
 /// The resource's identity is its attribute map: `schema_url` is preserved
 /// metadata and never participates (see [`crate::resources::Resource`]).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The derived [`Ord`] orders by the same content the derived
+/// [`PartialEq`] compares — resource, scope, name, descriptor, kind,
+/// temporality — the total order identity keys need for ordered, never
+/// hashed, maps (ADR 0008). It is a comparison order over identity bytes,
+/// not a ranking of streams.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamIdentity {
     /// The stream's resource.
     pub resource: Resource,
@@ -567,17 +573,54 @@ impl StreamIdentity {
 /// `(stream, time)` per the spec's semantics, so this key carries a
 /// gauge's start as `None` however the point was sent.
 ///
-/// The stream is shared through an `Arc` (ADR 0008): one stream payload,
-/// one copy, every point key referencing it. Equality and hashing run
-/// through the `Arc` byte-exactly — sharing changes nothing about what
-/// makes two keys equal.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// # Sharing, ordering, never hashing (ADR 0008)
+///
+/// Both payloads live here **once**, as `Arc`s shared with the ledger's
+/// tables and with storage: the key holds the record, the record holds its
+/// attribute set — nothing is copied into the key. The stream is the
+/// interned `Arc<StreamIdentity>` every point key of the stream shares, so
+/// a thousand points of one stream cost one stream payload and ten
+/// thousand points cost ten thousand record payloads and zero key copies.
+///
+/// # The projected comparison: the descriptor is deliberately blind
+///
+/// [`PartialEq`], [`Eq`], [`PartialOrd`] and [`Ord`] are **manual**, and
+/// they project only the *`OTel` collapse key*: the stream's resource
+/// (attribute map), scope (full field set), name, kind and temporality —
+/// **never the stream's descriptor** (description, unit, metadata) — plus
+/// the point's attribute set, gauge-normalised `start_time`, `time`, and
+/// flags. The point's *payload* (its value and exemplars) is projected out
+/// just as deliberately: it is compared separately, kind-aware, by the
+/// ledger's collapse decision (`MetricPoint::identity_payload_eq`), so a
+/// key can look up a standing entry whose payload then decides collapse
+/// versus conflict.
+///
+/// Descriptor-blindness is the law that makes a re-delivery under a
+/// changed descriptor land on the *same* key: the ledger finds the
+/// standing point, sees a different stream identity there, and records a
+/// stream-identity conflict — first descriptor standing — instead of
+/// silently admitting a parallel stream. A *different* point under the
+/// changed descriptor projects to a different key and admits as the second
+/// stream it is. The descriptor difference is still byte-exact data: it
+/// lives on the interned stream identities, which the ledger compares in
+/// full.
+///
+/// The projections skip exactly the fields the descriptor owns, and
+/// `a == b` holds exactly when `a.cmp(b)` is [`Ordering::Equal`]. There is
+/// no `Hash`: keys live in ordered maps keyed by content, and a partial
+/// equality must never be hashed (ADR 0008).
+#[derive(Clone, Debug)]
 pub struct PointIdentity {
-    /// The stream the point belongs to, shared with the ledger's stream
-    /// table and with storage.
+    /// The stream the point belongs to — the interned identity, shared
+    /// with the ledger's stream table and with storage. Compared by full
+    /// byte-exact identity in the ledger's conflict decision, and by its
+    /// descriptor-less `OTel` key in this key's own ordering.
     pub stream: Arc<StreamIdentity>,
-    /// The point's attribute set.
-    pub point_attributes: Attributes,
+    /// The point itself, as admitted — shared, never copied. The key
+    /// projects its attribute set, gauge-normalised start, time and flags;
+    /// its payload stays out of the ordering for the ledger's kind-aware
+    /// comparison.
+    pub point: Arc<MetricPoint>,
     /// The interval start; `None` for gauge points (and for gauges it is
     /// `None` however the point was sent).
     pub start_time_unix_nano: Option<u64>,
@@ -588,20 +631,12 @@ pub struct PointIdentity {
 }
 
 impl PointIdentity {
-    /// Builds the identity of `point` in `stream`.
+    /// Builds the identity of `point` in `stream`, sharing both payloads.
     ///
     /// A gauge point's start time is normalised away here: two gauges
     /// differing only in `start_time` carry the same identity key.
     #[must_use]
-    pub fn of(stream: &StreamIdentity, point: &MetricPoint) -> Self {
-        Self::of_interned(&Arc::new(stream.clone()), point)
-    }
-
-    /// Builds the identity of `point` under an already-interned stream —
-    /// the same law as [`PointIdentity::of`], sharing the stream payload
-    /// instead of copying it.
-    #[must_use]
-    pub fn of_interned(stream: &Arc<StreamIdentity>, point: &MetricPoint) -> Self {
+    pub fn of_interned(stream: &Arc<StreamIdentity>, point: &Arc<MetricPoint>) -> Self {
         let start = if stream.kind.requires_start_time() {
             point.start_time_unix_nano()
         } else {
@@ -609,11 +644,55 @@ impl PointIdentity {
         };
         Self {
             stream: Arc::clone(stream),
-            point_attributes: point.attributes().clone(),
+            point: Arc::clone(point),
             start_time_unix_nano: start,
             time_unix_nano: point.time_unix_nano(),
             flags: point.flags(),
         }
+    }
+
+    /// The descriptor-less `OTel` key of the stream side, in comparison
+    /// order: resource attributes, scope, name, kind, temporality. The
+    /// descriptor — description, unit, metadata — is skipped on purpose:
+    /// this projection is what routes a re-delivery under a changed
+    /// descriptor onto the standing key so the ledger can name the
+    /// conflict (see the type's law above).
+    fn projected_stream_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.stream
+            .resource
+            .cmp(&other.stream.resource)
+            .then_with(|| self.stream.scope.cmp(&other.stream.scope))
+            .then_with(|| self.stream.name.cmp(&other.stream.name))
+            .then_with(|| self.stream.kind.cmp(&other.stream.kind))
+            .then_with(|| self.stream.temporality.cmp(&other.stream.temporality))
+    }
+}
+
+impl PartialEq for PointIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for PointIdentity {}
+
+impl PartialOrd for PointIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PointIdentity {
+    /// The projected collapse key: the descriptor-less stream key, then
+    /// the point's attribute set, gauge-normalised start, time, flags.
+    /// The descriptor and the point payload are projected out — see the
+    /// type's law.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.projected_stream_cmp(other)
+            .then_with(|| self.point.attributes().cmp(other.point.attributes()))
+            .then_with(|| self.start_time_unix_nano.cmp(&other.start_time_unix_nano))
+            .then_with(|| self.time_unix_nano.cmp(&other.time_unix_nano))
+            .then_with(|| self.flags.cmp(&other.flags))
     }
 }
 
@@ -920,14 +999,19 @@ mod tests {
             attributes(),
             Vec::new(),
         );
-        let stream_id = identity(kind, None);
-        let bare_key = PointIdentity::of(&stream_id, &MetricPoint::Number(bare));
-        let started_key = PointIdentity::of(&stream_id, &MetricPoint::Number(with_start));
+        let stream_id = Arc::new(identity(kind, None));
+        let bare_key = PointIdentity::of_interned(&stream_id, &Arc::new(MetricPoint::Number(bare)));
+        let started_key =
+            PointIdentity::of_interned(&stream_id, &Arc::new(MetricPoint::Number(with_start)));
         assert_eq!(
             bare_key, started_key,
             "gauge identity is (stream, time): start_time is normalised out"
         );
         assert_eq!(bare_key.start_time_unix_nano, None);
+        // And the sharing is real: both keys reference the same interned
+        // stream payload, and each key carries its own point — once.
+        assert!(Arc::ptr_eq(&bare_key.stream, &started_key.stream));
+        assert_eq!(Arc::strong_count(&stream_id), 3); // handle + two keys
     }
 
     #[test]
@@ -939,13 +1023,141 @@ mod tests {
         };
         assert_eq!(zero.flags, 0);
         assert_eq!(stale.flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
-        let stream_id = identity(StreamKind::Gauge, None);
-        let zero_key = PointIdentity::of(&stream_id, &MetricPoint::Number(zero));
-        let stale_key = PointIdentity::of(&stream_id, &MetricPoint::Number(stale));
+        let stream_id = Arc::new(identity(StreamKind::Gauge, None));
+        let zero_key = PointIdentity::of_interned(&stream_id, &Arc::new(MetricPoint::Number(zero)));
+        let stale_key =
+            PointIdentity::of_interned(&stream_id, &Arc::new(MetricPoint::Number(stale)));
         assert_ne!(
             zero_key, stale_key,
             "a staleness marker and a real zero are different points"
         );
+    }
+
+    #[test]
+    fn the_point_identity_ordering_is_blind_to_the_descriptor_and_the_payload() {
+        // The projection is the OTel collapse key: descriptor-blind and
+        // payload-blind, both on purpose. A re-delivery under a changed
+        // descriptor must land on the standing key (the ledger then names
+        // the stream conflict), and the payload must stay out of the
+        // ordering because the ledger's kind-aware comparison owns it.
+        let described = {
+            let mut stream = identity(StreamKind::Gauge, None);
+            stream.description = Some("requests being served".to_owned());
+            stream.unit = Some("1".to_owned());
+            stream
+        };
+        let bare_stream = identity(StreamKind::Gauge, None);
+        assert_ne!(
+            described, bare_stream,
+            "the streams themselves differ — the descriptor is full identity"
+        );
+        let point = MetricPoint::Number(NumberPoint::measurement(
+            50,
+            MetricNumber::int(1),
+            attributes(),
+            Vec::new(),
+        ));
+        let payload_changed = MetricPoint::Number(NumberPoint::measurement(
+            50,
+            MetricNumber::int(9),
+            attributes(),
+            Vec::new(),
+        ));
+        let described_key =
+            PointIdentity::of_interned(&Arc::new(described), &Arc::new(point.clone()));
+        let bare_key = PointIdentity::of_interned(&Arc::new(bare_stream), &Arc::new(point));
+        let payload_key =
+            PointIdentity::of_interned(&described_key.stream, &Arc::new(payload_changed));
+        assert_eq!(
+            described_key.cmp(&bare_key),
+            std::cmp::Ordering::Equal,
+            "the key's ordering is blind to the stream descriptor"
+        );
+        assert_eq!(
+            described_key.cmp(&payload_key),
+            std::cmp::Ordering::Equal,
+            "the key's ordering is blind to the point payload"
+        );
+        // The blind projections still carry the full streams: the
+        // descriptor difference is intact on the key's own handle, exactly
+        // what the ledger compares to name a stream conflict.
+        assert_ne!(*described_key.stream, *bare_key.stream);
+    }
+
+    #[test]
+    fn float_ordering_is_the_bit_pattern_and_agrees_with_equality() {
+        // The Ord exists so identity keys live in ordered maps; it must be
+        // total and agree exactly with the bit-pattern equality.
+        let quiet_nan = Float::new(f64::NAN);
+        assert_eq!(
+            quiet_nan.cmp(&quiet_nan),
+            std::cmp::Ordering::Equal,
+            "a NaN compares Equal to itself — equality by bits"
+        );
+        let signalling = Float::new(f64::from_bits(0x7FF0_0000_0000_0001_u64));
+        assert_ne!(quiet_nan, signalling);
+        assert_ne!(
+            quiet_nan.cmp(&signalling),
+            std::cmp::Ordering::Equal,
+            "different NaN bit patterns are different values, totally ordered"
+        );
+        let negative_zero = Float::new(-0.0);
+        let positive_zero = Float::new(0.0);
+        assert_ne!(negative_zero, positive_zero);
+        assert_ne!(
+            negative_zero.cmp(&positive_zero),
+            std::cmp::Ordering::Equal,
+            "the sign of zero is a preserved distinction under Ord, too"
+        );
+        // The order is the bits read as u64 — a comparison order, never a
+        // claimed numeric or canonical one.
+        assert_eq!(
+            negative_zero.cmp(&positive_zero),
+            (-0.0_f64).to_bits().cmp(&0.0_f64.to_bits())
+        );
+        let infinity = Float::new(f64::INFINITY);
+        let one = Float::new(1.0);
+        assert_eq!(one.cmp(&infinity), std::cmp::Ordering::Less);
+        assert_eq!(infinity.cmp(&one), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn value_and_attribute_ordering_agree_with_map_equality() {
+        // Attributes compare as maps: emitter order is not semantic. The
+        // derived Ord walks the map's own sorted entries, so reordered but
+        // equal maps must compare Equal — Ord and Eq can never disagree.
+        let first = Attributes::from_pairs(vec![
+            ("a".to_owned(), Value::Int(1)),
+            ("b".to_owned(), Value::Int(2)),
+        ])
+        .expect("unique keys");
+        let second = Attributes::from_pairs(vec![
+            ("b".to_owned(), Value::Int(2)),
+            ("a".to_owned(), Value::Int(1)),
+        ])
+        .expect("unique keys");
+        assert_eq!(first, second, "map equality ignores pair order");
+        assert_eq!(
+            first.cmp(&second),
+            std::cmp::Ordering::Equal,
+            "the ordering agrees: equal maps are Equal"
+        );
+        let third = Attributes::from_pairs(vec![
+            ("a".to_owned(), Value::Int(1)),
+            ("b".to_owned(), Value::Int(3)),
+        ])
+        .expect("unique keys");
+        assert_ne!(first, third);
+        assert_eq!(first.cmp(&third), std::cmp::Ordering::Less);
+        // Values order by variant then content, Float by bits — total and
+        // equality-consistent, a key order, never a numeric ranking.
+        let string_value = Value::String("x".to_owned());
+        let int_value = Value::Int(1);
+        assert_ne!(string_value.cmp(&int_value), std::cmp::Ordering::Equal);
+        let nan_a = Value::Double(Float::new(f64::NAN));
+        let nan_b = Value::Double(Float::new(f64::from_bits(0x7FF8_0000_0000_0001_u64)));
+        assert_ne!(nan_a, nan_b);
+        assert_ne!(nan_a.cmp(&nan_b), std::cmp::Ordering::Equal);
     }
 
     #[test]

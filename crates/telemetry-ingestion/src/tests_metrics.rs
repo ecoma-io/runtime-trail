@@ -283,10 +283,13 @@ fn metric_streams_intern_across_envelopes() {
 #[test]
 fn two_same_named_metrics_differing_only_in_description_are_two_streams() {
     let harness = Harness::new();
-    // Same instrument name, same everything — except the description. The
-    // wire has no such thing as "the same metric with two descriptions";
-    // folding them into one stream would pick a winner and destroy a sent
-    // value, so they are two streams, side by side in one export.
+    // Same instrument name, same everything — except the description, and
+    // (necessarily) the point times: the same data point re-sent under a
+    // changed descriptor is a conflict, not a second stream (see the
+    // conflict test below). Two *different* points under two descriptors
+    // are two streams, side by side in one export.
+    let mut second = number_point(as_double(1.0));
+    second.time_unix_nano = 11;
     let payload = encode(&metrics_request(vec![resource_metrics(
         Some(resource(Vec::new())),
         vec![scope_metrics(
@@ -304,7 +307,7 @@ fn two_same_named_metrics_differing_only_in_description_are_two_streams() {
                     "requests queued at the gate",
                     "1",
                     vec![],
-                    vec![number_point(as_double(1.0))],
+                    vec![second],
                 ),
             ],
         )],
@@ -343,6 +346,77 @@ fn two_same_named_metrics_differing_only_in_description_are_two_streams() {
         descriptions,
         ["requests being served", "requests queued at the gate"],
         "each stream keeps its own description intact"
+    );
+}
+
+#[test]
+fn a_point_redelivered_under_a_changed_descriptor_is_a_recorded_conflict() {
+    let harness = Harness::new();
+    // The descriptor is stream identity — but the collapse key is the
+    // descriptor-less OTel key, so a re-delivery of the *same point* under
+    // a changed description lands on the standing point. The law fires:
+    // the first descriptor stands, the divergence is a recorded conflict,
+    // and the refused delivery admits nothing — no second stream, no
+    // second queue entry, no interned stream left behind.
+    let point_at = |description: &str, time: u64| {
+        let mut point = number_point(as_double(1.0));
+        point.time_unix_nano = time;
+        encode(&metrics_request(vec![resource_metrics(
+            Some(resource(Vec::new())),
+            vec![scope_metrics(
+                Some(scope("test")),
+                vec![described_metric(
+                    "in-flight",
+                    description,
+                    "1",
+                    vec![],
+                    vec![point],
+                )],
+            )],
+        )]))
+    };
+
+    let first_payload = point_at("requests being served", 10);
+    let redelivery_payload = point_at("requests queued at the gate", 10);
+
+    let first = harness
+        .pipeline
+        .ingest_metrics(now(), &first_payload)
+        .expect("admitted");
+    assert_eq!(first.admitted(), 1);
+
+    let redelivery = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &redelivery_payload)
+        .expect("walked");
+    assert!(
+        matches!(&redelivery.records[0], RecordOutcome::Conflict { .. }),
+        "a re-delivery under a changed descriptor is a conflict: {redelivery:?}"
+    );
+    assert_eq!(
+        harness.drain().len(),
+        1,
+        "the standing entry is the whole story; the conflict queues nothing"
+    );
+
+    // The refused delivery left nothing behind: the changed descriptor is
+    // not interned, and a *different point* under it admits as the second
+    // stream it is — first descriptor standing beside it.
+    let new_point_payload = point_at("requests queued at the gate", 11);
+    let second = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &new_point_payload)
+        .expect("walked");
+    assert_eq!(second.admitted(), 1, "a new point is not a re-delivery");
+    let queued = harness.drain();
+    assert_eq!(queued.len(), 1);
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.description(),
+        Some("requests queued at the gate"),
+        "the second stream carries its own descriptor"
     );
 }
 
