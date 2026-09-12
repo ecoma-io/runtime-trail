@@ -36,7 +36,7 @@
 //! droppable.
 
 use crate::logs::LogRecord;
-use crate::metrics::{MetricPoint, MetricStream};
+use crate::metrics::{MetricPoint, MetricStream, StreamIdentity};
 use crate::resources::{InstrumentationScope, Resource};
 use crate::spans::Span;
 use crate::values::{Attributes, Value};
@@ -387,14 +387,36 @@ pub fn check_scope(
     )
 }
 
-/// The admission gate for a whole metric stream: the identity's resource
-/// and scope, the stream's metadata attribute set, and every point through
-/// [`check_point`].
+/// The stream-level share of the admission gates: the identity's resource
+/// and scope attribute sets and the stream's metadata attribute set — the
+/// parts of a metric stream that belong to no single point.
 ///
 /// A stream's metadata belongs to no single point, so the per-point gate
-/// cannot see it; this gate exists so the ledger — which admits points,
-/// not streams — cannot let a stream-shaped payload smuggle an ungated
-/// attribute map past the budgets.
+/// ([`check_point`]) cannot see it. The admission ledger's
+/// `admit_metric_point` applies this gate on the path that actually admits
+/// streams, and [`check_metric_stream`] reuses it for the whole-stream
+/// view — one statement of the stream-level law, two applications.
+///
+/// # Errors
+///
+/// Returns the first [`BudgetRejection`] the stream-level parts trip.
+pub fn check_stream_identity(
+    stream: &StreamIdentity,
+    limits: &BudgetLimits,
+) -> Result<(), BudgetRejection> {
+    check_resource(&stream.resource, limits)?;
+    check_scope(&stream.scope, limits)?;
+    check_attribute_set(
+        &stream.metadata,
+        BudgetName::AttributesPerSignal,
+        limits.attributes_per_signal,
+        limits,
+    )
+}
+
+/// The admission gate for a whole metric stream: the stream-level gates
+/// through [`check_stream_identity`], then every point through
+/// [`check_point`].
 ///
 /// # Errors
 ///
@@ -403,14 +425,7 @@ pub fn check_metric_stream(
     stream: &MetricStream,
     limits: &BudgetLimits,
 ) -> Result<(), BudgetRejection> {
-    check_resource(&stream.identity.resource, limits)?;
-    check_scope(&stream.identity.scope, limits)?;
-    check_attribute_set(
-        &stream.metadata,
-        BudgetName::AttributesPerSignal,
-        limits.attributes_per_signal,
-        limits,
-    )?;
+    check_stream_identity(&stream.identity, limits)?;
     for point in &stream.points {
         check_point(point, limits)?;
     }
@@ -932,12 +947,12 @@ mod tests {
                 resource: resource(),
                 scope: scope(),
                 name: "requests".to_owned(),
+                description: None,
+                unit: None,
+                metadata: attributes_of(limits().attributes_per_signal + 1),
                 kind: StreamKind::Gauge,
                 temporality: None,
             },
-            None,
-            None,
-            attributes_of(limits().attributes_per_signal + 1),
             vec![number_point(Attributes::default(), Vec::new())],
         )
         .expect("a coherent stream");
@@ -947,17 +962,50 @@ mod tests {
             limits().attributes_per_signal,
             limits().attributes_per_signal + 1,
         );
+    }
+
+    #[test]
+    fn the_stream_identity_gate_gates_metadata_for_the_point_path() {
+        // The ledger admits points, not streams; `check_stream_identity` is the
+        // gate its point path applies to the stream-level parts. Within-cap
+        // metadata passes; one entry over the per-signal cap refuses with the
+        // budget named and the observed count carried.
+        let identity = StreamIdentity {
+            resource: resource(),
+            scope: scope(),
+            name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: attributes_of(limits().attributes_per_signal),
+            kind: StreamKind::Gauge,
+            temporality: None,
+        };
+        assert!(check_stream_identity(&identity, &limits()).is_ok());
+        let over = StreamIdentity {
+            metadata: attributes_of(limits().attributes_per_signal + 1),
+            ..identity.clone()
+        };
+        assert_rejected(
+            check_stream_identity(&over, &limits()),
+            BudgetName::AttributesPerSignal,
+            limits().attributes_per_signal,
+            limits().attributes_per_signal + 1,
+        );
+    }
+
+    #[test]
+    fn the_whole_stream_gate_refuses_an_over_cap_point() {
         let over_point = crate::metrics::MetricStream::new(
             StreamIdentity {
                 resource: resource(),
                 scope: scope(),
                 name: "requests".to_owned(),
+                description: None,
+                unit: None,
+                metadata: Attributes::default(),
                 kind: StreamKind::Gauge,
                 temporality: None,
             },
-            None,
-            None,
-            Attributes::default(),
             vec![number_point(
                 attributes_of(limits().attributes_per_signal + 1),
                 Vec::new(),
@@ -975,12 +1023,12 @@ mod tests {
                 resource: resource(),
                 scope: scope(),
                 name: "requests".to_owned(),
+                description: None,
+                unit: None,
+                metadata: Attributes::default(),
                 kind: StreamKind::Gauge,
                 temporality: None,
             },
-            None,
-            None,
-            Attributes::default(),
             vec![number_point(Attributes::default(), Vec::new())],
         )
         .expect("a coherent stream");

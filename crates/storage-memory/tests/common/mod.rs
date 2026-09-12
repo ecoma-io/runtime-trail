@@ -135,6 +135,9 @@ pub fn stream() -> Arc<StreamIdentity> {
             dropped_attributes_count: 0,
         },
         name: "requests".to_owned(),
+        description: None,
+        unit: None,
+        metadata: Attributes::default(),
         kind: StreamKind::Gauge,
         temporality: None,
     })
@@ -158,6 +161,9 @@ pub fn bare_stream(name: &str) -> Arc<StreamIdentity> {
             dropped_attributes_count: 0,
         },
         name: name.to_owned(),
+        description: None,
+        unit: None,
+        metadata: Attributes::default(),
         kind: StreamKind::Gauge,
         temporality: None,
     })
@@ -186,6 +192,9 @@ pub fn heavy_stream(name: &str, attributes: usize, value_bytes: usize) -> Arc<St
             dropped_attributes_count: 0,
         },
         name: name.to_owned(),
+        description: None,
+        unit: None,
+        metadata: Attributes::default(),
         kind: StreamKind::Gauge,
         temporality: None,
     })

@@ -242,6 +242,27 @@ pub(crate) fn metric(name: &str, data: metrics::metric::Data) -> metrics::Metric
     }
 }
 
+/// A gauge metric carrying its descriptor: the name plus the description,
+/// unit and metadata the stream identity carries since the descriptor
+/// joined it.
+pub(crate) fn described_metric(
+    name: &str,
+    description: &str,
+    unit: &str,
+    metadata: Vec<common::KeyValue>,
+    points: Vec<metrics::NumberDataPoint>,
+) -> metrics::Metric {
+    metrics::Metric {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        unit: unit.to_owned(),
+        metadata,
+        data: Some(metrics::metric::Data::Gauge(metrics::Gauge {
+            data_points: points,
+        })),
+    }
+}
+
 pub(crate) fn number_point(value: metrics::number_data_point::Value) -> metrics::NumberDataPoint {
     metrics::NumberDataPoint {
         attributes: Vec::new(),

@@ -59,7 +59,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::budgets::{
-    BudgetLimits, check_log_record, check_point, check_resource, check_scope, check_span,
+    BudgetLimits, check_log_record, check_point, check_span, check_stream_identity,
 };
 use crate::identity::{AdmissionOutcome, AssignedId, EntityId};
 use crate::logs::LogRecord;
@@ -371,14 +371,14 @@ impl AdmissionLedger {
                 stream: None,
             };
         }
-        if let Err(rejection) = check_resource(&stream.resource, &self.limits) {
-            return PointAdmission {
-                outcome: AdmissionOutcome::Rejected { rejection },
-                record: None,
-                stream: None,
-            };
-        }
-        if let Err(rejection) = check_scope(&stream.scope, &self.limits) {
+        // The stream-level gates — the identity's resource and scope and,
+        // since the descriptor became identity content, the stream's
+        // metadata attribute set — on the path that actually admits
+        // streams. Metadata is interned once per stream and charged to the
+        // byte ceiling with the rest of the identity; ungated, a
+        // stream-shaped payload could park attribute content in the ledger
+        // behind points that carry none of it.
+        if let Err(rejection) = check_stream_identity(stream, &self.limits) {
             return PointAdmission {
                 outcome: AdmissionOutcome::Rejected { rejection },
                 record: None,
@@ -750,6 +750,9 @@ mod metric_points {
             resource: resource(),
             scope: scope(),
             name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: Attributes::default(),
             kind,
             temporality,
         }
@@ -1325,9 +1328,6 @@ mod metric_points {
         let mut ledger = ledger();
         let stream = MetricStream::new(
             stream_identity(StreamKind::Gauge, None),
-            None,
-            None,
-            Attributes::default(),
             vec![gauge_point(1, 1), gauge_point(2, 2)],
         )
         .expect("a coherent stream");

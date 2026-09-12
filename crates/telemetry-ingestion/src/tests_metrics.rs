@@ -280,6 +280,244 @@ fn metric_streams_intern_across_envelopes() {
     );
 }
 
+#[test]
+fn two_same_named_metrics_differing_only_in_description_are_two_streams() {
+    let harness = Harness::new();
+    // Same instrument name, same everything — except the description. The
+    // wire has no such thing as "the same metric with two descriptions";
+    // folding them into one stream would pick a winner and destroy a sent
+    // value, so they are two streams, side by side in one export.
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![
+                described_metric(
+                    "in-flight",
+                    "requests being served",
+                    "1",
+                    vec![],
+                    vec![number_point(as_double(1.0))],
+                ),
+                described_metric(
+                    "in-flight",
+                    "requests queued at the gate",
+                    "1",
+                    vec![],
+                    vec![number_point(as_double(1.0))],
+                ),
+            ],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(
+        outcome.admitted(),
+        2,
+        "same name, different description: two streams"
+    );
+
+    let queued = harness.drain();
+    let [
+        QueuedRecord {
+            record: StoredRecord::Point { stream: a, .. },
+            ..
+        },
+        QueuedRecord {
+            record: StoredRecord::Point { stream: b, .. },
+            ..
+        },
+    ] = queued.as_slice()
+    else {
+        panic!("expected two queued points");
+    };
+    assert!(
+        !Arc::ptr_eq(a, b),
+        "distinct identities intern to distinct streams"
+    );
+    let mut descriptions: Vec<_> = [a, b].iter().map(|s| s.description().unwrap()).collect();
+    descriptions.sort_unstable();
+    assert_eq!(
+        descriptions,
+        ["requests being served", "requests queued at the gate"],
+        "each stream keeps its own description intact"
+    );
+}
+
+#[test]
+fn the_descriptor_survives_decode_byte_exact() {
+    let harness = Harness::new();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "in-flight",
+                "requests being served",
+                "ms",
+                vec![
+                    attr("tier", str_value("edge")),
+                    attr("team", str_value("edge")),
+                ],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+
+    let queued = harness.drain();
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        stream.description(),
+        Some("requests being served"),
+        "the description decodes whole"
+    );
+    assert_eq!(stream.unit(), Some("ms"));
+    let keys: Vec<&str> = stream
+        .metadata()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, ["team", "tier"], "the metadata map arrives whole");
+    assert_eq!(
+        stream.metadata().len(),
+        2,
+        "every sent metadata entry is present"
+    );
+
+    // The empty string is not a description: proto3 strings have no
+    // presence, so an unset description and a "" description arrive
+    // identically and both read as absent — "absent is not empty" holds
+    // at the decode site, not just in the model.
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "bare",
+                "",
+                "",
+                vec![],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+    let queued = harness.drain();
+    let StoredRecord::Point { stream, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert!(
+        stream.description().is_none() && stream.unit().is_none(),
+        "\"\" on the wire is absence, not an empty-string descriptor"
+    );
+    assert!(stream.metadata().is_empty());
+}
+
+#[test]
+fn duplicate_metadata_keys_are_a_named_per_record_refusal() {
+    let harness = Harness::new();
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![described_metric(
+                "in-flight",
+                "requests being served",
+                "1",
+                vec![
+                    attr("tier", str_value("edge")),
+                    attr("tier", str_value("core")),
+                ],
+                vec![number_point(as_double(1.0))],
+            )],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    assert!(
+        matches!(
+            rejected_reason(&outcome, 0),
+            RecordRejection::DuplicateKey(error) if error.key == "tier"
+        ),
+        "the refusal names the duplicated key"
+    );
+    assert!(
+        harness.drain().is_empty(),
+        "nothing of a refused record is admitted"
+    );
+}
+
+#[test]
+fn stream_metadata_over_budget_refuses_at_each_point_position() {
+    let harness = Harness::new();
+    // Metadata rides the stream identity, and the identity rides every
+    // point — so an over-budget metadata map refuses every point of the
+    // stream, each refusal naming the budget the payload trips. (The
+    // stream-level gate is the ledger's: the whole-stream check cannot see
+    // a payload that arrives point by point.)
+    let oversized = described_metric(
+        "in-flight",
+        "requests being served",
+        "1",
+        vec![attr("blob", str_value(&"a".repeat(5_000)))],
+        vec![number_point(as_double(1.0)), number_point(as_double(2.0))],
+    );
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![oversized])],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("walked");
+    for position in 0..2 {
+        assert!(
+            matches!(
+                rejected_reason(&outcome, position),
+                RecordRejection::Budget(rejection)
+                    if rejection.budget == BudgetName::AttributeValueSize
+            ),
+            "position {position} names the value-size budget"
+        );
+    }
+    assert!(harness.drain().is_empty());
+
+    // The refusal leaves no interned stream behind: the same stream,
+    // within budget, admits cleanly afterwards.
+    let within = described_metric(
+        "in-flight",
+        "requests being served",
+        "1",
+        vec![attr("tier", str_value("edge"))],
+        vec![number_point(as_double(1.0))],
+    );
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![within])],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(AdmissionTime::from_unix_nano(99), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+    assert_eq!(harness.drain().len(), 1);
+}
+
 // ------------------------------------------------------------- delivery
 
 #[test]

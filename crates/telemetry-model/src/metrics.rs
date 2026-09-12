@@ -496,9 +496,16 @@ impl fmt::Display for StreamShapeError {
 
 impl std::error::Error for StreamShapeError {}
 
-/// The identity of a data point stream: resource, scope, name, kind,
-/// temporality. A delta stream and a cumulative stream with the same name
-/// have different identities; so do two kinds, two resources, two scopes.
+/// The identity of a data point stream: resource, scope, name, description,
+/// unit, metadata, kind, temporality. A delta stream and a cumulative
+/// stream with the same name have different identities; so do two kinds,
+/// two resources, two scopes — and so do two instruments that differ only
+/// in their description, unit or metadata. The descriptor is part of the
+/// identity because the contract preserves it verbatim (`absent is not
+/// empty`): two same-named metrics that differ there are two distinct
+/// streams, never a silent merge, and a re-delivery that differs there is
+/// a stream-identity conflict recorded by the admission ledger — the first
+/// descriptor stands.
 ///
 /// The resource's identity is its attribute map: `schema_url` is preserved
 /// metadata and never participates (see [`crate::resources::Resource`]).
@@ -510,10 +517,43 @@ pub struct StreamIdentity {
     pub scope: InstrumentationScope,
     /// The metric name, verbatim.
     pub name: String,
+    /// The metric description, as sent; `None` is absent and distinct from
+    /// empty. Part of the identity: it describes the stream and is
+    /// preserved verbatim, so two instruments differing only here are two
+    /// streams.
+    pub description: Option<String>,
+    /// The unit, opaque at the model level — no unit grammar is
+    /// interpreted here; `None` is absent and distinct from empty. Part of
+    /// the identity, like the description.
+    pub unit: Option<String>,
+    /// The metric's metadata (OTLP `Metric.metadata`), as sent: an
+    /// attribute map whose duplicate keys were refused at construction
+    /// like every other keyed container. Part of the identity.
+    pub metadata: Attributes,
     /// The stream kind, monotonicity included.
     pub kind: StreamKind,
     /// The stream temporality; `None` where the kind carries none.
     pub temporality: Option<Temporality>,
+}
+
+impl StreamIdentity {
+    /// The description, as sent; `None` is absent and distinct from empty.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// The unit, as sent; `None` is absent and distinct from empty.
+    #[must_use]
+    pub fn unit(&self) -> Option<&str> {
+        self.unit.as_deref()
+    }
+
+    /// The metric's metadata, as sent.
+    #[must_use]
+    pub const fn metadata(&self) -> &Attributes {
+        &self.metadata
+    }
 }
 
 /// The collapse identity of one data point: the stream it belongs to, the
@@ -577,22 +617,15 @@ impl PointIdentity {
     }
 }
 
-/// One metric stream: its identity (name, description, unit and metadata
-/// verbatim — absent is not empty — resource, scope, kind, temporality)
-/// and its points.
+/// One metric stream: its identity — name, description, unit and metadata
+/// verbatim (absent is not empty), resource, scope, kind, temporality —
+/// and its points. The descriptor lives on the identity: it is identity
+/// content, interning, accounting and collapsing with the stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MetricStream {
-    /// The stream identity: name, resource, scope, kind, temporality.
+    /// The stream identity: name, description, unit, metadata, resource,
+    /// scope, kind, temporality.
     pub identity: StreamIdentity,
-    /// The description, as sent; `None` is absent and distinct from empty.
-    pub description: Option<String>,
-    /// The unit, opaque at the model level — no unit grammar is
-    /// interpreted here; `None` is absent and distinct from empty.
-    pub unit: Option<String>,
-    /// The metric's metadata (OTLP `Metric.metadata`), as sent: an
-    /// attribute map whose duplicate keys were refused at construction
-    /// like every other keyed container.
-    pub metadata: Attributes,
     /// The stream's points, in the order the emitter sent them.
     pub points: Vec<MetricPoint>,
 }
@@ -608,9 +641,6 @@ impl MetricStream {
     /// the kind/temporality pair). Nothing is coerced or re-bucketed.
     pub fn new(
         identity: StreamIdentity,
-        description: Option<String>,
-        unit: Option<String>,
-        metadata: Attributes,
         points: Vec<MetricPoint>,
     ) -> Result<Self, StreamShapeError> {
         let kind = identity.kind;
@@ -629,13 +659,7 @@ impl MetricStream {
         for (index, point) in points.iter().enumerate() {
             Self::check_point_coherence(&identity, point, index)?;
         }
-        Ok(Self {
-            identity,
-            description,
-            unit,
-            metadata,
-            points,
-        })
+        Ok(Self { identity, points })
     }
 
     /// The shape law for one `(identity, point)` pair — the same law
@@ -701,6 +725,24 @@ impl MetricStream {
     pub fn name(&self) -> &str {
         &self.identity.name
     }
+
+    /// The description, as sent; `None` is absent and distinct from empty.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.identity.description()
+    }
+
+    /// The unit, as sent; `None` is absent and distinct from empty.
+    #[must_use]
+    pub fn unit(&self) -> Option<&str> {
+        self.identity.unit()
+    }
+
+    /// The metric's metadata, as sent.
+    #[must_use]
+    pub const fn metadata(&self) -> &Attributes {
+        self.identity.metadata()
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +791,9 @@ mod tests {
             resource: resource(),
             scope: scope(),
             name: "m".to_owned(),
+            description: Some(String::new()),
+            unit: Some("ms".to_owned()),
+            metadata: Attributes::default(),
             kind,
             temporality,
         }
@@ -761,14 +806,7 @@ mod tests {
     ) -> MetricStream {
         let mut id = identity(kind, temporality);
         id.name = "requests".to_owned();
-        MetricStream::new(
-            id,
-            Some(String::new()),
-            Some("ms".to_owned()),
-            Attributes::default(),
-            points,
-        )
-        .expect("a coherent stream")
+        MetricStream::new(id, points).expect("a coherent stream")
     }
 
     #[test]
@@ -794,6 +832,9 @@ mod tests {
             resource: resource(),
             scope: scope(),
             name: "requests".to_owned(),
+            description: None,
+            unit: None,
+            metadata: Attributes::default(),
             kind: StreamKind::Sum { monotonic: true },
             temporality: Some(Temporality::Delta),
         };
@@ -1074,9 +1115,6 @@ mod tests {
         ));
         let error = MetricStream::new(
             identity(StreamKind::Histogram, Some(Temporality::Cumulative)),
-            None,
-            None,
-            Attributes::default(),
             vec![number.clone()],
         )
         .expect_err("a histogram stream cannot carry a number point");
@@ -1110,9 +1148,6 @@ mod tests {
     fn a_stream_rejects_a_temporality_its_kind_cannot_carry() {
         let gauge_error = MetricStream::new(
             identity(StreamKind::Gauge, Some(Temporality::Delta)),
-            None,
-            None,
-            Attributes::default(),
             Vec::new(),
         )
         .expect_err("a gauge carries no temporality");
@@ -1125,9 +1160,6 @@ mod tests {
         );
         let sum_error = MetricStream::new(
             identity(StreamKind::Sum { monotonic: true }, None),
-            None,
-            None,
-            Attributes::default(),
             Vec::new(),
         )
         .expect_err("a sum carries a temporality");
@@ -1155,9 +1187,6 @@ mod tests {
                 StreamKind::Sum { monotonic: false },
                 Some(Temporality::Delta),
             ),
-            None,
-            None,
-            Attributes::default(),
             vec![number],
         )
         .expect_err("a sum point must carry its interval start");
@@ -1210,19 +1239,47 @@ mod tests {
             ("tier".to_owned(), Value::Int(2)),
         ])
         .expect("ok");
-        let stream = MetricStream::new(
-            identity(StreamKind::Gauge, None),
-            None,
-            None,
-            metadata.clone(),
-            Vec::new(),
-        )
-        .expect("a coherent stream");
-        assert_eq!(stream.metadata, metadata);
+        let mut id = identity(StreamKind::Gauge, None);
+        id.metadata = metadata.clone();
+        let stream = MetricStream::new(id, Vec::new()).expect("a coherent stream");
+        assert_eq!(stream.metadata(), &metadata);
         assert_eq!(
-            stream.metadata.get("tier"),
+            stream.identity.metadata.get("tier"),
             Some(&Value::Int(2)),
             "metadata rides on the stream verbatim"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_is_part_of_the_stream_identity() {
+        // The description, unit and metadata describe the stream and are
+        // preserved verbatim; two same-named instruments differing only
+        // there are two distinct streams — never a silent merge.
+        let plain = identity(StreamKind::Gauge, None);
+        let described = StreamIdentity {
+            description: Some("an in-flight gauge".to_owned()),
+            ..plain.clone()
+        };
+        let united = StreamIdentity {
+            unit: Some("s".to_owned()),
+            ..plain.clone()
+        };
+        let with_metadata = StreamIdentity {
+            metadata: Attributes::from_pairs(vec![("tier".to_owned(), Value::Int(1))])
+                .expect("unique keys"),
+            ..plain.clone()
+        };
+        assert_ne!(plain, described, "description is identity content");
+        assert_ne!(plain, united, "unit is identity content");
+        assert_ne!(plain, with_metadata, "metadata is identity content");
+        // Absent and empty stay distinct in identity, as everywhere.
+        let empty_described = StreamIdentity {
+            description: Some(String::new()),
+            ..described.clone()
+        };
+        assert_ne!(
+            described, empty_described,
+            "absent is not empty, in the identity like everywhere else"
         );
     }
 
@@ -1236,8 +1293,8 @@ mod tests {
         ));
         let stream = stream(StreamKind::Gauge, None, vec![gauge.clone()]);
         assert_eq!(stream.name(), "requests");
-        assert_eq!(stream.description, Some(String::new()), "empty ≠ absent");
-        assert_eq!(stream.unit, Some("ms".to_owned()));
+        assert_eq!(stream.description(), Some(""), "empty ≠ absent");
+        assert_eq!(stream.unit(), Some("ms"));
         assert_eq!(stream.points, vec![gauge]);
         let identity = stream.identity();
         assert_eq!(identity.kind, StreamKind::Gauge);
