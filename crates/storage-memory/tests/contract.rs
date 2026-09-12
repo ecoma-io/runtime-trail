@@ -8,27 +8,35 @@ mod common;
 use common::{admitted, at, boxed, gauge_point, log_record, span, stream};
 use runtime_trail_storage::{AdmissionKey, EvictionHook, KeepOutcome, TelemetryStore};
 use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
-use runtime_trail_telemetry_model::{AdmissionLedger, AdmissionOutcome, Admitted, EntityId, Span};
-use std::cell::RefCell;
-use std::rc::Rc;
+use runtime_trail_telemetry_model::{
+    Accounted, AdmissionLedger, AdmissionOutcome, Admitted, EntityId, Span,
+};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 /// The composition root's half of ADR 0008: the hook implemented over the
-/// real ledger's `forget`, so eviction ends identity exactly as the
-/// decision requires. The ledger is shared behind a handle because the
-/// hook slot is `'static` — the same shape a session-owned wiring takes.
-#[derive(Clone)]
-struct LedgerForgetter(Rc<RefCell<AdmissionLedger>>);
+/// real ledger's `forget` and `release_stream`, so identity ends exactly as
+/// the decision requires. The ledger is shared behind a `Send + Sync`
+/// handle because the hook must be both, the same way the store is: the
+/// runtime holds one across its tasks, and the bounds ride along.
+struct LedgerHook(Arc<Mutex<AdmissionLedger>>);
 
-impl EvictionHook for LedgerForgetter {
+impl EvictionHook for LedgerHook {
     fn evicted(&mut self, entity: EntityId) {
-        self.0.borrow_mut().forget(entity);
+        self.0.lock().expect("ledger lock poisoned").forget(entity);
+    }
+
+    fn stream_released(&mut self, stream: &Arc<runtime_trail_telemetry_model::StreamIdentity>) {
+        self.0
+            .lock()
+            .expect("ledger lock poisoned")
+            .release_stream(stream);
     }
 }
 
 /// A fresh shared ledger, the way the tests below hold one.
-fn shared_ledger() -> Rc<RefCell<AdmissionLedger>> {
-    Rc::new(RefCell::new(AdmissionLedger::default()))
+fn shared_ledger() -> Arc<Mutex<AdmissionLedger>> {
+    Arc::new(Mutex::new(AdmissionLedger::default()))
 }
 
 /// Admits a span through the ledger and returns its entity id with the
@@ -54,8 +62,10 @@ fn admit_span_to(ledger: &mut AdmissionLedger, s: Span) -> (EntityId, Admitted<A
 #[test]
 fn an_evicted_spans_redelivery_is_admitted_fresh_through_the_real_ledger() {
     let ledger = shared_ledger();
-    let (first_entity, first_handoff) =
-        admit_span_to(&mut ledger.borrow_mut(), span([7; 16], [8; 8], "op"));
+    let (first_entity, first_handoff) = admit_span_to(
+        &mut ledger.lock().expect("ledger lock poisoned"),
+        span([7; 16], [8; 8], "op"),
+    );
     let second_entity = EntityId::Span {
         trace_id: runtime_trail_telemetry_model::TraceId::from_bytes([9; 16]),
         span_id: runtime_trail_telemetry_model::SpanId::from_bytes([9; 8]),
@@ -66,7 +76,7 @@ fn an_evicted_spans_redelivery_is_admitted_fresh_through_the_real_ledger() {
                 max_records: 1,
                 ..MemoryConfig::default()
             },
-            Some(Box::new(LedgerForgetter(Rc::clone(&ledger)))),
+            Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
         );
         assert_eq!(
             store.keep_span(first_handoff),
@@ -77,7 +87,10 @@ fn an_evicted_spans_redelivery_is_admitted_fresh_through_the_real_ledger() {
         let _ = store.keep_span(admitted(second_entity, 200, span([9; 16], [9; 8], "later")));
     }
     // The store is gone and the hook with it; re-deliver the first span.
-    let redelivery = ledger.borrow_mut().admit_span(span([7; 16], [8; 8], "op"));
+    let redelivery = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_span(span([7; 16], [8; 8], "op"));
     assert_eq!(
         redelivery.outcome,
         AdmissionOutcome::Admitted {
@@ -95,14 +108,16 @@ fn an_evicted_points_redelivery_gets_a_new_serial_through_the_real_ledger() {
     let ledger = shared_ledger();
 
     let first_admission = ledger
-        .borrow_mut()
+        .lock()
+        .expect("ledger lock poisoned")
         .admit_metric_point(&identity, gauge_point(50, 1));
     let first = first_admission.outcome.entity().expect("the point admits");
     let first_stream = first_admission.stream.expect("interned");
     let first_record = first_admission.record.expect("shared");
 
     let second_admission = ledger
-        .borrow_mut()
+        .lock()
+        .expect("ledger lock poisoned")
         .admit_metric_point(&identity, gauge_point(60, 2));
     let second = second_admission.outcome.entity().expect("the point admits");
     let second_record = second_admission.record.expect("shared");
@@ -113,7 +128,7 @@ fn an_evicted_points_redelivery_gets_a_new_serial_through_the_real_ledger() {
                 max_records: 1,
                 ..MemoryConfig::default()
             },
-            Some(Box::new(LedgerForgetter(Rc::clone(&ledger)))),
+            Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
         );
         let _ = store.keep_metric_point(
             Admitted {
@@ -134,7 +149,8 @@ fn an_evicted_points_redelivery_gets_a_new_serial_through_the_real_ledger() {
         );
     }
     let redelivery = ledger
-        .borrow_mut()
+        .lock()
+        .expect("ledger lock poisoned")
         .admit_metric_point(&identity, gauge_point(50, 1))
         .outcome;
     let AdmissionOutcome::Admitted { entity: fresh } = redelivery else {
@@ -391,4 +407,274 @@ fn the_driver_reports_its_mode_name() {
     assert_eq!(store.mode_name(), "memory");
     let boxed_store = boxed(MemoryConfig::default(), None);
     assert_eq!(TelemetryStore::mode_name(boxed_store.as_ref()), "memory");
+}
+
+/// Admits a metric point through the shared ledger and returns its entity
+/// id, the interned stream, and the shared payload for a store hand-off.
+fn admit_point_to(
+    ledger: &Mutex<AdmissionLedger>,
+    identity: &runtime_trail_telemetry_model::StreamIdentity,
+    point: runtime_trail_telemetry_model::MetricPoint,
+    nano: u64,
+) -> (
+    EntityId,
+    Arc<runtime_trail_telemetry_model::StreamIdentity>,
+    Admitted<Arc<runtime_trail_telemetry_model::MetricPoint>>,
+) {
+    let admission = ledger
+        .lock()
+        .expect("ledger lock poisoned")
+        .admit_metric_point(identity, point);
+    let entity = admission
+        .outcome
+        .entity()
+        .expect("the fixture point admits");
+    let interned = admission.stream.expect("the stream interns");
+    let record = admission.record.expect("the admitted payload is shared");
+    (
+        entity,
+        interned,
+        Admitted {
+            entity,
+            admitted_at: at(nano),
+            record,
+        },
+    )
+}
+
+/// The store tells the hook when a stream's residency ends: the ledger
+/// keeps the identity while any point of the stream stands, drops it
+/// exactly with the last point, and a re-delivery after that re-interns
+/// fresh.
+#[test]
+fn the_store_releases_a_stream_only_when_its_last_point_leaves() {
+    let identity = stream();
+    let ledger = shared_ledger();
+    let mut store = boxed(
+        MemoryConfig {
+            max_records: 1,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(LedgerHook(Arc::clone(&ledger)))),
+    );
+    let (first, interned, first_handoff) =
+        admit_point_to(&ledger, &identity, gauge_point(10, 1), 100);
+    let (second_entity, interned_again, second_handoff) =
+        admit_point_to(&ledger, &identity, gauge_point(20, 2), 200);
+    // One content, one interning: the second admission collapsed onto the
+    // first stream's Arc.
+    assert!(Arc::ptr_eq(&interned, &interned_again));
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        1
+    );
+
+    let _ = store.keep_metric_point(first_handoff, interned);
+    let _ = store.keep_metric_point(second_handoff, interned_again);
+    // The second keep evicted the first point; the stream survives it,
+    // because its last point is still resident.
+    assert!(store.metric_point(first).is_none());
+    assert!(store.metric_point(second_entity).is_some());
+    assert_eq!(store.stats().total_evictions(), 1);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        1,
+        "no release while a point stands"
+    );
+
+    // A retention pass a window past the last point's admission ends the
+    // stream: the hook releases the identity out of the ledger.
+    let window_nanos =
+        u64::try_from(MemoryConfig::default().admission_window.as_nanos()).expect("window fits");
+    assert_eq!(store.enforce_retention(at(200 + window_nanos)), 1);
+    assert_eq!(
+        ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .resident_streams(),
+        0,
+        "the last point's exit released the stream"
+    );
+    assert!(store.metric_point(second_entity).is_none());
+
+    // A re-delivery re-interns the stream: a fresh allocation, not the
+    // one the release dropped.
+    let (_, re_interned, _) = admit_point_to(&ledger, &identity, gauge_point(30, 3), 300);
+    assert!(
+        !Arc::ptr_eq(&re_interned, &identity),
+        "the re-delivery interns fresh, it does not resurrect the released Arc"
+    );
+}
+
+/// A hook that panics on its first delivery and answers the rest cleanly,
+/// so one test holds both the broken hook and the control. The store's
+/// own removal completes BEFORE the hook runs, and a panic inside the
+/// hook propagates only after the store is consistent: the record is
+/// gone, the eviction is counted, the delivery is not.
+struct PanickingHook {
+    panicked: bool,
+}
+
+impl EvictionHook for PanickingHook {
+    fn evicted(&mut self, _entity: EntityId) {
+        if self.panicked {
+            return; // the control delivery: quiet, clean
+        }
+        self.panicked = true;
+        panic!("the record hook is broken");
+    }
+
+    fn stream_released(&mut self, _stream: &Arc<runtime_trail_telemetry_model::StreamIdentity>) {
+        // A log record's removal retires no stream; nothing runs here.
+    }
+}
+
+#[test]
+fn a_panicking_hook_leaves_a_consistent_store_behind() {
+    let mut store = boxed(
+        MemoryConfig {
+            max_records: 1,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(PanickingHook { panicked: false })),
+    );
+    let first = common::assigned(1);
+    let _ = store.keep_log_record(admitted(first, 100, log_record("first")));
+    let second = common::assigned(2);
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.keep_log_record(admitted(second, 200, log_record("second")))
+    }));
+    std::panic::set_hook(previous_hook);
+    assert!(
+        outcome.is_err(),
+        "the hook's panic propagates to the caller"
+    );
+
+    // The removal completed before the hook ran; the delivery did not.
+    // The keep's own insert had completed before the panic too, so the
+    // incoming record stands.
+    let stats = store.stats();
+    assert_eq!(stats.total_evictions(), 1, "the eviction itself is counted");
+    assert_eq!(
+        stats.hook_deliveries, 0,
+        "a hook that panicked delivered nothing: the divergence is observable"
+    );
+    assert!(store.log_record(first).is_none(), "the record is gone");
+    assert_eq!(stats.resident_records, 1);
+    assert_eq!(
+        stats.accounted_bytes,
+        u64::try_from(log_record("second").accounted_size()).expect("fits"),
+        "the accounting names exactly the record the aborted keep left"
+    );
+
+    // The control: the next eviction delivers cleanly and its keep
+    // completes.
+    let third = common::assigned(3);
+    let control = store.keep_log_record(admitted(third, 300, log_record("third")));
+    assert_eq!(control, KeepOutcome::Kept { evicted: 1 });
+    assert!(store.log_record(third).is_some());
+    assert!(store.log_record(second).is_none());
+    let stats = store.stats();
+    assert_eq!(stats.total_evictions(), 2);
+    assert_eq!(
+        stats.hook_deliveries, 1,
+        "the control delivery completed; the gap closes to one missing call"
+    );
+}
+
+/// A duplicate keep of a metric point leaves the resident point standing
+/// and counts the attempt; the stream's identity charge does not double.
+#[test]
+fn a_duplicate_metric_point_keep_leaves_the_resident_point_standing() {
+    let identity = stream();
+    let mut store = boxed(MemoryConfig::default(), None);
+    let entity = common::assigned(1);
+    let _ = store.keep_metric_point(
+        admitted(entity, 100, gauge_point(90, 1)),
+        Arc::clone(&identity),
+    );
+    let before = store.stats();
+
+    let outcome = store.keep_metric_point(
+        admitted(entity, 400, gauge_point(90, 1)),
+        Arc::clone(&identity),
+    );
+    assert_eq!(outcome, KeepOutcome::Duplicate);
+    let after = store.stats();
+    assert_eq!(after.resident_metric_points, before.resident_metric_points);
+    assert_eq!(
+        after.accounted_bytes, before.accounted_bytes,
+        "neither the point nor the stream is charged twice"
+    );
+    assert_eq!(after.resident_streams, before.resident_streams);
+    assert_eq!(after.total_evictions(), 0);
+    assert_eq!(after.duplicate_keeps, before.duplicate_keeps + 1);
+}
+
+/// The string bodies of a scan page, for the walk assertions.
+fn bodies(
+    page: &runtime_trail_storage::ScanPage<Arc<runtime_trail_telemetry_model::LogRecord>>,
+) -> Vec<String> {
+    page.items
+        .iter()
+        .map(|record| match &record.body {
+            Some(runtime_trail_telemetry_model::Value::String(body)) => body.clone(),
+            _ => panic!("fixture bodies are strings"),
+        })
+        .collect()
+}
+
+/// A scan is a view over a living store: a cursor taken before an
+/// eviction continues from where it was, skipping what left and never
+/// repeating what stayed.
+#[test]
+fn a_cursor_continues_across_an_eviction_without_skips_or_repeats() {
+    let mut store = boxed(
+        MemoryConfig {
+            max_records: 3,
+            ..MemoryConfig::default()
+        },
+        None,
+    );
+    for serial in 1..=3_u64 {
+        let _ = store.keep_log_record(admitted(
+            common::assigned(serial),
+            serial * 100,
+            log_record(&format!("r{serial}")),
+        ));
+    }
+    // Page one holds the oldest record; its cursor names it.
+    let first_page = store.scan_log_records(None, 1);
+    assert_eq!(bodies(&first_page), vec!["r1".to_owned()]);
+
+    // A keep evicts that same oldest record while the caller holds the
+    // cursor to it.
+    let _ = store.keep_log_record(admitted(common::assigned(4), 400, log_record("r4")));
+    assert!(store.log_record(common::assigned(1)).is_none());
+
+    // The walk continues strictly after the cursor's key: r1 is gone and
+    // simply absent, everything resident is yielded exactly once.
+    let mut seen = Vec::new();
+    let mut cursor = first_page.cursor;
+    loop {
+        let page = store.scan_log_records(cursor, 2);
+        seen.extend(bodies(&page));
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        vec!["r2".to_owned(), "r3".to_owned(), "r4".to_owned()]
+    );
 }

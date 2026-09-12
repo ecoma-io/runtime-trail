@@ -4,7 +4,7 @@
 //! through the concrete type.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use runtime_trail_storage::{EvictionHook, TelemetryStore};
 use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
@@ -140,6 +140,57 @@ pub fn stream() -> Arc<StreamIdentity> {
     })
 }
 
+/// A stream identity named `name`, empty otherwise — the smallest legal
+/// content, for tests that count streams rather than their bytes.
+#[must_use]
+pub fn bare_stream(name: &str) -> Arc<StreamIdentity> {
+    Arc::new(StreamIdentity {
+        resource: Resource {
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        },
+        scope: InstrumentationScope {
+            name: String::new(),
+            version: None,
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        },
+        name: name.to_owned(),
+        kind: StreamKind::Gauge,
+        temporality: None,
+    })
+}
+
+/// A stream identity whose **resource** carries `attributes` attributes of
+/// `value_bytes` payload bytes each — the reviewer's probe shape: many
+/// distinct streams, each pinning large legal identity content that a
+/// per-point formula never sees.
+#[must_use]
+pub fn heavy_stream(name: &str, attributes: usize, value_bytes: usize) -> Arc<StreamIdentity> {
+    let pairs: Vec<(String, Value)> = (0..attributes)
+        .map(|index| (format!("k{index}"), Value::String("x".repeat(value_bytes))))
+        .collect();
+    Arc::new(StreamIdentity {
+        resource: Resource {
+            attributes: Attributes::from_pairs(pairs).expect("unique keys"),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        },
+        scope: InstrumentationScope {
+            name: String::new(),
+            version: None,
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        },
+        name: name.to_owned(),
+        kind: StreamKind::Gauge,
+        temporality: None,
+    })
+}
+
 /// An admitted record: entity, admission time, shared payload — the exact
 /// hand-off ingestion makes.
 #[must_use]
@@ -157,14 +208,45 @@ pub fn boxed(config: MemoryConfig, hook: Option<Box<dyn EvictionHook>>) -> Box<d
     Box::new(InMemoryStore::new(config, hook))
 }
 
-/// A hook that records every eviction, in eviction order.
+/// A hook that records every removal report, in the order the store
+/// delivered it: evicted records and, separately, the streams whose last
+/// resident point went with them.
 #[derive(Debug, Default)]
 pub struct RecordingHook {
     pub evicted: Vec<EntityId>,
+    pub streams_released: Vec<Arc<StreamIdentity>>,
 }
 
 impl EvictionHook for RecordingHook {
     fn evicted(&mut self, entity: EntityId) {
         self.evicted.push(entity);
+    }
+
+    fn stream_released(&mut self, stream: &Arc<StreamIdentity>) {
+        self.streams_released.push(Arc::clone(stream));
+    }
+}
+
+/// A hook whose recording is shared with the test through a `Send + Sync`
+/// handle: the test reads what the store delivered while the store, and
+/// the boxed hook, still live.
+#[derive(Debug, Default, Clone)]
+pub struct SharedRecordingHook(pub Arc<Mutex<RecordingHook>>);
+
+impl EvictionHook for SharedRecordingHook {
+    fn evicted(&mut self, entity: EntityId) {
+        self.0
+            .lock()
+            .expect("hook lock poisoned")
+            .evicted
+            .push(entity);
+    }
+
+    fn stream_released(&mut self, stream: &Arc<StreamIdentity>) {
+        self.0
+            .lock()
+            .expect("hook lock poisoned")
+            .streams_released
+            .push(Arc::clone(stream));
     }
 }

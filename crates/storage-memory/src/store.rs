@@ -9,6 +9,7 @@
 //! there is no I/O: a keep is a map insert plus the retention pass, plain
 //! memory work on the caller's thread.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use runtime_trail_storage::{
@@ -31,11 +32,12 @@ struct PointSlot {
 }
 
 impl Accounted for PointSlot {
-    /// The point's accounted size. The stream identity is interned — one
-    /// allocation shared by the ledger, the store and every point of the
-    /// stream (ADR 0008) — so counting it per point would multiply it by
-    /// residency; it is interning overhead outside the accounted ceilings,
-    /// exactly like the ledger's per-record entries.
+    /// The point's accounted size only. The stream identity is charged to
+    /// the byte ceiling by the store's series table — exactly once per
+    /// distinct resident stream, never per point — so counting it here
+    /// would multiply it by the stream's residency; counting it nowhere
+    /// would let a session of single-point streams park identity content
+    /// under a ceiling that only saw the points.
     fn accounted_size(&self) -> usize {
         self.point.accounted_size()
     }
@@ -49,19 +51,30 @@ struct Counters {
     evicted_for_admission_window: u64,
     oversized_refusals: u64,
     duplicate_keeps: u64,
+    kept_out_series_cap: u64,
+    hook_deliveries: u64,
 }
 
 /// The in-memory store.
 ///
 /// Built once with its [`MemoryConfig`] and — optionally — the
 /// [`EvictionHook`] the composition root wires to the admission ledger's
-/// `forget`, so a record's identity ends exactly when its residency does
-/// (ADR 0008). Ceilings are checked after every keep and on every
+/// `forget` and `release_stream`, so identity ends exactly when residency
+/// does (ADR 0008). Ceilings are checked after every keep and on every
 /// [`TelemetryStore::enforce_retention`] pass; when any is exceeded the
 /// oldest record is evicted — smallest [`AdmissionKey`] — until all are
 /// satisfied again. Each eviction is attributed to the first ceiling found
 /// violated at that moment, so "first ceiling hit wins" is observable per
 /// record, and the hook fires for it.
+///
+/// The byte ceiling bounds **what residency pins**: the shelves' record
+/// sums plus each distinct resident stream's identity accounted size,
+/// charged once by the [`InMemoryStore`] `series` table when the stream's
+/// first point enters residency and released when its last point leaves —
+/// the same removal that reports [`EvictionHook::stream_released`]. The
+/// series cap bounds how many streams may be resident at all: a keep
+/// establishing a new stream beyond it is refused
+/// (`KeepOutcome::SeriesCapReached`), never evicting for it.
 pub struct InMemoryStore {
     config: MemoryConfig,
     window_nanos: u64,
@@ -69,6 +82,15 @@ pub struct InMemoryStore {
     spans: Shelf<Span>,
     logs: Shelf<LogRecord>,
     points: Shelf<PointSlot>,
+    /// Distinct resident streams and how many resident points reference
+    /// each: the series residency count. Keys are the interned identities
+    /// the points arrived with, compared by content (the model's identity
+    /// law) — a stream enters when its first point is charged and leaves
+    /// when its last point is released.
+    series: HashMap<Arc<StreamIdentity>, u64>,
+    /// The identities' share of the byte ceiling: each series entry's
+    /// accounted size, counted once.
+    identity_accounted_bytes: u64,
     counters: Counters,
     anomalies: u64,
 }
@@ -77,8 +99,8 @@ impl InMemoryStore {
     /// The mode name surfaces report for this driver.
     pub const NAME: &'static str = "memory";
 
-    /// An empty store bounded by `config`, reporting evictions through
-    /// `hook` when one is wired.
+    /// An empty store bounded by `config`, reporting evictions and stream
+    /// releases through `hook` when one is wired.
     #[must_use]
     pub fn new(config: MemoryConfig, hook: Option<Box<dyn EvictionHook>>) -> Self {
         let window_nanos = u64::try_from(config.admission_window.as_nanos()).unwrap_or(u64::MAX);
@@ -89,6 +111,8 @@ impl InMemoryStore {
             spans: Shelf::new(),
             logs: Shelf::new(),
             points: Shelf::new(),
+            series: HashMap::new(),
+            identity_accounted_bytes: 0,
             counters: Counters::default(),
             anomalies: 0,
         }
@@ -124,10 +148,14 @@ impl InMemoryStore {
         .min();
         // The window compares admission times only: the oldest resident
         // record is expired when `now` is at least one window past its
-        // admission.
+        // admission. A reference reading *behind* the record's admission
+        // is a non-monotonic caller clock; the age has no meaning there,
+        // so it expires nothing rather than collapsing through a
+        // saturating subtraction into a bogus full-window age.
         let expired = oldest?.admitted_at().as_unix_nano();
-        let now_nanos = now.as_unix_nano();
-        (now_nanos.saturating_sub(expired) >= self.window_nanos)
+        now.as_unix_nano()
+            .checked_sub(expired)
+            .is_some_and(|age| age >= self.window_nanos)
             .then_some(EvictionCause::AdmissionWindow)
     }
 
@@ -135,11 +163,11 @@ impl InMemoryStore {
     /// oldest record for as long as any ceiling is violated. Each eviction
     /// is counted under the cause that triggered it and reported through
     /// the hook, so identity-keeping wiring sees exactly what residency
-    /// ended.
+    /// ended — including streams whose last resident point went with it.
     fn enforce_against(&mut self, now: AdmissionTime) -> u64 {
         let mut evicted = 0;
         while let Some(cause) = self.first_violation(now) {
-            let Some(key) = self.pop_oldest() else {
+            let Some((key, released)) = self.pop_oldest() else {
                 break;
             };
             match cause {
@@ -149,19 +177,33 @@ impl InMemoryStore {
                 }
                 EvictionCause::AdmissionWindow => self.counters.evicted_for_admission_window += 1,
             }
+            evicted += 1;
+            // The store's own removal — shelves, entity index, stream
+            // table, counters — is complete above. The hook runs after it
+            // and must not panic (`EvictionHook` owns that law): the
+            // record is reported first, then the stream its removal
+            // retired, if that removal was the stream's last resident
+            // point. A delivery is counted only once its call has
+            // returned, so a panicking hook shows up as the gap between
+            // `total_evictions()` and `hook_deliveries`.
             if let Some(hook) = self.hook.as_mut() {
                 hook.evicted(key.entity());
+                self.counters.hook_deliveries += 1;
             }
-            evicted += 1;
+            if let (Some(hook), Some(stream)) = (self.hook.as_mut(), released.as_ref()) {
+                hook.stream_released(stream);
+            }
         }
         evicted
     }
 
     /// Removes the oldest record from whichever shelf holds it and returns
-    /// its key. The three shelves cannot hold equal keys — an entity id
-    /// names exactly one resident record — so the minimum picks exactly
-    /// one shelf.
-    fn pop_oldest(&mut self) -> Option<AdmissionKey> {
+    /// its key together with the stream the removal retired — `Some` when
+    /// the record was a metric point whose stream just lost its last
+    /// resident point. The three shelves cannot hold equal keys — an
+    /// entity id names exactly one resident record — so the minimum picks
+    /// exactly one shelf.
+    fn pop_oldest(&mut self) -> Option<(AdmissionKey, Option<Arc<StreamIdentity>>)> {
         let oldest = [
             self.spans.smallest_key(),
             self.logs.smallest_key(),
@@ -171,12 +213,57 @@ impl InMemoryStore {
         .flatten()
         .min()?;
         if Some(oldest) == self.spans.smallest_key() {
-            return self.spans.pop_smallest().map(|(key, _)| key);
+            return self.spans.pop_smallest().map(|(key, _)| (key, None));
         }
         if Some(oldest) == self.logs.smallest_key() {
-            return self.logs.pop_smallest().map(|(key, _)| key);
+            return self.logs.pop_smallest().map(|(key, _)| (key, None));
         }
-        self.points.pop_smallest().map(|(key, _)| key)
+        let (key, slot) = self.points.pop_smallest()?;
+        let retired = self.release_stream_ref(&slot.stream);
+        Some((key, retired.then(|| Arc::clone(&slot.stream))))
+    }
+
+    /// Charges one entering point to its stream: the stream's residency
+    /// count grows by one, and the identity's accounted size joins the
+    /// byte ceiling exactly when that count leaves zero — the stream's
+    /// first resident point.
+    fn charge_stream(&mut self, stream: &Arc<StreamIdentity>) {
+        let count = self.series.entry(Arc::clone(stream)).or_insert(0);
+        if *count == 0 {
+            self.identity_accounted_bytes = self
+                .identity_accounted_bytes
+                .saturating_add(accounted_u64(stream.as_ref()));
+        }
+        *count += 1;
+    }
+
+    /// Releases one removed point's residency of its stream: the count
+    /// drops by one, and when it reaches zero — the stream's last resident
+    /// point is gone — the identity's charge leaves the ceiling and the
+    /// caller is told to report the release. Returns `false` (changing
+    /// nothing) for a stream the store is not tracking, which cannot
+    /// happen for a slot the store built.
+    fn release_stream_ref(&mut self, stream: &Arc<StreamIdentity>) -> bool {
+        let retired = match self.series.get_mut(stream) {
+            Some(count) => {
+                *count -= 1;
+                *count == 0
+            }
+            None => false,
+        };
+        if retired {
+            self.series.remove(stream);
+            self.identity_accounted_bytes = self
+                .identity_accounted_bytes
+                .saturating_sub(accounted_u64(stream.as_ref()));
+        }
+        retired
+    }
+
+    /// Distinct streams with resident points — the number the series cap
+    /// bounds.
+    fn resident_streams(&self) -> u64 {
+        u64::try_from(self.series.len()).unwrap_or(u64::MAX)
     }
 
     /// Records currently resident, all shelves together.
@@ -185,10 +272,16 @@ impl InMemoryStore {
         u64::try_from(total).unwrap_or(u64::MAX)
     }
 
-    /// Accounted bytes currently resident, summed over the shelves. A
-    /// point's interned stream identity is shared, not copied, so it is
-    /// interning overhead outside the ceilings (see [`PointSlot`]).
+    /// Accounted bytes currently resident — what the byte ceiling bounds:
+    /// the shelves' record sums plus each distinct resident stream's
+    /// identity, charged once by the series table.
     fn accounted_bytes(&self) -> u64 {
+        self.record_accounted_bytes()
+            .saturating_add(self.identity_accounted_bytes)
+    }
+
+    /// The shelves' record sums, without the identity charge.
+    fn record_accounted_bytes(&self) -> u64 {
         self.spans
             .accounted_bytes()
             .saturating_add(self.logs.accounted_bytes())
@@ -201,12 +294,17 @@ impl InMemoryStore {
             resident_spans: u64::try_from(self.spans.len()).unwrap_or(u64::MAX),
             resident_log_records: u64::try_from(self.logs.len()).unwrap_or(u64::MAX),
             resident_metric_points: u64::try_from(self.points.len()).unwrap_or(u64::MAX),
+            resident_streams: self.resident_streams(),
             accounted_bytes: self.accounted_bytes(),
+            record_accounted_bytes: self.record_accounted_bytes(),
+            identity_accounted_bytes: self.identity_accounted_bytes,
             evicted_for_record_ceiling: self.counters.evicted_for_record_ceiling,
             evicted_for_accounted_bytes_ceiling: self.counters.evicted_for_accounted_bytes_ceiling,
             evicted_for_admission_window: self.counters.evicted_for_admission_window,
             oversized_refusals: self.counters.oversized_refusals,
             duplicate_keeps: self.counters.duplicate_keeps,
+            kept_out_series_cap: self.counters.kept_out_series_cap,
+            hook_deliveries: self.counters.hook_deliveries,
             admission_anomalies: self.anomalies,
         }
     }
@@ -218,7 +316,30 @@ fn accounted_u64(record: &(impl Accounted + ?Sized)) -> u64 {
     u64::try_from(record.accounted_size()).unwrap_or(u64::MAX)
 }
 
-/// The shared keep sequence: the size refusal, the duplicate refusal, the
+/// The refusals every keep runs before anything is inserted: the record's
+/// own accounted size against the byte ceiling (no amount of eviction
+/// could keep it), then the duplicate check (the resident record stands).
+/// The series-cap refusal is the metric-point keep's alone; it runs after
+/// these, also before any insert.
+fn refuse_early<R: Accounted>(
+    shelf: &Shelf<R>,
+    entity: EntityId,
+    size: u64,
+    max_accounted_bytes: u64,
+    counters: &mut Counters,
+) -> Result<(), KeepOutcome> {
+    if size > max_accounted_bytes {
+        counters.oversized_refusals += 1;
+        return Err(KeepOutcome::Oversized);
+    }
+    if shelf.contains(entity) {
+        counters.duplicate_keeps += 1;
+        return Err(KeepOutcome::Duplicate);
+    }
+    Ok(())
+}
+
+/// The shared keep sequence for spans and logs: the early refusals, the
 /// insert. Returns `Ok(the reference now for the retention pass)` when the
 /// record entered residency, `Err(the counted outcome)` when it was
 /// refused; the caller runs the retention pass itself, so every kind's
@@ -230,14 +351,7 @@ fn keep_on_shelf<R: Accounted>(
     max_accounted_bytes: u64,
     counters: &mut Counters,
 ) -> Result<AdmissionTime, KeepOutcome> {
-    if size > max_accounted_bytes {
-        counters.oversized_refusals += 1;
-        return Err(KeepOutcome::Oversized);
-    }
-    if shelf.contains(admitted.entity) {
-        counters.duplicate_keeps += 1;
-        return Err(KeepOutcome::Duplicate);
-    }
+    refuse_early(shelf, admitted.entity, size, max_accounted_bytes, counters)?;
     let now = admitted.admitted_at;
     shelf.insert(admitted);
     Ok(now)
@@ -281,27 +395,40 @@ impl TelemetryStore for InMemoryStore {
         admitted: Admitted<Arc<MetricPoint>>,
         stream: Arc<StreamIdentity>,
     ) -> KeepOutcome {
+        // The refusals run before anything is built: oversized and
+        // duplicate like every kind, then the series cap — a keep that
+        // would establish a NEW distinct stream while the cap is already
+        // full is refused without evicting anything. Only after all of
+        // them is the slot allocated, so a refused keep costs no heap.
         let size = accounted_u64(admitted.record.as_ref());
-        let slot = PointSlot {
-            point: admitted.record,
-            stream,
-        };
-        let admitted = Admitted {
-            entity: admitted.entity,
-            admitted_at: admitted.admitted_at,
-            record: Arc::new(slot),
-        };
-        match keep_on_shelf(
-            &mut self.points,
-            admitted,
+        if let Err(outcome) = refuse_early(
+            &self.points,
+            admitted.entity,
             size,
             self.config.max_accounted_bytes,
             &mut self.counters,
         ) {
-            Ok(now) => KeepOutcome::Kept {
-                evicted: self.enforce_against(now),
-            },
-            Err(outcome) => outcome,
+            return outcome;
+        }
+        if !self.series.contains_key(stream.as_ref())
+            && self.resident_streams() >= self.config.series_cap
+        {
+            self.counters.kept_out_series_cap += 1;
+            return KeepOutcome::SeriesCapReached;
+        }
+        let slot = Arc::new(PointSlot {
+            point: admitted.record,
+            stream: Arc::clone(&stream),
+        });
+        let now = admitted.admitted_at;
+        self.points.insert(Admitted {
+            entity: admitted.entity,
+            admitted_at: now,
+            record: slot,
+        });
+        self.charge_stream(&stream);
+        KeepOutcome::Kept {
+            evicted: self.enforce_against(now),
         }
     }
 

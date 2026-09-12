@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{RecordingHook, admitted, assigned, at, boxed, log_record, span};
+use common::{RecordingHook, SharedRecordingHook, admitted, assigned, at, boxed, log_record, span};
 use runtime_trail_storage::KeepOutcome;
 use runtime_trail_storage_memory::MemoryConfig;
 use runtime_trail_telemetry_model::{Accounted, EntityId};
@@ -268,6 +268,7 @@ fn a_mixed_sequence_is_attributed_cause_by_cause() {
             max_records: 3,
             max_accounted_bytes: u64::try_from(small * 4).expect("fits"),
             admission_window: window,
+            ..MemoryConfig::default()
         },
         None,
     );
@@ -302,4 +303,166 @@ fn a_mixed_sequence_is_attributed_cause_by_cause() {
     assert_eq!(stats.total_evictions(), 4);
     assert_eq!(stats.resident_records, 0);
     assert_eq!(stats.accounted_bytes, 0);
+}
+
+/// One keep pays its whole eviction debt to the ceiling that fired: a
+/// record three units wide arrives at a ceiling holding four, and the
+/// keep evicts the three oldest records, all attributed to the byte
+/// ceiling, all reported on the outcome, oldest first through the hook.
+#[test]
+fn one_keep_pays_its_whole_eviction_debt_to_the_ceiling_it_hit() {
+    let unit_record = log_record("0123456789");
+    let unit = u64::try_from(unit_record.accounted_size()).expect("fits");
+    // Body length chosen so the big record is exactly three units wide,
+    // whatever the record formula's fixed part is.
+    let big_record = log_record(&"x".repeat(usize::try_from(unit * 2 + 10).expect("fits")));
+    let big_size = u64::try_from(big_record.accounted_size()).expect("fits");
+    // The ceiling holds the four unit records and no more.
+    let ceiling = unit * 5 - 1;
+    // Evictions the big keep owes: the smallest count whose removal fits.
+    let owed = (unit * 4 + big_size - ceiling).div_ceil(unit);
+    assert!(
+        owed >= 2,
+        "the fixture must demand several evictions: {owed}"
+    );
+
+    let hook = SharedRecordingHook::default();
+    let mut store = boxed(
+        MemoryConfig {
+            max_records: u64::MAX,
+            max_accounted_bytes: ceiling,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(hook.clone())),
+    );
+    let entities = [assigned(1), assigned(2), assigned(3), assigned(4)];
+    for (index, entity) in entities.iter().enumerate() {
+        let _ = store.keep_log_record(admitted(
+            *entity,
+            (index as u64 + 1) * 100,
+            unit_record.clone(),
+        ));
+    }
+    assert_eq!(store.stats().resident_records, 4);
+    assert!(store.stats().accounted_bytes <= ceiling);
+
+    let big_entity = assigned(5);
+    let outcome = store.keep_log_record(admitted(big_entity, 500, big_record));
+    assert!(matches!(outcome, KeepOutcome::Kept { evicted } if evicted == owed));
+    let stats = store.stats();
+    assert_eq!(
+        stats.evicted_for_accounted_bytes_ceiling, owed,
+        "every eviction the keep owed is the byte ceiling's"
+    );
+    assert_eq!(stats.evicted_for_record_ceiling, 0);
+    assert_eq!(
+        stats.resident_records, 2,
+        "the big record and the newest unit"
+    );
+    assert!(store.log_record(entities[0]).is_none());
+    assert!(store.log_record(entities[1]).is_none());
+    assert!(store.log_record(entities[2]).is_none());
+    assert!(store.log_record(entities[3]).is_some());
+    assert!(store.log_record(big_entity).is_some());
+    assert!(
+        stats.accounted_bytes <= ceiling,
+        "the ceiling holds after the debt is paid"
+    );
+    // The hook saw the debt oldest first, one delivery per eviction.
+    let hook = hook.0.lock().expect("hook lock poisoned");
+    assert_eq!(hook.evicted, entities[..3].to_vec());
+    drop(hook);
+    assert_eq!(store.stats().hook_deliveries, owed);
+}
+
+/// A reference reading behind the clock expires nothing and counts
+/// nothing; a record admitted behind the clock is legal residency that
+/// orders first.
+#[test]
+fn a_backwards_reading_expires_nothing_and_a_backwards_admission_orders_first() {
+    let window = std::time::Duration::from_secs(60);
+    let mut store = boxed(
+        MemoryConfig {
+            admission_window: window,
+            ..MemoryConfig::default()
+        },
+        None,
+    );
+    let later = assigned(1);
+    let _ = store.keep_log_record(admitted(later, 60_000_000_000, log_record("later")));
+    // The composition root's reading runs backwards relative to the
+    // record's admission: an age that cannot be computed expires nothing.
+    assert_eq!(store.enforce_retention(at(0)), 0);
+    assert!(store.log_record(later).is_some());
+    assert_eq!(store.stats().total_evictions(), 0);
+    assert_eq!(store.stats().evicted_for_admission_window, 0);
+
+    // A record admitted behind the clock is simply the oldest resident
+    // record: first out, first scanned.
+    let earlier = assigned(2);
+    let outcome = store.keep_log_record(admitted(earlier, 0, log_record("earlier")));
+    assert!(matches!(outcome, KeepOutcome::Kept { evicted: 0 }));
+    let page = store.scan_log_records(None, 1);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        store.log_record(earlier).as_deref(),
+        page.items.first().map(std::convert::AsRef::as_ref)
+    );
+    // And the backwards reading still expires nothing.
+    assert_eq!(store.enforce_retention(at(0)), 0);
+    assert_eq!(store.stats().resident_records, 2);
+}
+
+/// The extremes of the clock are legal admission times: a record at
+/// `u64::MAX` ages zero at its own instant, ties there are deterministic,
+/// and nothing over- or under-flows.
+#[test]
+fn the_extremes_of_the_clock_are_legal_admission_times() {
+    let mut store = boxed(
+        MemoryConfig {
+            max_records: 2,
+            ..MemoryConfig::default()
+        },
+        None,
+    );
+    let at_end = assigned(1);
+    let _ = store.keep_log_record(admitted(at_end, u64::MAX, log_record("end of time")));
+    // A reference reading AT the end of time: the record's age is zero.
+    assert_eq!(store.enforce_retention(at(u64::MAX)), 0);
+    assert_eq!(store.enforce_retention(at(u64::MAX - 1)), 0);
+    assert!(store.log_record(at_end).is_some());
+
+    // A second record ties at the extreme; the ceiling holds both.
+    let twin = assigned(2);
+    let _ = store.keep_log_record(admitted(twin, u64::MAX, log_record("twin")));
+    assert_eq!(store.stats().resident_records, 2);
+
+    // A third keep evicts the smaller id first: the tie is deterministic
+    // even at the end of time.
+    let third = assigned(3);
+    let _ = store.keep_log_record(admitted(third, u64::MAX, log_record("third")));
+    assert!(store.log_record(at_end).is_none());
+    assert!(store.log_record(twin).is_some());
+    assert_eq!(store.stats().resident_records, 2);
+}
+
+/// A zero window is a legal degenerate configuration: a record expires at
+/// its own admission instant, inside the very keep that admitted it.
+#[test]
+fn a_zero_window_expires_every_record_at_its_admission_instant() {
+    let mut store = boxed(
+        MemoryConfig {
+            admission_window: std::time::Duration::ZERO,
+            ..MemoryConfig::default()
+        },
+        None,
+    );
+    let entity = assigned(1);
+    let outcome = store.keep_log_record(admitted(entity, 1_000, log_record("born expired")));
+    assert_eq!(outcome, KeepOutcome::Kept { evicted: 1 });
+    assert!(store.log_record(entity).is_none());
+    assert_eq!(store.stats().evicted_for_admission_window, 1);
+    assert_eq!(store.stats().resident_records, 0);
+    // A reading before the admission expires nothing that is not there.
+    assert_eq!(store.enforce_retention(at(0)), 0);
 }

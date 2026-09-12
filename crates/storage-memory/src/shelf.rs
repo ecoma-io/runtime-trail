@@ -88,18 +88,34 @@ impl<R: Accounted> Shelf<R> {
                 cursor: None,
             };
         }
-        let mut range: Box<dyn Iterator<Item = (AdmissionKey, &Arc<R>)>> = match after {
-            Some(after) => Box::new(
+        // Two concrete range branches: the scan is on the retrieval path,
+        // and a boxed `dyn Iterator` per call bought nothing but a heap
+        // allocation.
+        match after {
+            Some(after) => Self::page_from(
                 self.by_key
                     .range((Bound::Excluded(after), Bound::Unbounded))
                     .map(|(key, record)| (*key, record)),
+                limit,
             ),
-            None => Box::new(self.by_key.iter().map(|(key, record)| (*key, record))),
-        };
+            None => Self::page_from(
+                self.by_key.iter().map(|(key, record)| (*key, record)),
+                limit,
+            ),
+        }
+    }
+
+    /// Builds the page from an ordered record iterator: at most `limit`
+    /// records, and a cursor when a record follows the page's last.
+    fn page_from<'a, I>(records: I, limit: usize) -> ScanPage<Arc<R>>
+    where
+        R: 'a,
+        I: Iterator<Item = (AdmissionKey, &'a Arc<R>)>,
+    {
         let mut items = Vec::new();
         let mut last_in_page = None;
         let mut cursor = None;
-        for (key, record) in range.by_ref() {
+        for (key, record) in records {
             if items.len() == limit {
                 // The page is full and a successor exists: the caller
                 // resumes strictly after the page's last record.
