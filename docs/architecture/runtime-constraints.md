@@ -71,8 +71,11 @@ deliberately over-counts record content ([telemetry-model.md](telemetry-model.md
 — so real content residency sits under the ceiling by design, not by luck.
 The byte ceiling also charges each distinct resident stream's identity
 exactly once ([storage-model.md](storage-model.md)), so identity content
-cannot hide behind the per-record formula. On top of the ceiling stand the
-admission ledger's per-record entries
+cannot hide behind the per-record formula — and a stream identity whose
+accounted size alone exceeds the ceiling is refused at keep time,
+non-retryable and never evicting into
+([mechanism](storage-model.md)), the series-cap refusal's sibling. On top
+of the ceiling stand the admission ledger's per-record entries
 ([ADR 0008](../decisions/0008-admission-ledger-design.md) — bounded overhead
 per retained record, sharing ownership with the record it pins) and the
 runtime's fixed overhead; how large the real-to-accounted margin actually is

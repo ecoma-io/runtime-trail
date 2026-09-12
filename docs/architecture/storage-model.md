@@ -73,7 +73,13 @@ leaves — so a session of single-point streams cannot park unbounded
 identity content under a byte ceiling that only saw the points
 ([telemetry-model.md](telemetry-model.md) owns the definition;
 [ADR 0008](../decisions/0008-admission-ledger-design.md) owns the
-lifecycle). The **series cap** ([runtime-constraints.md](runtime-constraints.md))
+lifecycle). An identity the ceiling cannot hold on its own is refused,
+not evicted into: a keep whose stream identity's accounted size alone
+exceeds the byte ceiling is refused before anything is inserted —
+non-retryable, naming the ceiling and the identity's size, with an
+observable counter — because no amount of eviction could make room for a
+charge that is over the cap by itself. The **series cap**
+([runtime-constraints.md](runtime-constraints.md))
 is the second half of the same law: the store refuses a keep that would
 establish a new distinct stream beyond the cap, with an observable
 counter, and a slot frees when the stream's last point is evicted.

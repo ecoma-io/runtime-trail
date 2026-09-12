@@ -148,5 +148,14 @@ mod tests {
             0,
             "a series-cap refusal never evicts to make room"
         );
+        assert_eq!(
+            super::KeepOutcome::IdentityOverCeiling {
+                ceiling: 1024,
+                identity_bytes: 4096,
+            }
+            .evicted(),
+            0,
+            "an over-ceiling identity refusal never evicts to make room"
+        );
     }
 }

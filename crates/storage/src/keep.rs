@@ -66,6 +66,22 @@ pub enum KeepOutcome {
     /// frees when a stream's last point is evicted; a re-attempt of the
     /// refused stream then admits cleanly.
     SeriesCapReached,
+    /// Refused before anything was inserted or evicted: the stream
+    /// identity the point arrives with carries an accounted size that
+    /// alone exceeds the accounted-byte ceiling. The store charges each
+    /// distinct resident stream's identity to the ceiling exactly once —
+    /// so keeping the point would add a charge already over the cap, and
+    /// no amount of eviction could ever satisfy the ceiling. The refusal
+    /// names the ceiling it was measured against and the identity's
+    /// accounted size. Non-retryable — the identity is payload content;
+    /// retrying cannot shrink it — and it never evicts. Counted as
+    /// `StoreStats::identity_over_ceiling_refusals`.
+    IdentityOverCeiling {
+        /// The accounted-byte ceiling the keep was measured against.
+        ceiling: u64,
+        /// The stream identity's accounted size.
+        identity_bytes: u64,
+    },
 }
 
 impl KeepOutcome {
@@ -75,7 +91,10 @@ impl KeepOutcome {
     pub const fn evicted(&self) -> u64 {
         match self {
             Self::Kept { evicted } => *evicted,
-            Self::Duplicate | Self::Oversized | Self::SeriesCapReached => 0,
+            Self::Duplicate
+            | Self::Oversized
+            | Self::SeriesCapReached
+            | Self::IdentityOverCeiling { .. } => 0,
         }
     }
 }
