@@ -177,6 +177,18 @@ impl SpendLedger {
         self.scan.degrade(Dimension::Scan, want, Magnitude::Units)
     }
 
+    /// Settles the scan units of records the driver pulled but the walk
+    /// will not examine: work already done for this query, charged at
+    /// stop time up to what remains of the ceiling. Not an allowance —
+    /// the work is sunk, so there is nothing to refuse, no outcome to
+    /// change, and no units to fabricate: a drained ceiling settles
+    /// nothing, and the settle can never take the remaining allowance
+    /// below zero.
+    pub(crate) fn settle_scan(&mut self, units: u64) {
+        let owed = units.min(self.scan.remaining);
+        self.scan.remaining -= owed;
+    }
+
     /// Aggregation-shaped charge against `max_aggregation_memory`.
     ///
     /// All-or-nothing: a partial aggregate would be a false number

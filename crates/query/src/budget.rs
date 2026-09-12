@@ -222,6 +222,16 @@ impl BudgetSession {
         self.ledger.allow_scan(want)
     }
 
+    /// Settles the scan units of records a batch pulled but the walk will
+    /// not examine — records pulled ahead of a stop are driver work done
+    /// for this query. Bookkeeping of sunk work, deliberately not
+    /// deadline-checked (the deadline cannot un-pull a record) and never
+    /// an outcome: it runs after the stop is decided and changes nothing
+    /// about it. The ceiling bounds it; a drained ceiling settles nothing.
+    pub(crate) fn settle_abandoned_scan(&mut self, units: u64) {
+        self.ledger.settle_scan(units);
+    }
+
     /// Aggregation-shaped charge against `max_aggregation_memory`,
     /// deadline first: an expired deadline refuses the charge outright —
     /// aggregation-shaped work never proceeds past its deadline, and it

@@ -95,7 +95,9 @@ Every response is an **`Investigation`** — one envelope with five parts:
   policy](query-model.md)); opaque cursors for continuation; and **coverage**
   — what was and was not covered (residency gaps under
   [eviction](storage-model.md), the continuation's
-  [snapshot boundary](query-model.md), suppressed relation evidence under
+  [snapshot boundary](query-model.md), the uncounted rest of a
+  byte-ceiling omission whose counting walk was cut short by a stop,
+  suppressed relation evidence under
   [strongest-evidence-wins](correlation-model.md), relation shrinkage under
   eviction, **admission anomalies** — identity conflicts under the model's
   [duplicate-delivery rules](telemetry-model.md) — and the metric-window

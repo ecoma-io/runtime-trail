@@ -26,10 +26,12 @@
 //! kind's whole resident set (or until a budget stops it) and mints its
 //! frontier from the *pulled batch tail* — the store's scan cursor of the
 //! last batch it pulled, or that batch's last item's key at the kind's
-//! end. The bound is inclusive: the frontier record was examined by the
-//! page that minted it and stays inside the snapshot; every later page of
-//! the continuation stops before keys strictly past it and names the
-//! boundary in coverage. A continuation passes the boundary through
+//! end. The bound is inclusive: records at the frontier sit inside the
+//! snapshot whether or not the minting page examined them — a budget may
+//! stop the page mid-batch, and the batch tail it pulled but never
+//! examined settles against `max_scan` at the stop. Every later page of
+//! the continuation stops before keys strictly past the boundary and
+//! names it in coverage. A continuation passes the boundary through
 //! unchanged — the chain's snapshot is fixed by its first page, and a
 //! pulled tail past it never widens the view.
 
@@ -212,7 +214,9 @@ struct Walk<'a> {
     store: &'a dyn TelemetryStore,
     kind: SignalKind,
     fingerprint: u64,
-    session: BudgetSession,
+    /// The admitted budget the walk spends against, held mutably so the
+    /// caller (a test included) can read the ledger after the page.
+    session: &'a mut BudgetSession,
     /// The continuation's inclusive upper bound: keys strictly past it
     /// are outside the snapshot. `None` on a first page.
     snapshot_bound: Option<AdmissionKey>,
@@ -313,6 +317,17 @@ impl Walk<'_> {
         .encode()
     }
 
+    /// The presented cursor, echoed byte for byte — the anchor of last
+    /// resort when the walk has nothing included or examined to name:
+    /// both degraded shapes that reach for it continue exactly where the
+    /// continuation was handed off, so one helper keeps the echoes
+    /// identical.
+    fn presented_echo(&self) -> Option<TruncationPoint> {
+        self.presented
+            .as_ref()
+            .map(|payload| TruncationPoint::Cursor(payload.encode()))
+    }
+
     /// The degrade a stop names when the walk stopped at or past an
     /// examined record: a cursor anchored at the last *included* record
     /// when the page returned something — examined-but-unreturned records
@@ -330,8 +345,8 @@ impl Walk<'_> {
     ) -> PartOutcome {
         let position = if let Some(anchor) = self.last_included {
             TruncationPoint::Cursor(self.cursor_bytes(anchor))
-        } else if let Some(payload) = &self.presented {
-            TruncationPoint::Cursor(payload.encode())
+        } else if let Some(echo) = self.presented_echo() {
+            echo
         } else {
             TruncationPoint::LastExamined(last_examined)
         };
@@ -363,8 +378,8 @@ impl Walk<'_> {
         }
         let position = if let Some(anchor) = self.last_examined {
             TruncationPoint::Cursor(self.cursor_bytes(anchor))
-        } else if let Some(payload) = &self.presented {
-            TruncationPoint::Cursor(payload.encode())
+        } else if let Some(echo) = self.presented_echo() {
+            echo
         } else {
             self.stopped = Some(PartOutcome::Refused(refusal));
             return;
@@ -394,14 +409,30 @@ impl Walk<'_> {
         }
     }
 
+    /// Settles the batch tail a stop abandons: records the driver pulled
+    /// whole but the walk will never examine are still work done for this
+    /// query, so they consume scan allowance — up to the remaining
+    /// ceiling, never past it (a tail beyond the grant is the engine's own
+    /// pull-ahead overhead, not chargeable units). The settle runs after
+    /// the stop is decided and changes no outcome's shape.
+    fn settle(&mut self, unexamined: u64) {
+        self.session.settle_abandoned_scan(unexamined);
+    }
+
     /// Processes one yielded record: the snapshot bound, the scan charge
     /// (after which the record is examined), the eviction gap's first
     /// resident successor, then either the counting walk's fit check or
     /// the results and bytes gates and the include itself. Sets `stopped`
-    /// when the walk must stop.
-    fn examine(&mut self, yielded: Yield) {
+    /// when the walk must stop. `unexamined_after` is the number of
+    /// records the current batch still holds behind this one — at a stop
+    /// they were pulled but will never be examined, and they settle
+    /// against `max_scan`.
+    fn examine(&mut self, yielded: Yield, unexamined_after: u64) {
         if let Some(bound) = self.snapshot_bound {
             if yielded.key > bound {
+                // This record and everything behind it in the batch were
+                // pulled past the snapshot: never examined, but pulled.
+                self.settle(unexamined_after + 1);
                 self.finish_counting_or_complete();
                 return;
             }
@@ -412,6 +443,9 @@ impl Walk<'_> {
         if let TraversalAllowance::Partial { refusal, .. } =
             self.session.allow_scan(Instant::now(), 1)
         {
+            // This record was never examined either — the charge was
+            // refused — so it settles with the tail behind it.
+            self.settle(unexamined_after + 1);
             self.stop_before_examining(refusal);
             return;
         }
@@ -435,6 +469,9 @@ impl Walk<'_> {
         // Results: charged only for records the page returns — read what
         // remains, and charge exactly what an include takes.
         if self.session.ledger().remaining_results() == 0 {
+            // This record was examined, so only the tail behind it
+            // settles.
+            self.settle(unexamined_after);
             self.stopped =
                 Some(self.include_anchored_degrade(Dimension::Results, 0, yielded.key.entity()));
             return;
@@ -445,6 +482,7 @@ impl Walk<'_> {
             // The deadline died between the scan and the results charges:
             // the record was examined but is not returned, so the cursor
             // anchors before it and the continuation stays lossless.
+            self.settle(unexamined_after);
             self.stopped =
                 Some(self.include_anchored_degrade(refusal.dimension, 0, yielded.key.entity()));
             return;
@@ -463,6 +501,7 @@ impl Walk<'_> {
         if let TraversalAllowance::Partial { refusal, .. } =
             self.session.allow_bytes(Instant::now(), evidence)
         {
+            self.settle(unexamined_after);
             self.stopped =
                 Some(self.include_anchored_degrade(refusal.dimension, 0, yielded.key.entity()));
             return;
@@ -501,13 +540,17 @@ impl Walk<'_> {
     }
 
     /// Runs the walk to its stop: batches until the kind's end, the
-    /// snapshot bound, or a budget dimension expires.
+    /// snapshot bound, or a budget dimension expires. A stop mid-batch
+    /// settles the batch tail it abandons; a complete end — the kind's
+    /// end, where every pulled record was examined — settles nothing.
     fn run(mut self) -> Page<RecordView> {
         while self.stopped.is_none() {
             let (batch, batch_cursor) = self.pull();
             self.frontier = batch_cursor.or(batch.last().map(|yielded| yielded.key));
-            for yielded in batch {
-                self.examine(yielded);
+            let total = batch.len();
+            for (index, yielded) in batch.into_iter().enumerate() {
+                let unexamined_after = u64::try_from(total - index - 1).unwrap_or(u64::MAX);
+                self.examine(yielded, unexamined_after);
                 if self.stopped.is_some() {
                     break;
                 }
@@ -551,7 +594,7 @@ pub fn records(
             Some(payload)
         }
     };
-    let session = budget.admit(Instant::now());
+    let mut session = budget.admit(Instant::now());
 
     // A zero results ceiling demands the empty answer: no examination, no
     // omission — the budget itself is the whole answer, and nothing was
@@ -577,6 +620,20 @@ pub fn records(
         });
     }
 
+    Ok(walk_records(store, *query, &mut session, presented))
+}
+
+/// The walk itself, over an already-admitted session: split from
+/// [`records`] so the behavioral tests can drive the engine with a
+/// session they hold, and read its ledger after the page — the honest
+/// window on accounting no page shape exposes.
+fn walk_records(
+    store: &dyn TelemetryStore,
+    query: RecordsQuery,
+    session: &mut BudgetSession,
+    presented: Option<CursorPayload>,
+) -> Page<RecordView> {
+    let fingerprint = cursor::fingerprint(&query.canonical_bytes());
     let snapshot_bound = presented.map(|payload| payload.snapshot());
     let mut walk = Walk {
         store,
@@ -622,7 +679,7 @@ pub fn records(
             payload.last_entity(),
         )
     });
-    Ok(walk.run())
+    walk.run()
 }
 
 #[cfg(test)]
@@ -631,7 +688,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::ops::Bound;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use runtime_trail_storage::{
         AdmissionKey, KeepOutcome, PointView, ScanItem, ScanPage, StoreStats, TelemetryStore,
@@ -643,7 +700,7 @@ mod tests {
         TraceFlags, TraceId, TraceState, Value,
     };
 
-    use super::{QueryError, RecordView, RecordsQuery, SignalKind, records};
+    use super::{QueryError, RecordView, RecordsQuery, SignalKind, records, walk_records};
     use crate::budget::QueryBudget;
     use crate::cursor::{CursorError, CursorPayload};
     use crate::result::{CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation};
@@ -683,8 +740,14 @@ mod tests {
     /// Five spans, admitted 100..=500 nanoseconds apart, each under its
     /// own wire identity: the pagination fixture.
     fn five_spans() -> FixtureStore {
+        span_store(5)
+    }
+
+    /// `count` spans, one wire identity each, admitted 100 nanoseconds
+    /// apart: big enough that a walk crosses `SCAN_BATCH` boundaries.
+    fn span_store(count: u8) -> FixtureStore {
         let mut store = FixtureStore::empty();
-        for index in 1_u8..=5 {
+        for index in 1_u8..=count {
             keep_span(
                 &mut store,
                 u64::from(index) * 100,
@@ -1771,6 +1834,142 @@ mod tests {
             "the boundary's entity names the rest when nothing resident remains"
         );
         assert!(second.next_cursor.is_none());
+    }
+
+    /// MAJOR-1, the reviewer's measurement shape: `max_scan` = 1 over a
+    /// mid-batch stop with the whole kind pulled as one batch. The driver
+    /// yielded five records; the walk examined one before the scan ceiling
+    /// died at the second. The pulled-but-unexamined tail (e2..e5) settles
+    /// against what remains of the ceiling — zero here, the grant was already
+    /// drained — so the spend pins at the ceiling exactly: never past it, no
+    /// fabricated units, and the page shape is the same degrade it always
+    /// was.
+    #[test]
+    fn a_scan_stop_on_a_full_batch_spends_the_ceiling_and_nothing_more() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let budget = budget_with(1_000, 1 << 40, 1);
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, query, &mut session, None);
+        assert_eq!(
+            page.items.len(),
+            1,
+            "one record passed every gate before the scan ceiling died"
+        );
+        let truncation = degraded_of(&page);
+        assert_eq!(truncation.dimension, Dimension::Scan);
+        assert!(page.next_cursor.is_some(), "the page continues");
+        // MAJOR-1: four pulled-unexamined records were yielded by the driver
+        // for this query, but the ceiling is spent — the settle charges
+        // nothing rather than breaching it or inventing units.
+        assert_eq!(session.ledger().remaining_scan(), 0);
+    }
+
+    /// MAJOR-1's ceiling pin at scale: a walk whose first batch alone is
+    /// larger than a tiny scan ceiling stops mid-batch and spends exactly the
+    /// ceiling — the sixty-two-record tail behind the refused charge settles
+    /// to zero against a drained dimension, and the walk never reaches the
+    /// second batch.
+    #[test]
+    fn a_tiny_scan_ceiling_is_never_breached_by_batch_pull_ahead() {
+        let store = span_store(70);
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let budget = budget_with(1_000, 1 << 40, 2);
+        let ceiling = budget.max_scan();
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, query, &mut session, None);
+        assert_eq!(
+            page.items.len(),
+            2,
+            "both examined records were returned before the ceiling died"
+        );
+        let truncation = degraded_of(&page);
+        assert_eq!(truncation.dimension, Dimension::Scan);
+        // Two examined units are the whole grant; the batch's other
+        // sixty-two records — pulled whole, never examined — settle to zero
+        // against the drained ceiling.
+        assert_eq!(session.ledger().remaining_scan(), 0);
+        assert_eq!(
+            ceiling - session.ledger().remaining_scan(),
+            2,
+            "spend equals the ceiling exactly"
+        );
+    }
+
+    /// MAJOR-1's settle bites where allowance remains: a snapshot-bound
+    /// continuation whose bound stop lands mid-batch charges the records the
+    /// batch pulled past the bound — the walk examined three and the batch
+    /// dragged two more behind the bound, so the ledger carries five units,
+    /// not three.
+    #[test]
+    fn a_bound_stop_mid_batch_settles_the_records_past_it() {
+        let mut store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+        let presented = CursorPayload::decode(&cursor).expect("the first page minted it");
+
+        // Admitted after the minting page: the continuation's snapshot
+        // stays at the first page's pulled tail, and the new records sit
+        // past the bound.
+        keep_span(
+            &mut store,
+            600,
+            span_entity(6, 6),
+            fixture_span(6, 6, "span-6"),
+        );
+        keep_span(
+            &mut store,
+            700,
+            span_entity(7, 7),
+            fixture_span(7, 7, "span-7"),
+        );
+
+        let budget = open_budget();
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, query, &mut session, Some(presented));
+        let entities: Vec<EntityId> = page
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(4, 4), span_entity(5, 5),]
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        // Three examined in-snapshot records, plus the two the batch pulled
+        // past the bound (e6, e7) settled at the stop: five units, ceiling
+        // intact.
+        assert_eq!(session.ledger().remaining_scan(), 10_000 - 5);
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// MINOR-1's pinned path: a byte-ceiling continuation where nothing fits
+    /// includes no record, so its only anchor is the presented cursor — and
+    /// the echo is byte-identical, not a re-mint.
+    #[test]
+    fn a_byte_ceiling_continuation_that_returns_nothing_echoes_its_cursor() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        // A byte ceiling below the smallest record's evidence: the
+        // continuation returns nothing and counts the rest truthfully.
+        let second = records(&store, &query, budget_with(1_000, 1, 10_000), Some(&cursor))
+            .expect("the query answers");
+        assert!(second.items.is_empty());
+        let truncation = degraded_of(&second);
+        assert_eq!(truncation.dimension, Dimension::Bytes);
+        assert_eq!(truncation.omitted, 3, "e3, e4 and e5 all miss the ceiling");
+        assert_eq!(
+            second.next_cursor.as_deref(),
+            Some(cursor.as_slice()),
+            "the presented cursor is echoed byte for byte"
+        );
     }
 
     /// A metric point's evidence is its point's accounted size only: the

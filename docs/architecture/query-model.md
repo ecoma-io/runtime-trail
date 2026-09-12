@@ -63,7 +63,10 @@ reported count against the budget, and a driver that cannot produce a
 faithful count reports its in-exactness through coverage. A driver that
 cannot bound its own work within the ceiling produces a budget error — the
 error remains a budget error; the engine never exceeds the caller's ceiling
-by accepting made-up units.
+by accepting made-up units. A batched walk may pull up to a bounded batch
+ahead of examination; records pulled but not examined at a stop consume
+scan allowance up to the remaining ceiling at the moment of the stop; the
+engine never charges fabricated units and never exceeds the ceiling.
 
 ## Deadlines
 
@@ -123,7 +126,8 @@ Every budget expiry is one of exactly two honest outcomes:
 
 - **Degrade** — return a truncated answer that is true: the records
   returned are a subset of the true answer set, the truncation point is
-  named, and a cursor or coverage entry says what was not visited. Allowed
+  named, and a cursor, a coverage entry, or the last-examined entity says
+  what was not visited. Allowed
   for traversal-shaped work (search, scan, relation traversal) because a
   subset of a set answer is still a true set answer.
 - **Refuse** — fail with a budget error naming the dimension, the limit and
@@ -177,9 +181,12 @@ not for slowness.
 
 ## Status
 
-**Contracts pinned (M0).** The five-dimension budget, scan accounting,
-deadline semantics, ordering/cursor rules and refuse-or-degrade policy are
-the contract the Phase 2 Query Engine implements. The Query Engine crate
-remains scaffolding until then per [the roadmap](../roadmap/phases.md);
-[the benchmarks README](../benchmarks/README.md) will hold the measurements
-that later prove the ceilings honoured in practice.
+**Contracts pinned (M0); the records flow implemented (Phase 2, in
+progress).** The five-dimension budget, scan accounting, deadline
+semantics, ordering/cursor rules and refuse-or-degrade policy are the
+contract the Phase 2 Query Engine implements; the budgeted records flow is
+implemented in the Query Engine crate and adversarially reviewed. The
+remaining flows compose at the Investigation API in a later milestone of
+the phase per [the roadmap](../roadmap/phases.md); [the benchmarks
+README](../benchmarks/README.md) will hold the measurements that prove the
+ceilings honoured in practice.
