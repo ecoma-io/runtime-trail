@@ -786,25 +786,10 @@ mod tests {
         let router = build_router(Arc::clone(&runtime), ServerConfig::default());
 
         let _frozen = runtime.lock_store_for_test();
-        let mut saturated = false;
-        for i in 0..2_048_u32 {
-            let mut span_id = [0_u8; 8];
-            span_id[..4].copy_from_slice(&i.to_be_bytes());
-            let span = fx::trace_span("saturate", fx::T1, span_id);
-            let request = fx::traces_request(vec![fx::resource_spans(
-                None,
-                vec![fx::scope_spans(None, vec![span])],
-            )]);
-            if runtime
-                .pipeline()
-                .ingest_spans(fx::now(), &fx::encode(&request))
-                .is_err()
-            {
-                saturated = true;
-                break;
-            }
-        }
-        assert!(saturated, "a 4-KiB queue saturates within 2 Ki spans");
+        assert!(
+            saturate_until_full(&runtime),
+            "a 4-KiB queue saturates within 2 Ki spans"
+        );
 
         let answer = call(
             router,
@@ -1132,5 +1117,226 @@ mod tests {
             partial.error_message
         );
         runtime.shutdown();
+    }
+
+    use bytes::{Buf, BufMut, Bytes};
+    use std::marker::PhantomData;
+    use tonic::Status;
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+
+    /// The client half of the passthrough pair: the request message is the
+    /// raw payload bytes (tonic frames them; the server's passthrough codec
+    /// receives them verbatim), the response message is prost-decoded. The
+    /// mirror of [`PassthroughCodec`], for the real-socket test below.
+    struct WireClientCodec<Res> {
+        _response: PhantomData<fn() -> Res>,
+    }
+
+    impl<Res> WireClientCodec<Res> {
+        fn new() -> Self {
+            Self {
+                _response: PhantomData,
+            }
+        }
+    }
+
+    impl<Res> Codec for WireClientCodec<Res>
+    where
+        Res: prost::Message + Default + 'static,
+    {
+        type Encode = Bytes;
+        type Decode = Res;
+        type Encoder = RawBytesEncoder;
+        type Decoder = ProstDecoder<Res>;
+
+        fn encoder(&mut self) -> Self::Encoder {
+            RawBytesEncoder
+        }
+
+        fn decoder(&mut self) -> Self::Decoder {
+            ProstDecoder {
+                _response: PhantomData,
+            }
+        }
+    }
+
+    /// Writes the payload bytes into the gRPC frame verbatim.
+    struct RawBytesEncoder;
+
+    impl Encoder for RawBytesEncoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+            dst.reserve(item.len());
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+
+    /// Prost-decodes the response frame.
+    struct ProstDecoder<Res> {
+        _response: PhantomData<fn() -> Res>,
+    }
+
+    impl<Res> Decoder for ProstDecoder<Res>
+    where
+        Res: prost::Message + Default,
+    {
+        type Item = Res;
+        type Error = Status;
+
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+            Res::decode(&mut src.copy_to_bytes(src.remaining()))
+                .map(Some)
+                .map_err(|error| {
+                    Status::internal(format!("decoding the OTLP response failed: {error}"))
+                })
+        }
+    }
+
+    /// The wire proof, on a real h2c socket: tonic's own client stack — an
+    /// `Endpoint` and `Channel` over TCP, a hand-written passthrough client
+    /// codec — against the served router. The in-process tower calls above
+    /// prove the answers' content; this proves the served wire speaks them.
+    ///
+    /// A unary export succeeds end to end, and the one retryable refusal —
+    /// a saturated queue — arrives as `RESOURCE_EXHAUSTED` **from the
+    /// response headers alone**: `Grpc::streaming` returns the `Err`
+    /// before a message could be read only when `grpc-status` rode the
+    /// initial HEADERS — the trailers-only shape — never when it rode
+    /// trailers after a body.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_real_h2c_client_exports_and_meets_the_retryable_refusal() {
+        use tonic::client::Grpc;
+        use tonic::codegen::http::uri::PathAndQuery;
+        use tonic::transport::Endpoint;
+
+        // The served socket: the real accept loop, the real router, one
+        // saturable runtime behind it.
+        let runtime = CoreRuntime::build(saturation_config()).expect("the config is buildable");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral bind");
+        let addr = listener.local_addr().expect("an ephemeral address");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let drain_runtime = Arc::clone(&runtime);
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+            let _ = gate.await;
+            drain_runtime.begin_drain();
+        });
+        let server = tokio::spawn(async move { serve.await });
+
+        let channel = tokio::time::timeout(
+            Duration::from_secs(10),
+            Endpoint::from_shared(format!("http://{addr}"))
+                .expect("a loopback endpoint")
+                .connect(),
+        )
+        .await
+        .expect("the client connects in time")
+        .expect("the client connects");
+        let mut grpc = Grpc::new(channel);
+        grpc.ready()
+            .await
+            .expect("the client channel becomes ready");
+        let path = PathAndQuery::from_static(TRACE_EXPORT);
+
+        // (a) The unary export succeeds on the wire, and the record is
+        // resident behind the pump.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            grpc.unary(
+                tonic::Request::new(Bytes::copy_from_slice(&one_span_payload(fx::T1, fx::S1))),
+                path.clone(),
+                WireClientCodec::<ExportTraceServiceResponse>::new(),
+            ),
+        )
+        .await
+        .expect("the unary export answers in time")
+        .expect("the export is admitted");
+        let reply = answer.into_inner();
+        assert_eq!(
+            reply
+                .partial_success
+                .expect("partial_success is present")
+                .rejected_spans,
+            0,
+            "the wire export is fully admitted"
+        );
+        wait_for_resident(&runtime, 1);
+
+        // (b) Saturate the queue — the store frozen so the pump frees no
+        // space — and meet the refusal over the same socket.
+        let frozen = runtime.lock_store_for_test();
+        assert!(
+            saturate_until_full(&runtime),
+            "a 4-KiB queue saturates within 2 Ki spans"
+        );
+
+        grpc.ready()
+            .await
+            .expect("the client channel is ready again");
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(10),
+            grpc.streaming(
+                tonic::Request::new(tonic::codegen::tokio_stream::once(Bytes::copy_from_slice(
+                    &one_span_payload(fx::T2, fx::S2),
+                ))),
+                path,
+                WireClientCodec::<ExportTraceServiceResponse>::new(),
+            ),
+        )
+        .await
+        .expect("the refusal answers in time");
+        let Err(status) = refusal else {
+            panic!("a saturated queue must refuse the wire export");
+        };
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "the one retryable status: {status:?}"
+        );
+        assert!(
+            status.message().contains("ingestion"),
+            "the saturated queue is named across the wire: {:?}",
+            status.message()
+        );
+
+        // Release the freeze before shutdown: the drain path must be able
+        // to finish the queue.
+        drop(frozen);
+        trigger.send(()).expect("the server is still running");
+        server
+            .await
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
+        runtime.shutdown();
+    }
+
+    /// Fills the runtime's queue to saturation through the pipeline, the
+    /// pump blocked by a frozen store, one fresh span per export. Returns
+    /// whether saturation was reached — the shared fixture of the
+    /// saturation tests.
+    fn saturate_until_full(runtime: &CoreRuntime) -> bool {
+        for i in 0..2_048_u32 {
+            let mut span_id = [0_u8; 8];
+            span_id[..4].copy_from_slice(&i.to_be_bytes());
+            let span = fx::trace_span("saturate", fx::T1, span_id);
+            let request = fx::traces_request(vec![fx::resource_spans(
+                None,
+                vec![fx::scope_spans(None, vec![span])],
+            )]);
+            if runtime
+                .pipeline()
+                .ingest_spans(fx::now(), &fx::encode(&request))
+                .is_err()
+            {
+                return true;
+            }
+        }
+        false
     }
 }
