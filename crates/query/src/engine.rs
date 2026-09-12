@@ -34,6 +34,15 @@
 //! names it in coverage. A continuation passes the boundary through
 //! unchanged — the chain's snapshot is fixed by its first page, and a
 //! pulled tail past it never widens the view.
+//!
+//! Filters are the walk's predicate layer
+//! ([`crate::filters`]): the query carries its kind's filter struct, and
+//! each examined record is matched against it after the scan charge and
+//! before every other gate. A filtered-out record was still examined —
+//! the scan charge is its cost, and the deadline ran on it — but it is
+//! never returned, never byte-charged, and never counted into an
+//! omission. Filters never reorder anything: the page's order stays the
+//! residency order, and no filter reaches into a driver.
 
 use std::fmt;
 use std::sync::Arc;
@@ -46,6 +55,7 @@ use runtime_trail_telemetry_model::{
 
 use crate::budget::{BudgetSession, QueryBudget};
 use crate::cursor::{self, CursorError, CursorPayload};
+use crate::filters::{LogFilters, MetricFilters, RecordsFilters, SpanFilters};
 use crate::result::{
     BudgetRefusal, Coverage, CoverageEntry, Dimension, Execution, Page, PartOutcome, Truncation,
     TruncationPoint,
@@ -58,7 +68,10 @@ use crate::spend::TraversalAllowance;
 const QUERY_TAG: u8 = b'Q';
 
 /// The query description's version byte, bumped on any parameter change.
-const QUERY_VERSION: u8 = 1;
+/// Version 2 grew the filter fields; a version 1 cursor therefore fails
+/// [`CursorPayload::verify`] under this engine — the honest rejection, not
+/// a silent reinterpretation of bytes minted under the narrower encoding.
+const QUERY_VERSION: u8 = 2;
 
 /// Records pulled per driver scan. Batches bound the per-call page the
 /// driver materializes without bounding the walk: a budget stops the walk
@@ -89,20 +102,61 @@ impl SignalKind {
     }
 }
 
-/// A records query: the signal kind only, in M2. Predicates and windows
-/// are future parameters, and each one joins the canonical query
-/// description the fingerprint hashes — a cursor minted under one
-/// parameter set never continues under another (invariant 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A records query: the signal kind plus that kind's filter struct
+/// ([`crate::filters`]). The pairing is kind-tagged — a query is built
+/// with the constructor for its kind, so a log query cannot arrive
+/// carrying span filters, and a severity filter cannot be expressed for
+/// spans or metrics at all. The all-`None` filter set a [`Self::new`]
+/// query carries is byte-identical to a kind-only query: same canonical
+/// bytes, same fingerprint, same pages.
+///
+/// Every parameter joins the canonical query description the fingerprint
+/// hashes — a cursor minted under one parameter set never continues under
+/// another (invariant 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordsQuery {
     kind: SignalKind,
+    filters: RecordsFilters,
 }
 
 impl RecordsQuery {
-    /// A query over one signal kind.
+    /// A query over one signal kind, filtering nothing: every resident
+    /// record of the kind is in the answer set.
     #[must_use]
     pub const fn new(kind: SignalKind) -> Self {
-        Self { kind }
+        let filters = match kind {
+            SignalKind::Spans => RecordsFilters::Spans(SpanFilters::all_none()),
+            SignalKind::LogRecords => RecordsFilters::LogRecords(LogFilters::all_none()),
+            SignalKind::MetricPoints => RecordsFilters::MetricPoints(MetricFilters::all_none()),
+        };
+        Self { kind, filters }
+    }
+
+    /// A spans query carrying span filters.
+    #[must_use]
+    pub const fn spans(filters: SpanFilters) -> Self {
+        Self {
+            kind: SignalKind::Spans,
+            filters: RecordsFilters::Spans(filters),
+        }
+    }
+
+    /// A log-records query carrying log filters.
+    #[must_use]
+    pub const fn logs(filters: LogFilters) -> Self {
+        Self {
+            kind: SignalKind::LogRecords,
+            filters: RecordsFilters::LogRecords(filters),
+        }
+    }
+
+    /// A metric-points query carrying metric filters.
+    #[must_use]
+    pub const fn metric_points(filters: MetricFilters) -> Self {
+        Self {
+            kind: SignalKind::MetricPoints,
+            filters: RecordsFilters::MetricPoints(filters),
+        }
     }
 
     /// The signal kind the query asks for.
@@ -111,12 +165,24 @@ impl RecordsQuery {
         self.kind
     }
 
+    /// The query's filter set, kind-tagged to [`Self::kind`].
+    #[must_use]
+    pub const fn filters(&self) -> &RecordsFilters {
+        &self.filters
+    }
+
     /// The canonical query description: a tag byte and a version byte
-    /// prefix, then the kind tag. The fingerprint is taken over these
+    /// prefix, then the kind tag, then every filter field in a fixed
+    /// order with presence bytes. The fingerprint is taken over these
     /// bytes, so an older encoding can never be mistaken for a newer
-    /// parameter set.
-    const fn canonical_bytes(self) -> [u8; 3] {
-        [QUERY_TAG, QUERY_VERSION, self.kind.tag()]
+    /// parameter set, and two distinct filter sets never share one.
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(QUERY_TAG);
+        bytes.push(QUERY_VERSION);
+        bytes.push(self.kind.tag());
+        self.filters.push_canonical(&mut bytes);
+        bytes
     }
 }
 
@@ -214,6 +280,11 @@ struct Walk<'a> {
     store: &'a dyn TelemetryStore,
     kind: SignalKind,
     fingerprint: u64,
+    /// The filter set every examined record is matched against: the
+    /// predicate layer over the record view (F4). Records that fail it are
+    /// still scan-charged and deadline-checked; they are never returned,
+    /// never byte-charged, and never counted into an omission.
+    filters: &'a RecordsFilters,
     /// The admitted budget the walk spends against, held mutably so the
     /// caller (a test included) can read the ledger after the page.
     session: &'a mut BudgetSession,
@@ -456,6 +527,14 @@ impl Walk<'_> {
                 before: yielded.key.entity(),
             });
         }
+        // The predicate layer (F4): the record was examined — the scan
+        // charge stood and the deadline ran on it — but a non-matching
+        // record is not part of the answer set. It returns here without
+        // touching the results/bytes gates, the omission count, or the
+        // include.
+        if !self.filters.matches(&yielded.record) {
+            return;
+        }
         if let Some(counting) = &mut self.counting {
             // The include phase is over: the walk counts the truth — how
             // many records' evidence would not fit. Counted records are
@@ -620,7 +699,7 @@ pub fn records(
         });
     }
 
-    Ok(walk_records(store, *query, &mut session, presented))
+    Ok(walk_records(store, query, &mut session, presented))
 }
 
 /// The walk itself, over an already-admitted session: split from
@@ -629,7 +708,7 @@ pub fn records(
 /// window on accounting no page shape exposes.
 fn walk_records(
     store: &dyn TelemetryStore,
-    query: RecordsQuery,
+    query: &RecordsQuery,
     session: &mut BudgetSession,
     presented: Option<CursorPayload>,
 ) -> Page<RecordView> {
@@ -638,6 +717,7 @@ fn walk_records(
     let mut walk = Walk {
         store,
         kind: query.kind(),
+        filters: query.filters(),
         fingerprint,
         session,
         snapshot_bound,
@@ -695,14 +775,18 @@ mod tests {
     };
     use runtime_trail_telemetry_model::{
         Accounted, AdmissionTime, Admitted, AssignedId, Attributes, EmitterDroppedCounts, EntityId,
-        InstrumentationScope, LogRecord, MetricNumber, MetricPoint, NumberPoint, Resource, Span,
-        SpanId, SpanKind, SpanStatus, SpanStatusCode, StreamIdentity, StreamKind, TraceContext,
-        TraceFlags, TraceId, TraceState, Value,
+        InstrumentationScope, LogRecord, MetricNumber, MetricPoint, NumberPoint, Resource,
+        SeverityNumber, Span, SpanId, SpanKind, SpanStatus, SpanStatusCode, StreamIdentity,
+        StreamKind, TraceContext, TraceFlags, TraceId, TraceState, Value,
     };
 
     use super::{QueryError, RecordView, RecordsQuery, SignalKind, records, walk_records};
     use crate::budget::QueryBudget;
     use crate::cursor::{CursorError, CursorPayload};
+    use crate::filters::{
+        LogFilters, MetricFilters, ScopeFilter, ServiceFilter, SeverityFilter, SpanFilters,
+        TimeRangeFilter,
+    };
     use crate::result::{CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation};
 
     /// A nanosecond admission reading.
@@ -1164,6 +1248,116 @@ mod tests {
             Attributes::default(),
             Vec::new(),
         ))
+    }
+
+    /// Five spans alternating between two services, admitted 100..=500
+    /// nanoseconds apart: the filter fixtures' resident set.
+    fn service_store() -> FixtureStore {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        let services = ["checkout", "payments", "checkout", "payments", "checkout"];
+        for (index, service) in services.iter().enumerate() {
+            let index = u8::try_from(index + 1).expect("fixture indices fit");
+            keep_span(
+                &mut store,
+                u64::from(index) * 100,
+                span_entity(index, index),
+                service_span(index, index, Some(service), &scope, u64::from(index) * 10),
+            );
+        }
+        store
+    }
+
+    /// The checkout-only spans query over [`service_store`].
+    fn checkout_query() -> RecordsQuery {
+        RecordsQuery::spans(SpanFilters {
+            service: Some(ServiceFilter::new("checkout")),
+            time_range: None,
+            scope: None,
+        })
+    }
+
+    /// A resource whose attribute map names `service` or nothing.
+    fn fixture_resource(service: Option<&str>) -> Resource {
+        let attributes = match service {
+            Some(name) => Attributes::from_pairs(vec![(
+                "service.name".to_owned(),
+                Value::String(name.to_owned()),
+            )])
+            .expect("one key"),
+            None => Attributes::default(),
+        };
+        Resource {
+            attributes,
+            schema_url: None,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// A scope with the given name and version.
+    fn fixture_scope(name: &str, version: Option<&str>) -> InstrumentationScope {
+        InstrumentationScope {
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+            attributes: Attributes::default(),
+            schema_url: None,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// A span under the given service, scope and start time, with its own
+    /// wire identity so assertions can name it.
+    fn service_span(
+        trace: u8,
+        span_byte: u8,
+        service: Option<&str>,
+        scope: &InstrumentationScope,
+        start: u64,
+    ) -> Span {
+        let mut span = fixture_span(trace, span_byte, "filtered-span");
+        span.start_time_unix_nano = start;
+        span.resource = Arc::new(fixture_resource(service));
+        span.scope = Arc::new(scope.clone());
+        span
+    }
+
+    /// A log under the given service, scope, timestamps and severity.
+    fn service_log(
+        service: Option<&str>,
+        scope: &InstrumentationScope,
+        timestamp: Option<u64>,
+        observed: Option<u64>,
+        severity: Option<SeverityNumber>,
+        body: &str,
+    ) -> LogRecord {
+        let mut record = fixture_log(body);
+        record.timestamp_unix_nano = timestamp;
+        record.observed_timestamp_unix_nano = observed;
+        record.severity_number = severity;
+        record.resource = Arc::new(fixture_resource(service));
+        record.scope = Arc::new(scope.clone());
+        record
+    }
+
+    /// A point under the given service and scope at a given time.
+    fn service_point(
+        service: Option<&str>,
+        scope: &InstrumentationScope,
+        time: u64,
+        value: i64,
+    ) -> (MetricPoint, StreamIdentity) {
+        let mut stream = fixture_stream("filtered-stream");
+        stream.resource = fixture_resource(service);
+        stream.scope = scope.clone();
+        (
+            MetricPoint::Number(NumberPoint::measurement(
+                time,
+                MetricNumber::int(value),
+                Attributes::default(),
+                Vec::new(),
+            )),
+            stream,
+        )
     }
 
     /// Invariant 8: the same resident set, query and budget assemble
@@ -1850,7 +2044,7 @@ mod tests {
         let query = RecordsQuery::new(SignalKind::Spans);
         let budget = budget_with(1_000, 1 << 40, 1);
         let mut session = budget.admit(Instant::now());
-        let page = walk_records(&store, query, &mut session, None);
+        let page = walk_records(&store, &query, &mut session, None);
         assert_eq!(
             page.items.len(),
             1,
@@ -1877,7 +2071,7 @@ mod tests {
         let budget = budget_with(1_000, 1 << 40, 2);
         let ceiling = budget.max_scan();
         let mut session = budget.admit(Instant::now());
-        let page = walk_records(&store, query, &mut session, None);
+        let page = walk_records(&store, &query, &mut session, None);
         assert_eq!(
             page.items.len(),
             2,
@@ -1928,7 +2122,7 @@ mod tests {
 
         let budget = open_budget();
         let mut session = budget.admit(Instant::now());
-        let page = walk_records(&store, query, &mut session, Some(presented));
+        let page = walk_records(&store, &query, &mut session, Some(presented));
         let entities: Vec<EntityId> = page
             .items
             .iter()
@@ -2076,5 +2270,916 @@ mod tests {
                 admission: AdmissionKey::new(at(500), span_entity(5, 5)),
             }],
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Content filters: service, time range, severity, scope identity.
+    // ------------------------------------------------------------------
+
+    /// The service filter returns only matching records, and the
+    /// filtered-out ones are still examined: the scan ledger carries all
+    /// five records while the results ledger carries the three matches
+    /// (F4). A filter is a predicate over the walk, never an order and
+    /// never a cheaper scan.
+    ///
+    /// Kills the no-op where a filter quietly narrows the scan charge
+    /// (making `max_scan` mean "matching records examined") or where it
+    /// skips examination altogether.
+    #[test]
+    fn a_service_filter_returns_only_matches_and_still_examines_the_rest() {
+        let store = service_store();
+        let query = checkout_query();
+        let budget = budget_with(1_000, 1 << 40, 10);
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, &query, &mut session, None);
+
+        let entities: Vec<EntityId> = page
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(1, 1), span_entity(3, 3), span_entity(5, 5)],
+            "only the checkout records, in residency order"
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        assert_eq!(
+            session.ledger().remaining_scan(),
+            10 - 5,
+            "all five records were examined — the two payments records pay max_scan too"
+        );
+        assert_eq!(
+            session.ledger().remaining_results(),
+            1_000 - 3,
+            "results are charged only for records the page returns"
+        );
+    }
+
+    /// The time range is half-open on both ends: `from` included, `to`
+    /// excluded, against the span's `start_time_unix_nano` (F3).
+    ///
+    /// Kills the closed-interval no-op on either end.
+    #[test]
+    fn a_time_range_is_half_open_on_both_ends() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        for (index, start) in [100_u64, 200, 300].into_iter().enumerate() {
+            let index = u8::try_from(index + 1).expect("fixture indices fit");
+            keep_span(
+                &mut store,
+                u64::from(index) * 100,
+                span_entity(index, index),
+                service_span(index, index, None, &scope, start),
+            );
+        }
+        let query = RecordsQuery::spans(SpanFilters {
+            service: None,
+            time_range: Some(TimeRangeFilter::new(200, 300)),
+            scope: None,
+        });
+        let page = records(&store, &query, open_budget(), None).expect("the query answers");
+        let entities: Vec<EntityId> = page
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(2, 2)],
+            "start 100 is before `from`; start 300 sits on the excluded `to`"
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// Each kind filters on its own model timestamp: a log record on its
+    /// event time — falling back to its observation time, and outside
+    /// entirely when the emitter sent neither — and a metric point on its
+    /// `time_unix_nano` (F3).
+    ///
+    /// Kills the no-op where logs filter on the observation time while an
+    /// event time is present, or where a record with no time key slips
+    /// into a bounded window.
+    #[test]
+    fn each_kind_filters_on_its_own_model_timestamp() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        keep_log(
+            &mut store,
+            100,
+            assigned(1),
+            service_log(None, &scope, None, None, None, "neither-time"),
+        );
+        keep_log(
+            &mut store,
+            200,
+            assigned(2),
+            service_log(None, &scope, None, Some(150), None, "observation-time-only"),
+        );
+        keep_log(
+            &mut store,
+            300,
+            assigned(3),
+            service_log(
+                None,
+                &scope,
+                Some(50),
+                Some(150),
+                None,
+                "event-time-outside",
+            ),
+        );
+        let (first_point, first_stream) = service_point(None, &scope, 150, 1);
+        keep_point(&mut store, 400, assigned(4), first_point, first_stream);
+        let (second_point, second_stream) = service_point(None, &scope, 250, 2);
+        keep_point(&mut store, 500, assigned(5), second_point, second_stream);
+
+        let window = TimeRangeFilter::new(100, 200);
+        let logs = records(
+            &store,
+            &RecordsQuery::logs(LogFilters {
+                service: None,
+                time_range: Some(window),
+                severity: None,
+                scope: None,
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let bodies: Vec<&str> = logs
+            .items
+            .iter()
+            .map(|view| log_body_of(view).expect("a log page"))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["observation-time-only"],
+            "the record with no time key is outside; the event timestamp \
+             outranks the in-window observation time"
+        );
+
+        let points = records(
+            &store,
+            &RecordsQuery::metric_points(MetricFilters {
+                service: None,
+                time_range: Some(window),
+                scope: None,
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let values: Vec<i64> = points
+            .items
+            .iter()
+            .map(|view| point_value_of(view).expect("a point page"))
+            .collect();
+        assert_eq!(values, vec![1], "the point's time_unix_nano is its key");
+    }
+
+    /// The severity floor: logs at or above the threshold match, and a log
+    /// with no severity number is outside a severity-filtered answer (F3).
+    /// Severity for spans and metric points is not a runtime refusal — it
+    /// is unexpressible at the type level (F2; asserted by construction in
+    /// `filters.rs`, where the span and metric filter structs carry no
+    /// severity field).
+    ///
+    /// Kills the no-op where an absent severity is treated as any value
+    /// (`None >= threshold`) or where `severity_text` sneaks into the
+    /// comparison.
+    #[test]
+    fn a_severity_floor_filters_logs_and_absent_severity_is_outside() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        let nine = SeverityNumber::try_new(9).expect("in domain");
+        let seventeen = SeverityNumber::try_new(17).expect("in domain");
+        keep_log(
+            &mut store,
+            100,
+            assigned(1),
+            service_log(None, &scope, None, None, Some(nine), "info"),
+        );
+        keep_log(
+            &mut store,
+            200,
+            assigned(2),
+            service_log(None, &scope, None, None, Some(seventeen), "error"),
+        );
+        keep_log(
+            &mut store,
+            300,
+            assigned(3),
+            service_log(None, &scope, None, None, None, "unnumbered"),
+        );
+
+        let at_floor = records(
+            &store,
+            &RecordsQuery::logs(LogFilters {
+                service: None,
+                time_range: None,
+                severity: Some(SeverityFilter::new(seventeen)),
+                scope: None,
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let at_floor_bodies: Vec<&str> = at_floor
+            .items
+            .iter()
+            .map(|view| log_body_of(view).expect("a log page"))
+            .collect();
+        assert_eq!(
+            at_floor_bodies,
+            vec!["error"],
+            "at-threshold matches; below and absent do not"
+        );
+
+        let below_floor = records(
+            &store,
+            &RecordsQuery::logs(LogFilters {
+                service: None,
+                time_range: None,
+                severity: Some(SeverityFilter::new(nine)),
+                scope: None,
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let bodies: Vec<&str> = below_floor
+            .items
+            .iter()
+            .map(|view| log_body_of(view).expect("a log page"))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["info", "error"],
+            "both numbered logs at or above the floor, in residency order"
+        );
+    }
+
+    /// The scope filter is exact name plus exact version, presence
+    /// included (F3): the same name under a different version is a
+    /// different scope, and an absent version never equals the empty
+    /// string.
+    ///
+    /// Kills the no-op where the filter matches on name alone or where
+    /// `None` means "any version".
+    #[test]
+    fn a_scope_filter_matches_name_and_version_exactly() {
+        let mut store = FixtureStore::empty();
+        let versioned = fixture_scope("io.runtime-trail.scope", Some("1.2.3"));
+        let unversioned = fixture_scope("io.runtime-trail.scope", None);
+        let other = fixture_scope("io.runtime-trail.other", Some("1.2.3"));
+        keep_span(
+            &mut store,
+            100,
+            span_entity(1, 1),
+            service_span(1, 1, None, &versioned, 10),
+        );
+        keep_span(
+            &mut store,
+            200,
+            span_entity(2, 2),
+            service_span(2, 2, None, &unversioned, 10),
+        );
+        keep_span(
+            &mut store,
+            300,
+            span_entity(3, 3),
+            service_span(3, 3, None, &other, 10),
+        );
+
+        let exact = records(
+            &store,
+            &RecordsQuery::spans(SpanFilters {
+                service: None,
+                time_range: None,
+                scope: Some(ScopeFilter::new(
+                    "io.runtime-trail.scope",
+                    Some("1.2.3".to_owned()),
+                )),
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let exact_entities: Vec<EntityId> = exact
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(exact_entities, vec![span_entity(1, 1)]);
+
+        let absent = records(
+            &store,
+            &RecordsQuery::spans(SpanFilters {
+                service: None,
+                time_range: None,
+                scope: Some(ScopeFilter::new("io.runtime-trail.scope", None)),
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let absent_entities: Vec<EntityId> = absent
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            absent_entities,
+            vec![span_entity(2, 2)],
+            "an absent filter version matches only an absent record version"
+        );
+    }
+
+    /// Invariant 3 under filters: a cursor minted under one filter set is
+    /// an error under any other filter set — a different service, or a
+    /// service filter where none was minted — and continues only under the
+    /// filters that minted it (F5).
+    ///
+    /// Kills the no-op where the fingerprint covers the kind but not the
+    /// filter fields, letting one answer set continue under another.
+    #[test]
+    fn a_cursor_continues_only_under_the_filters_that_minted_it() {
+        let store = service_store();
+        let first = records(
+            &store,
+            &checkout_query(),
+            budget_with(1, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        let foreign_service = records(
+            &store,
+            &RecordsQuery::spans(SpanFilters {
+                service: Some(ServiceFilter::new("payments")),
+                time_range: None,
+                scope: None,
+            }),
+            budget_with(1, 1 << 40, 10_000),
+            Some(&cursor),
+        )
+        .expect_err("a different service is a different query");
+        assert_eq!(
+            foreign_service,
+            QueryError::Cursor(CursorError::FingerprintMismatch)
+        );
+
+        let unfiltered = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            budget_with(1, 1 << 40, 10_000),
+            Some(&cursor),
+        )
+        .expect_err("no filter set is also a different query");
+        assert_eq!(
+            unfiltered,
+            QueryError::Cursor(CursorError::FingerprintMismatch)
+        );
+
+        let same = records(&store, &checkout_query(), open_budget(), Some(&cursor))
+            .expect("the identical filter set continues");
+        let entities: Vec<EntityId> = same
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(5, 5)],
+            "the continuation carries the rest of the same answer set"
+        );
+    }
+
+    /// A filtered set larger than one page walks to exhaustion through
+    /// cursors — no matching record repeated, none lost, the order stable,
+    /// and the filtered-out records never enter a page (invariants 2+8).
+    ///
+    /// Kills the no-op where the cursor lands on a filtered-out record and
+    /// the next page restarts before it, repeating or losing records.
+    #[test]
+    fn pagination_under_filters_walks_to_exhaustion_without_repeat_or_loss() {
+        let store = service_store();
+        let query = checkout_query();
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen: Vec<EntityId> = Vec::new();
+        let mut continuations = 0;
+        loop {
+            let presented = cursor.is_some();
+            let page = records(
+                &store,
+                &query,
+                budget_with(2, 1 << 40, 10_000),
+                cursor.as_deref(),
+            )
+            .expect("the query answers");
+            seen.extend(
+                page.items
+                    .iter()
+                    .map(|view| span_entity_of(view).expect("a span page")),
+            );
+            if let Some(next) = page.next_cursor.clone() {
+                cursor = Some(next);
+                continuations += 1;
+                if presented {
+                    assert!(
+                        page.execution
+                            .coverage
+                            .entries
+                            .iter()
+                            .any(|entry| matches!(entry, CoverageEntry::SnapshotBoundary { .. })),
+                        "every continuation names its snapshot boundary"
+                    );
+                }
+            } else {
+                assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+                break;
+            }
+            assert!(continuations < 10, "the walk terminates");
+        }
+        assert_eq!(continuations, 1, "five residents, three matches, two pages");
+        assert_eq!(
+            seen,
+            vec![span_entity(1, 1), span_entity(3, 3), span_entity(5, 5)],
+            "every matching record exactly once, in residency order"
+        );
+    }
+
+    /// A filtered continuation stays within its first page's snapshot:
+    /// matching records admitted after the minting frontier are outside
+    /// every later page, and the boundary entry names the frontier (F9).
+    ///
+    /// Kills the no-op where a filter re-evaluates records the snapshot
+    /// never held — newer matching records silently joining the page.
+    #[test]
+    fn records_admitted_after_the_frontier_stay_outside_a_filtered_continuation() {
+        let mut store = service_store();
+        let first = records(
+            &store,
+            &checkout_query(),
+            budget_with(1, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+        let payload = CursorPayload::decode(&cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.snapshot(),
+            AdmissionKey::new(at(500), span_entity(5, 5)),
+            "the frontier is the minting page's pulled batch tail"
+        );
+
+        let scope = fixture_scope("scope", None);
+        keep_span(
+            &mut store,
+            600,
+            span_entity(6, 6),
+            service_span(6, 6, Some("checkout"), &scope, 60),
+        );
+
+        let second = records(&store, &checkout_query(), open_budget(), Some(&cursor))
+            .expect("the query answers");
+        let entities: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(5, 5)],
+            "the page walks exactly the snapshot — the newer matching record \
+             stays outside"
+        );
+        assert_eq!(second.execution.parts, vec![PartOutcome::Complete]);
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    /// An evicted anchor under filters is named as a gap exactly as wave
+    /// 2 names it: the anchor is always a matching record (only matches
+    /// mint cursors), and the gap's `before` is the first resident
+    /// successor the walk examines — even when that successor is itself
+    /// filtered out of the answer (F8, F4).
+    ///
+    /// Kills the no-op where the gap names the next *matching* record,
+    /// hiding the residency position where the hole actually ends.
+    #[test]
+    fn an_evicted_anchor_under_filters_names_the_gap_and_walks_exact() {
+        let mut store = service_store();
+        let first = records(
+            &store,
+            &checkout_query(),
+            budget_with(1, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+        let payload = CursorPayload::decode(&cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(1, 1),
+            "the anchor matches"
+        );
+
+        assert!(store.evict(span_entity(1, 1)), "the anchor was resident");
+
+        let second = records(&store, &checkout_query(), open_budget(), Some(&cursor))
+            .expect("the query answers");
+        let entities: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(5, 5)],
+            "the walk resumes exactly, skipping nothing matching that is resident"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![
+                CoverageEntry::SnapshotBoundary {
+                    admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+                },
+                CoverageEntry::EvictionGap {
+                    after: span_entity(1, 1),
+                    before: span_entity(2, 2),
+                },
+            ],
+            "the gap names the evicted anchor and the first examined successor — \
+             the filtered-out record where the hole ends"
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    /// The byte ceiling under filters counts only matching records of the
+    /// remainder: a filtered-out record is never evidence-charged while
+    /// included and never counted into `omitted` when behind the wall (F6,
+    /// F4).
+    ///
+    /// Kills both lies: counting filtered-out records into the omission,
+    /// and charging their evidence on the way past.
+    #[test]
+    fn a_byte_ceiling_under_filters_counts_only_matching_omissions() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        let mut sizes = Vec::new();
+        for index in 1_u8..=5_u8 {
+            let service = match index {
+                2 | 4 => "payments",
+                _ => "checkout",
+            };
+            let name = match index {
+                1 => "a".repeat(10),
+                2 => "b".repeat(10),
+                3 => "c".repeat(40),
+                4 => "d".repeat(10),
+                _ => "e".repeat(30),
+            };
+            let mut span = fixture_span(index, index, &name);
+            span.resource = Arc::new(fixture_resource(Some(service)));
+            span.scope = Arc::new(scope.clone());
+            sizes.push(u64::try_from(span.accounted_size()).expect("sizes fit"));
+            keep_span(
+                &mut store,
+                u64::from(index) * 100,
+                span_entity(index, index),
+                span,
+            );
+        }
+        // The ceiling fits e1 and e3 with e2's evidence left over — but
+        // e2 was never charged, so e5 is the wall — and stops one byte
+        // short of it.
+        let ceiling = sizes[0] + sizes[2] + sizes[1] - 1;
+        let query = checkout_query();
+        let budget = budget_with(1_000, ceiling, 10_000);
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, &query, &mut session, None);
+
+        let truncation = degraded_of(&page);
+        assert_eq!(truncation.dimension, Dimension::Bytes);
+        assert_eq!(
+            truncation.omitted, 1,
+            "only e5 — the matching record behind the wall; e4 is filtered, \
+             not omitted"
+        );
+        let entities: Vec<EntityId> = page
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(entities, vec![span_entity(1, 1), span_entity(3, 3)]);
+        assert_eq!(
+            session.ledger().remaining_bytes(),
+            ceiling - sizes[0] - sizes[2],
+            "the filtered-out records' evidence was never charged"
+        );
+        let cursor = page.next_cursor.as_deref().expect("the page continues");
+        let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(3, 3),
+            "the cursor anchors at the last included record"
+        );
+        assert!(
+            page.execution.coverage.entries.is_empty(),
+            "a counted omission needs no coverage entry"
+        );
+    }
+
+    /// A dead continuation under filters degrades by echoing the presented
+    /// cursor byte for byte — and that echo is anchored at the last
+    /// matching included record, because only matches mint cursors (F7).
+    ///
+    /// Kills the no-op where a filtered walk moves the caller without
+    /// returning anything.
+    #[test]
+    fn a_dead_continuation_under_filters_degrades_at_the_last_matching_anchor() {
+        let store = service_store();
+        let first = records(
+            &store,
+            &checkout_query(),
+            budget_with(1, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        let second = records(
+            &store,
+            &checkout_query(),
+            QueryBudget::new(Duration::ZERO, 1_000, 1 << 40, 10_000, 4_096),
+            Some(&cursor),
+        )
+        .expect("the query answers");
+
+        assert!(second.items.is_empty());
+        assert_eq!(
+            second.next_cursor.as_deref(),
+            Some(cursor.as_slice()),
+            "the presented cursor is echoed byte for byte"
+        );
+        let truncation = degraded_of(&second);
+        assert_eq!(truncation.dimension, Dimension::Deadline);
+        assert_eq!(
+            truncation.position,
+            crate::result::TruncationPoint::Cursor(cursor.clone()),
+            "the truncation names the echo, not a fresh cursor"
+        );
+        let payload = CursorPayload::decode(second.next_cursor.as_deref().expect("the echo"))
+            .expect("the echoed cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(1, 1),
+            "the echo sits at the last matching included record — the anchor \
+             only matches mint"
+        );
+    }
+
+    /// A scan-ceiling stop under filters anchors at the last examined
+    /// record — which under a filter is here a filtered-out one — and the
+    /// continuation stays lossless: it resumes strictly after that
+    /// residency position and returns exactly the matching rest (F4, F7).
+    ///
+    /// The ceiling of two examines e1 (checkout, included) and e2
+    /// (payments, filtered out) and refuses e3's charge: the cursor
+    /// anchors at e2, the record the walk actually stopped at. Anchoring
+    /// at the last *included* record instead would make every page
+    /// re-examine the filtered-out span between the anchors; anchoring at
+    /// or past the refused record would lose it.
+    #[test]
+    fn a_scan_stop_under_filters_anchors_at_the_last_examined_and_stays_lossless() {
+        let store = service_store();
+        let query = checkout_query();
+        let budget = budget_with(1_000, 1 << 40, 2);
+        let mut session = budget.admit(Instant::now());
+        let page = walk_records(&store, &query, &mut session, None);
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "only e1 was examined and included before the ceiling expired"
+        );
+        let truncation = degraded_of(&page);
+        assert_eq!(truncation.dimension, Dimension::Scan);
+        let cursor = page.next_cursor.as_deref().expect("the page continues");
+        let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(2, 2),
+            "the anchor is the last examined record — filtered out, but where \
+             the walk actually stopped"
+        );
+        assert_eq!(session.ledger().remaining_scan(), 0);
+
+        let second =
+            records(&store, &query, open_budget(), Some(cursor)).expect("the query answers");
+        let entities: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(5, 5)],
+            "the continuation resumes after the stop and loses nothing"
+        );
+    }
+
+    /// Invariant 8 under filters: the same resident set, the same filtered
+    /// query and the same budget assemble identical content parts across
+    /// two runs and two independently built stores — the minted cursor
+    /// included.
+    ///
+    /// Kills the no-op where filter evaluation leaks run facts (a clock
+    /// read, an iteration order) into the page.
+    #[test]
+    fn identical_filtered_queries_assemble_identical_pages() {
+        fn run(store: &FixtureStore) -> Page<RecordView> {
+            records(
+                store,
+                &checkout_query(),
+                budget_with(2, 1 << 40, 10_000),
+                None,
+            )
+            .expect("the query answers")
+        }
+
+        let first_store = service_store();
+        let second_store = service_store();
+        let first = run(&first_store);
+        let second = run(&first_store);
+        let third = run(&second_store);
+        assert_eq!(first, second, "two runs on one store assemble one page");
+        assert_eq!(first, third, "a second, identically built store too");
+
+        let entities: Vec<EntityId> = first
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(1, 1), span_entity(3, 3)],
+            "the page carries the first two matches in residency order"
+        );
+        let cursor = first
+            .next_cursor
+            .as_deref()
+            .expect("a truncated page continues");
+        let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(3, 3),
+            "the minted cursor anchors at the last included record"
+        );
+    }
+
+    /// An all-`None` filter set is byte-identical to a kind-only query
+    /// (F2): the same canonical bytes, the same fingerprint, the same
+    /// pages — items, continuation and execution — under both a complete
+    /// and a truncating budget, for every kind.
+    ///
+    /// Kills the no-op where the empty filter set perturbs the encoding or
+    /// the walk, breaking every wave-2 byte.
+    #[test]
+    fn all_none_filters_are_byte_identical_to_kind_only_queries() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        keep_span(
+            &mut store,
+            100,
+            span_entity(1, 1),
+            service_span(1, 1, Some("checkout"), &scope, 10),
+        );
+        keep_span(
+            &mut store,
+            200,
+            span_entity(2, 2),
+            service_span(2, 2, None, &scope, 10),
+        );
+        keep_log(
+            &mut store,
+            300,
+            assigned(3),
+            service_log(
+                Some("checkout"),
+                &scope,
+                Some(50),
+                Some(60),
+                Some(SeverityNumber::try_new(9).expect("in domain")),
+                "log-one",
+            ),
+        );
+        let (point, stream) = service_point(None, &scope, 70, 1);
+        keep_point(&mut store, 400, assigned(4), point, stream);
+
+        let plain = [
+            RecordsQuery::new(SignalKind::Spans),
+            RecordsQuery::new(SignalKind::LogRecords),
+            RecordsQuery::new(SignalKind::MetricPoints),
+        ];
+        let emptied = [
+            RecordsQuery::spans(SpanFilters::all_none()),
+            RecordsQuery::logs(LogFilters::all_none()),
+            RecordsQuery::metric_points(MetricFilters::all_none()),
+        ];
+        for (plain, emptied) in plain.iter().zip(emptied.iter()) {
+            assert_eq!(
+                plain.canonical_bytes(),
+                emptied.canonical_bytes(),
+                "the all-None encoding is the kind-only encoding"
+            );
+            assert_eq!(plain, emptied, "the queries are equal");
+            for results in [1_000_u64, 1] {
+                let budget = budget_with(results, 1 << 40, 10_000);
+                let plain_page =
+                    records(&store, plain, budget_with(results, 1 << 40, 10_000), None)
+                        .expect("the query answers");
+                let emptied_page =
+                    records(&store, emptied, budget, None).expect("the query answers");
+                assert_eq!(
+                    plain_page, emptied_page,
+                    "identical pages under a {results}-result budget"
+                );
+            }
+        }
+    }
+
+    /// Filters are predicates, never an order (F4): a page whose matching
+    /// records' timestamps deliberately run *against* the residency order
+    /// comes back in residency order — no re-sort by the filter key, and
+    /// the log's observation-time fallback participates in a timestamp
+    /// scheme the emitter never sorted.
+    ///
+    /// Kills the no-op where filtering re-orders the page (or where the
+    /// fallback key is consulted only when it happens to be ascending).
+    #[test]
+    fn a_time_filtered_page_stays_in_scan_order_not_time_order() {
+        let scope = fixture_scope("scope", None);
+        let mut store = FixtureStore::empty();
+        // Scan order 100..400; the time keys descend: 900, 700, 500, 300.
+        keep_log(
+            &mut store,
+            100,
+            assigned(1),
+            service_log(None, &scope, None, Some(900), None, "latest"),
+        );
+        keep_log(
+            &mut store,
+            200,
+            assigned(2),
+            service_log(None, &scope, Some(700), Some(950), None, "second"),
+        );
+        keep_log(
+            &mut store,
+            300,
+            assigned(3),
+            service_log(None, &scope, Some(500), Some(800), None, "third"),
+        );
+        keep_log(
+            &mut store,
+            400,
+            assigned(4),
+            service_log(None, &scope, Some(300), Some(310), None, "earliest"),
+        );
+
+        let page = records(
+            &store,
+            &RecordsQuery::logs(LogFilters {
+                service: None,
+                time_range: Some(TimeRangeFilter::new(400, 1_000)),
+                severity: None,
+                scope: None,
+            }),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+        let bodies: Vec<&str> = page
+            .items
+            .iter()
+            .map(|view| log_body_of(view).expect("a log page"))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["latest", "second", "third"],
+            "scan order, not time order — and the observation-time-only \
+             record participates through its fallback key"
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        assert!(page.next_cursor.is_none());
     }
 }

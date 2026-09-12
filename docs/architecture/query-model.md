@@ -18,6 +18,17 @@ storage concepts: no table, no index, no driver type appears in a query or
 its result. That is what makes one contract serve both
 [storage modes](storage-model.md).
 
+The records flow admits **content filters** drawn from that same vocabulary:
+service (resource identity), a half-open time range over the record's
+kind-specific model timestamps, a minimum severity (log records — the filter
+is unexpressible for spans and metric points), and scope identity (name and
+version, exact). Filters are predicates over the record view: they never
+reorder the total order and never enter a storage driver. A filtered-out
+record was still examined — the scan charge stands and the deadline ran on
+it — but it is never returned, never byte-charged, and never counted into an
+omission. The cursor's query fingerprint binds the filter set, so a cursor
+continues only under the filters that minted it.
+
 ## Every query carries a budget
 
 Every query admits with a budget. A query without a budget is invalid — not
