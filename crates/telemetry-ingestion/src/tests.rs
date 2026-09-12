@@ -835,7 +835,10 @@ fn a_resource_schema_url_drift_collapses_and_a_scope_drift_conflicts() {
     let drifted = encode(&traces_request(vec![resource_spans_with_schema_url(
         "https://schema/v2",
         Some(resource(Vec::new())),
-        vec![scope_spans(Some(scope("test")), vec![trace_span("op", T1, S1)])],
+        vec![scope_spans(
+            Some(scope("test")),
+            vec![trace_span("op", T1, S1)],
+        )],
     )]));
     let second = harness
         .pipeline

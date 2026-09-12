@@ -140,9 +140,7 @@ impl AdmissionAnomalies {
     /// Every anomaly recorded this session.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.span_identity_conflicts
-            + self.point_identity_conflicts
-            + self.provenance_mismatches
+        self.span_identity_conflicts + self.point_identity_conflicts + self.provenance_mismatches
     }
 }
 
