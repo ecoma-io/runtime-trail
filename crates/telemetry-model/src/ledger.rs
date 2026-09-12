@@ -38,21 +38,30 @@
 //! evicts a record, [`AdmissionLedger::forget`] removes its ledger entry; a
 //! re-delivery afterwards is admitted fresh. When a stream's last resident
 //! point leaves residency, [`AdmissionLedger::release_stream`] drops the
-//! interned identity.
+//! interned identity. A record the store **refused at keep** ends its
+//! identity the same way: nothing was inserted, so the store reports the
+//! refusal through the same hook and the composition root answers with
+//! `forget` and `release_stream` — without that report the entry and the
+//! interned stream would outlive any residency, stranding the identity
+//! behind every later collapse (ADR 0008).
 //!
 //! # Stream release (ADR 0008)
 //!
 //! Interning is only half of the stream lifecycle: the ledger interns a
 //! stream when its first point is admitted and must drop it when the
-//! stream's last **resident** point leaves — a fact only the store knows
-//! (it holds the per-stream residency count). The composition root
-//! completes the lifecycle by wiring the store's eviction hook to
+//! stream's residency story ends — a fact only the store knows (it holds
+//! the per-stream residency count and the keep verdicts). The composition
+//! root completes the lifecycle by wiring the store's hook to
 //! [`AdmissionLedger::forget`] and [`AdmissionLedger::release_stream`] over
 //! the same ledger: `forget` runs per evicted record, `release_stream` when
-//! the store's per-stream residency count reaches zero. Until that call
-//! arrives the interned identity stays — a stream whose points were
-//! admitted but never kept, or whose points are still resident, remains
-//! interned by design, never dropped early.
+//! the store's per-stream residency count reaches zero. Two lifecycles
+//! deliver the release, and neither strands: a stream whose points were
+//! **kept and later evicted** is released when the store reports its last
+//! resident point gone (`stream_released`), and a stream whose point was
+//! **admitted but refused at keep** is released through the same hook's
+//! refusal report (`keep_refused`). A stream whose points are still
+//! resident is interned by design, for exactly as long as those points
+//! stand.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -227,7 +236,9 @@ impl AdmissionLedger {
     }
 
     /// Forgets one admitted record: the ledger entry naming `entity` is
-    /// removed, on eviction. After forgetting, a re-delivery of the same
+    /// removed — on eviction, and equally on a keep refusal that inserted
+    /// nothing, the two ways a record's residency story ends (ADR 0008's
+    /// hook reports both). After forgetting, a re-delivery of the same
     /// natural identity is admitted fresh — for an assigned id that means
     /// a new serial; for a span it means the natural identity is free
     /// again (and a re-delivery re-admits under the same natural id).
@@ -235,9 +246,9 @@ impl AdmissionLedger {
     ///
     /// Forgetting a metric point does **not** release its stream: the
     /// stream's interned identity stays until
-    /// [`AdmissionLedger::release_stream`] reports that the stream's last
-    /// resident point left — a fact only the store's per-stream residency
-    /// count knows.
+    /// [`AdmissionLedger::release_stream`] reports the stream's residency
+    /// ended — a fact only the store's per-stream residency count and keep
+    /// verdicts know.
     pub fn forget(&mut self, entity: EntityId) {
         match entity {
             EntityId::Span {
@@ -256,7 +267,8 @@ impl AdmissionLedger {
 
     /// Releases one interned stream identity: the ledger's interning entry
     /// for `stream` is dropped, so the identity's payload leaves the ledger
-    /// when the store reports the stream's last resident point gone. The
+    /// when the store reports the stream's residency ended — its last
+    /// resident point gone, or its only point refused at keep. The
     /// refcount behind the call is the **store's** residency count — the
     /// ledger does not track residency itself; it interns on admission and
     /// releases when told. Releasing a stream that was never interned, or
@@ -1406,6 +1418,50 @@ mod metric_points {
             "the re-interned identity is a fresh payload, not the released one"
         );
         assert_eq!(ledger.resident_streams(), 1);
+    }
+
+    #[test]
+    fn a_keep_refusal_releases_the_identity_the_hook_reports_and_a_redelivery_readmits_fresh() {
+        let mut ledger = ledger();
+        let identity = stream_identity(
+            StreamKind::Sum { monotonic: true },
+            Some(Temporality::Cumulative),
+        );
+        let first = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let entity = assert_admitted(&first);
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "admission interned the stream before any keep"
+        );
+
+        // The store refused this record's keep — nothing was inserted. The
+        // hook delivers the refusal (`keep_refused`), and the composition
+        // root's documented answer is the same pair an eviction earns:
+        // forget the record, release the stream.
+        ledger.forget(entity);
+        ledger.release_stream(&identity);
+        assert_eq!(
+            ledger.resident_streams(),
+            0,
+            "a refused record's interned stream does not strand"
+        );
+        assert!(
+            ledger.points.is_empty() && ledger.assigned_points.is_empty(),
+            "a refused record's ledger entry does not strand"
+        );
+
+        // The pipeline's next delivery of the same bytes admits FRESH: the
+        // collapse intercept has nothing to land on, so a re-attempt after
+        // a refusal is a real admission.
+        let redelivered = ledger.admit_metric_point(&identity, sum_point(100, 200, 5));
+        let fresh = assert_admitted(&redelivered);
+        assert_ne!(fresh, entity, "a fresh serial, never a collapse");
+        assert_eq!(
+            ledger.resident_streams(),
+            1,
+            "the fresh admission re-interned the stream"
+        );
     }
 
     #[test]
