@@ -38,6 +38,10 @@
  *   layer-storage         →  layer-model            ✅  the storage abstraction knows the model, no driver
  *   layer-storage-driver  →  storage, model         ✅  a driver implements the abstraction it belongs under
  *   layer-ingest          →  model, storage         ✅  ingestion writes through the abstraction
+ *   layer-bench           →  model/storage/driver/ingest ✅ the benchmark probes compose exactly what they
+ *                                                       measure — the real pipeline, the real driver,
+ *                                                       the real contract — and nothing else; they are
+ *                                                       a measurement harness, never a product surface
  *   layer-app             →  api/driver/ingest/app  ✅  the composition roots wire everything; app may
  *                                                       compose app (desktop shells server's contract, not
  *                                                       its crate — the edge under test stays server→api)
@@ -120,6 +124,23 @@ export const depConstraints = [
   {
     sourceTag: "layer-ingest",
     onlyDependOnLibsWithTags: ["layer-model", "layer-storage"],
+  },
+
+  // The benchmark probes (Phase 1) compose exactly the layers they
+  // measure — model, storage contract, the memory driver, ingestion —
+  // and nothing else: no query, correlation, api, app, agent or view
+  // edge exists. They name a concrete driver the same way the
+  // composition root does, because a memory-path probe that measured a
+  // stand-in would measure nothing; they stay out of the product graph
+  // by shipping nowhere and importing nothing above ingestion.
+  {
+    sourceTag: "layer-bench",
+    onlyDependOnLibsWithTags: [
+      "layer-model",
+      "layer-storage",
+      "layer-storage-driver",
+      "layer-ingest",
+    ],
   },
 
   // The composition roots wire everything: they are the only places allowed

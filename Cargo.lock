@@ -2559,6 +2559,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-trail-bench-probes"
+version = "0.0.0"
+dependencies = [
+ "runtime-trail-storage",
+ "runtime-trail-storage-memory",
+ "runtime-trail-telemetry-ingestion",
+ "runtime-trail-telemetry-model",
+]
+
+[[package]]
 name = "runtime-trail-correlation"
 version = "0.0.0"
 dependencies = [

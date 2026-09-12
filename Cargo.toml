@@ -11,6 +11,7 @@ members = [
     "crates/storage-sqlite",
     "crates/mcp",
     "crates/server",
+    "crates/bench-probes",
     "apps/desktop/src-tauri",
 ]
 
