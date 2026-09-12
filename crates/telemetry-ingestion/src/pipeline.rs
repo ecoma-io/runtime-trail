@@ -55,10 +55,19 @@
 //! producer does next. A retry re-delivers the whole export; spans and
 //! metric points collapse onto their standing records and so queue
 //! nothing (the entries already in flight are the delivery), while log
-//! records — no natural identity — are admitted and queued again. The one
-//! record whose own offer the queue refused stands in the ledger with no
-//! queue entry: the signal named that refusal loudly and retryably, and
-//! no later collapse silently resurrects a delivery that never happened.
+//! records — no natural identity — are admitted and queued again.
+//!
+//! The one record whose own offer the queue refused is **ended by this
+//! pipeline before the signal returns**: the ledger entry admission just
+//! created is forgotten — and the interned stream identity released when
+//! this very admission created it — by the same lifecycle ADR 0008 gives
+//! every other way a record fails to stay resident. No entry stands
+//! behind a delivery that never happened, so the retry the signal invites
+//! can actually deliver: the re-delivery of that record is admitted
+//! fresh, not collapsed onto a stranded identity. What the undo never
+//! touches is what an **earlier** delivery created — a collapse this
+//! export made queues nothing and must leave the standing record and its
+//! identity exactly as they are.
 
 use std::sync::{
     Arc, Mutex, PoisonError,
@@ -528,13 +537,26 @@ impl Pipeline {
                 let record = admission
                     .record
                     .expect("an admitted span carries its ledger record");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Span(record),
-                    })
-                    .map(|()| RecordOutcome::Admitted { entity })
+                let offer = self.sink.offer(QueuedRecord {
+                    entity,
+                    admitted_at: now,
+                    record: StoredRecord::Span(record),
+                });
+                match offer {
+                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
+                    Err(signal) => {
+                        // The queue refused the record this very admission
+                        // admitted: its ledger entry must not outlive the
+                        // delivery it names. The signal is the one retryable
+                        // answer, and its promised retry can only deliver if
+                        // the re-delivery is admitted fresh — the same
+                        // lifecycle ADR 0008 gives a refused keep, applied
+                        // by the pipeline itself. (A span with assigned ids
+                        // keeps no entry, so `forget` is a no-op there.)
+                        ledger.forget(entity);
+                        Err(signal)
+                    }
+                }
             }
             AdmissionOutcome::Collapsed { entity } => {
                 // The law the queue states and this pipeline keeps: a
@@ -568,14 +590,19 @@ impl Pipeline {
         };
         let admission = ledger.admit_log_record(&record);
         match admission {
-            AdmissionOutcome::Admitted { entity } => self
-                .sink
-                .offer(QueuedRecord {
-                    entity,
-                    admitted_at: now,
-                    record: StoredRecord::Log(Arc::new(record)),
-                })
-                .map(|()| RecordOutcome::Admitted { entity }),
+            AdmissionOutcome::Admitted { entity } => {
+                // A log record keeps no ledger entry — OTLP defines no
+                // log-record identity — so a refused offer has nothing to
+                // strand: the retry re-admits and re-queues it fresh by
+                // nature, no undo needed.
+                self.sink
+                    .offer(QueuedRecord {
+                        entity,
+                        admitted_at: now,
+                        record: StoredRecord::Log(Arc::new(record)),
+                    })
+                    .map(|()| RecordOutcome::Admitted { entity })
+            }
             AdmissionOutcome::Collapsed { entity } => Ok(RecordOutcome::Collapsed { entity }),
             AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
             AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
@@ -607,13 +634,30 @@ impl Pipeline {
                 let stream = admission
                     .stream
                     .expect("an admitted point carries its interned stream identity");
-                self.sink
-                    .offer(QueuedRecord {
-                        entity,
-                        admitted_at: now,
-                        record: StoredRecord::Point { stream, point },
-                    })
-                    .map(|()| RecordOutcome::Admitted { entity })
+                let offer = self.sink.offer(QueuedRecord {
+                    entity,
+                    admitted_at: now,
+                    record: StoredRecord::Point {
+                        stream: Arc::clone(&stream),
+                        point,
+                    },
+                });
+                match offer {
+                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
+                    Err(signal) => {
+                        // As with spans: the refused delivery's identity
+                        // ends here, by the pipeline that just created it.
+                        // The intern is undone only when *this* admission
+                        // created it — an intern made for an earlier
+                        // standing point of the same stream is that
+                        // point's residency story, not this refusal's.
+                        ledger.forget(entity);
+                        if admission.fresh_intern {
+                            ledger.release_stream(&stream);
+                        }
+                        Err(signal)
+                    }
+                }
             }
             AdmissionOutcome::Collapsed { entity } => {
                 // As with spans: a collapse is the point already admitted.

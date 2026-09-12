@@ -104,6 +104,14 @@ pub struct PointAdmission {
     /// descriptor: nothing a refused delivery earned is handed out, and a
     /// fresh intern made for it is undone.
     pub stream: Option<Arc<StreamIdentity>>,
+    /// Whether **this admission** created the interned entry `stream`
+    /// names — `false` when the stream was already interned for an
+    /// earlier standing point. The pipeline consults it when the
+    /// hand-off queue refuses the record it just admitted: the undo of a
+    /// refused delivery must end exactly what *this* admission created
+    /// (the ledger entry, and the intern only when this admission made
+    /// it) and never touch what an earlier delivery still stands on.
+    pub fresh_intern: bool,
 }
 
 /// The observable runtime counter for admission anomalies.
@@ -415,6 +423,7 @@ impl AdmissionLedger {
                 outcome: AdmissionOutcome::Invalid { error },
                 record: None,
                 stream: None,
+                fresh_intern: false,
             };
         }
         if let Err(error) = MetricStream::check_point_coherence(stream, &point, 0) {
@@ -422,6 +431,7 @@ impl AdmissionLedger {
                 outcome: AdmissionOutcome::Invalid { error },
                 record: None,
                 stream: None,
+                fresh_intern: false,
             };
         }
         // The stream-level gates — the identity's resource and scope and,
@@ -436,6 +446,7 @@ impl AdmissionLedger {
                 outcome: AdmissionOutcome::Rejected { rejection },
                 record: None,
                 stream: None,
+                fresh_intern: false,
             };
         }
         if let Err(rejection) = check_point(&point, &self.limits) {
@@ -443,6 +454,7 @@ impl AdmissionLedger {
                 outcome: AdmissionOutcome::Rejected { rejection },
                 record: None,
                 stream: None,
+                fresh_intern: false,
             };
         }
         // Every gate passed: now — and only now — intern the stream
@@ -492,6 +504,7 @@ impl AdmissionLedger {
                         outcome: AdmissionOutcome::Collapsed { entity: *standing },
                         record: Some(Arc::clone(&standing_key.point)),
                         stream: Some(interned),
+                        fresh_intern,
                     }
                 } else {
                     self.anomalies.point_identity_conflicts += 1;
@@ -499,6 +512,7 @@ impl AdmissionLedger {
                         outcome: AdmissionOutcome::Conflict { entity: *standing },
                         record: None,
                         stream: Some(interned),
+                        fresh_intern,
                     }
                 }
             } else {
@@ -514,6 +528,7 @@ impl AdmissionLedger {
                     outcome: AdmissionOutcome::Conflict { entity: *standing },
                     record: None,
                     stream: None,
+                    fresh_intern: false,
                 }
             }
         } else {
@@ -527,6 +542,7 @@ impl AdmissionLedger {
                 outcome: AdmissionOutcome::Admitted { entity },
                 record: Some(point),
                 stream: Some(interned),
+                fresh_intern,
             }
         }
     }
