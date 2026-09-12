@@ -606,6 +606,17 @@ impl CoreRuntime {
     pub(crate) fn lock_store_for_test(&self) -> MutexGuard<'_, Box<dyn TelemetryStore>> {
         self.lock_store()
     }
+
+    /// The hand-off queue's record count — the seam that lets tests
+    /// observe a *pop*. The pump pops a record before its keep takes the
+    /// store lock, so a frozen store bounds the pump to one further pop
+    /// without bounding when that pop lands; queue-length movement is the
+    /// only test-visible proof that pop has happened (a keep blocked on
+    /// the frozen store counts nothing).
+    #[cfg(test)]
+    pub(crate) fn queue_len_for_test(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 impl std::fmt::Debug for CoreRuntime {
@@ -875,18 +886,33 @@ mod tests {
         // exact same point, re-delivered, is admitted FRESH — a `Collapsed`
         // outcome would mean the ledger still held the evicted entry
         // behind it.
-        let again = ingest_point("a", 1);
-        assert!(
-            matches!(&again.records[0], RecordOutcome::Admitted { .. }),
-            "the re-delivery must be fresh, not collapsed onto the evicted \
-             entry: {:?}",
-            again.records[0]
-        );
-        assert_eq!(
-            releaser.resident_streams(),
-            2,
-            "the re-delivery re-interned stream a fresh"
-        );
+        //
+        // The freeze holds across the re-delivery and its ledger reads on
+        // purpose: the re-delivery carries its original admission time, so
+        // once the pump keeps it the store's make-room eviction evicts the
+        // record it just kept (its key is the smallest resident key) and
+        // the hook then releases the stream again. Without the freeze the
+        // two asserts below race the pump's keep and can read the release
+        // instead of the intern (filed flake #10). With it, the pump cannot
+        // keep — and thereby cannot evict or release — until the
+        // ledger-side proof is done. Nothing is awaited under the lock: the
+        // blocked keep is the test's determinism device, the same one the
+        // saturation tests use.
+        {
+            let _frozen = runtime.lock_store_for_test();
+            let again = ingest_point("a", 1);
+            assert!(
+                matches!(&again.records[0], RecordOutcome::Admitted { .. }),
+                "the re-delivery must be fresh, not collapsed onto the evicted \
+                 entry: {:?}",
+                again.records[0]
+            );
+            assert_eq!(
+                releaser.resident_streams(),
+                2,
+                "the re-delivery re-interned stream a fresh"
+            );
+        }
         wait_for_pump(&runtime, |summary| summary.kept == 5);
         // Every removal was reported: identity ended wherever residency
         // did, with no divergence between the store's removals and the
