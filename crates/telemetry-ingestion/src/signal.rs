@@ -236,8 +236,24 @@ pub enum Unrepresentable {
     /// A `trace_state` string carried a member the model's ordered
     /// (vendor, value) entry list cannot represent — a member with no `=`.
     TraceState {
-        /// The raw string as sent, for the refusal message.
-        raw: String,
+        /// The offending member, bounded: the raw string is unbounded
+        /// transport input and is never cloned into the refusal message
+        /// whole. The member is the atomic transport unit the conflict is
+        /// about; a hostile multi-megabyte `trace_state` is refused before
+        /// any member is materialized, so this string is at most one member
+        /// of a within-cap string (≤ 512 bytes by the decode boundary).
+        member: String,
+    },
+    /// A `trace_state` past the W3C Trace Context caps — more than 32 list
+    /// members or more than 512 bytes total. Tracestate is transport
+    /// metadata, not a required part of the model, so the caps live at the
+    /// decode boundary; the refusal names the measured counts, and (being
+    /// the wire itself) deliberately carries no clone of the raw string.
+    TraceStateOverCap {
+        /// The member count measured on the wire.
+        members: usize,
+        /// The total byte count measured on the wire.
+        bytes: usize,
     },
 }
 
@@ -273,10 +289,17 @@ impl std::fmt::Display for Unrepresentable {
                     "resource carried entity_refs (OTLP v1.11 Alpha), which the model has no slot for"
                 )
             }
-            Self::TraceState { raw } => {
+            Self::TraceState { member } => {
                 write!(
                     f,
-                    "trace_state {raw:?} is not a list of vendor=value entries"
+                    "trace_state member {member:?} is not a vendor=value entry"
+                )
+            }
+            Self::TraceStateOverCap { members, bytes } => {
+                write!(
+                    f,
+                    "trace_state over the W3C caps: {members} members, {bytes} bytes \
+                     (limit 32 members, 512 bytes)"
                 )
             }
         }

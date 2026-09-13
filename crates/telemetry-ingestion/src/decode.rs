@@ -45,6 +45,7 @@ use crate::otlp::opentelemetry::{
     resource::v1 as wire_resource, trace::v1 as wire_trace,
 };
 use crate::signal::{RecordRejection, Unrepresentable};
+use runtime_trail_telemetry_model::budgets::{BudgetLimits, BudgetName, BudgetRejection};
 
 /// A translation result: the model record, or the per-record refusal naming
 /// why the bytes cannot cross.
@@ -87,12 +88,13 @@ impl Envelope {
 pub(crate) fn resource(
     resource: wire_resource::Resource,
     schema_url: &str,
+    limits: &BudgetLimits,
 ) -> Translated<Arc<Resource>> {
     if !resource.entity_refs.is_empty() {
         return unrepresentable(Unrepresentable::UnsupportedEntityRefs);
     }
     Ok(Arc::new(Resource {
-        attributes: attributes(resource.attributes, "resource attribute")?,
+        attributes: attributes(resource.attributes, "resource attribute", limits)?,
         schema_url: present_string(schema_url),
         dropped_attributes_count: resource.dropped_attributes_count,
     }))
@@ -103,11 +105,12 @@ pub(crate) fn resource(
 pub(crate) fn scope(
     scope: wire::InstrumentationScope,
     schema_url: &str,
+    limits: &BudgetLimits,
 ) -> Translated<Arc<InstrumentationScope>> {
     Ok(Arc::new(InstrumentationScope {
         name: scope.name,
         version: present_string(&scope.version),
-        attributes: attributes(scope.attributes, "scope attribute")?,
+        attributes: attributes(scope.attributes, "scope attribute", limits)?,
         schema_url: present_string(schema_url),
         dropped_attributes_count: scope.dropped_attributes_count,
     }))
@@ -123,12 +126,51 @@ fn present_string(text: &str) -> Option<String> {
 
 /// Wire `KeyValue`s → the model's attribute map. Duplicate keys are refused
 /// by the model's own construction.
-fn attributes(pairs: Vec<wire::KeyValue>, field: &'static str) -> Translated<Attributes> {
+///
+/// The attribute-count budget is consulted **before** any per-attribute
+/// allocation: a list over its field's count budget is refused at the count
+/// boundary — naming the budget, its limit and the observed count — without
+/// materializing the attributes it would otherwise waste. The budget is the
+/// model gate's own split (per-signal sets held to `attributes_per_signal`,
+/// the three nested sets to `attributes_per_nested_set`), so the trigger
+/// counts and the at-cap acceptance are identical to the ledger's; the
+/// ledger gate remains the second, value-level check (size and nesting).
+fn attributes(
+    pairs: Vec<wire::KeyValue>,
+    field: &'static str,
+    limits: &BudgetLimits,
+) -> Translated<Attributes> {
+    let (budget, limit) = attribute_count_budget(field, limits);
+    let observed = pairs.len();
+    if observed > limit {
+        return Err(RecordRejection::Budget(BudgetRejection {
+            budget,
+            limit,
+            observed,
+        }));
+    }
     let converted: Vec<(String, Value)> = pairs
         .into_iter()
         .map(|kv| key_value(kv, field))
         .collect::<Translated<_>>()?;
     Attributes::from_pairs(converted).map_err(RecordRejection::DuplicateKey)
+}
+
+/// The attribute-count budget one field's set is held to — the model gate's
+/// own split: per-signal for resource, scope, span, log, data point and
+/// metric-metadata sets; per-nested-set for span event, span link and
+/// exemplar-filtered-attribute sets.
+fn attribute_count_budget(field: &'static str, limits: &BudgetLimits) -> (BudgetName, usize) {
+    match field {
+        "span event attribute" | "span link attribute" | "exemplar filtered attribute" => (
+            BudgetName::AttributesPerNestedSet,
+            limits.attributes_per_nested_set,
+        ),
+        _ => (
+            BudgetName::AttributesPerSignal,
+            limits.attributes_per_signal,
+        ),
+    }
 }
 
 /// One wire `KeyValue` → one model entry. The key is examined exactly like
@@ -281,15 +323,40 @@ fn parent_span_id(bytes: &[u8]) -> Translated<Option<SpanId>> {
 /// The W3C `trace_state` string → the model's ordered (vendor, value)
 /// entries, in the order sent. A member without `=` is not representable as
 /// an entry pair; the record is refused rather than silently reshaped.
+///
+/// The W3C Trace Context caps ride the decode boundary: `trace_state` is
+/// transport metadata, not a required part of the model, so the spec's
+/// limits (32 list members, 512 bytes total) are enforced here, **before**
+/// any per-member allocation, and a `trace_state` past either cap is
+/// refused as over-budget. Both refusals are billing from the wire only:
+/// the raw string is never cloned into the refusal message — a hostile
+/// string is unbounded transport input, and a member is summarized (or the
+/// measured byte count named) instead, preserving the honest error meaning.
 fn trace_state(raw: &str) -> Translated<TraceState> {
+    const MAX_MEMBERS: usize = 32;
+    const MAX_BYTES: usize = 512;
     if raw.is_empty() {
         return Ok(TraceState::default());
+    }
+    // Both caps are observed before parsing so a hostile string is refused
+    // without granting any per-member allocation. The byte cap fires first
+    // (it is the cheaper statement: the raw transport bytes), the member cap
+    // next. Exactly the cap (512 bytes, 32 members) is admitted; the next
+    // byte or member refuses. The member count is a read-only walk, never an
+    // allocation.
+    let bytes = raw.len();
+    let members = raw.split(',').count();
+    if bytes > MAX_BYTES {
+        return unrepresentable(Unrepresentable::TraceStateOverCap { members, bytes });
+    }
+    if members > MAX_MEMBERS {
+        return unrepresentable(Unrepresentable::TraceStateOverCap { members, bytes });
     }
     let mut entries = Vec::new();
     for member in raw.split(',') {
         let Some((vendor, value)) = member.split_once('=') else {
             return unrepresentable(Unrepresentable::TraceState {
-                raw: raw.to_owned(),
+                member: member.to_owned(),
             });
         };
         entries.push(TraceStateEntry {
@@ -365,7 +432,11 @@ fn severity_number(
 /// A span, translated verbatim: ids (invalid included), flags at full
 /// width, parent presence, name, kind, timestamps, events and links in
 /// emitter order, the two-field status, dropped counts, resource and scope.
-pub(crate) fn span(proto: wire_trace::Span, envelope: &Envelope) -> Translated<Span> {
+pub(crate) fn span(
+    proto: wire_trace::Span,
+    envelope: &Envelope,
+    limits: &BudgetLimits,
+) -> Translated<Span> {
     let status = proto.status.unwrap_or_default();
     Ok(Span {
         context: TraceContext {
@@ -381,7 +452,7 @@ pub(crate) fn span(proto: wire_trace::Span, envelope: &Envelope) -> Translated<S
         end_time_unix_nano: (proto.end_time_unix_nano != 0).then_some(proto.end_time_unix_nano),
         resource: Arc::clone(&envelope.resource),
         scope: Arc::clone(&envelope.scope),
-        attributes: attributes(proto.attributes, "span attribute")?,
+        attributes: attributes(proto.attributes, "span attribute", limits)?,
         emitter_dropped: EmitterDroppedCounts {
             attributes: proto.dropped_attributes_count,
             events: proto.dropped_events_count,
@@ -394,7 +465,7 @@ pub(crate) fn span(proto: wire_trace::Span, envelope: &Envelope) -> Translated<S
                 Ok(SpanEvent {
                     time_unix_nano: (event.time_unix_nano != 0).then_some(event.time_unix_nano),
                     name: event.name,
-                    attributes: attributes(event.attributes, "span event attribute")?,
+                    attributes: attributes(event.attributes, "span event attribute", limits)?,
                     dropped_attribute_count: event.dropped_attributes_count,
                 })
             })
@@ -410,7 +481,7 @@ pub(crate) fn span(proto: wire_trace::Span, envelope: &Envelope) -> Translated<S
                         flags: TraceFlags::new(link.flags),
                         tracestate: trace_state(&link.trace_state)?,
                     },
-                    attributes: attributes(link.attributes, "span link attribute")?,
+                    attributes: attributes(link.attributes, "span link attribute", limits)?,
                     dropped_attribute_count: link.dropped_attributes_count,
                 })
             })
@@ -428,6 +499,7 @@ pub(crate) fn span(proto: wire_trace::Span, envelope: &Envelope) -> Translated<S
 pub(crate) fn log_record(
     proto: wire_logs::LogRecord,
     envelope: &Envelope,
+    limits: &BudgetLimits,
 ) -> Translated<LogRecord> {
     Ok(LogRecord {
         timestamp_unix_nano: (proto.time_unix_nano != 0).then_some(proto.time_unix_nano),
@@ -444,7 +516,7 @@ pub(crate) fn log_record(
         },
         resource: Arc::clone(&envelope.resource),
         scope: Arc::clone(&envelope.scope),
-        attributes: attributes(proto.attributes, "log attribute")?,
+        attributes: attributes(proto.attributes, "log attribute", limits)?,
         dropped_attribute_count: proto.dropped_attributes_count,
         trace_id: optional_trace_id(&proto.trace_id)?,
         span_id: optional_span_id(&proto.span_id)?,
@@ -462,6 +534,7 @@ pub(crate) fn log_record(
 pub(crate) fn stream_identity(
     proto: &wire_metrics::Metric,
     envelope: &Envelope,
+    limits: &BudgetLimits,
 ) -> Translated<StreamIdentity> {
     use crate::otlp::opentelemetry::metrics::v1::metric::Data;
     let (kind, temporality) = match &proto.data {
@@ -496,7 +569,7 @@ pub(crate) fn stream_identity(
         name: proto.name.clone(),
         description: present_string(&proto.description),
         unit: present_string(&proto.unit),
-        metadata: attributes(proto.metadata.clone(), "metric metadata")?,
+        metadata: attributes(proto.metadata.clone(), "metric metadata", limits)?,
         kind,
         temporality,
     })
@@ -509,24 +582,37 @@ pub(crate) fn stream_identity(
 /// wire-coherent with the kind by construction (a `Sum` carries only
 /// `NumberDataPoint`s); the shape law the ledger enforces re-checks the
 /// pair anyway, so a point cannot bypass it.
-pub(crate) fn into_points(proto: wire_metrics::Metric) -> Vec<Translated<MetricPoint>> {
+pub(crate) fn into_points(
+    proto: wire_metrics::Metric,
+    limits: &BudgetLimits,
+) -> Vec<Translated<MetricPoint>> {
     use crate::otlp::opentelemetry::metrics::v1::metric::Data;
     match proto.data {
-        Some(Data::Gauge(gauge)) => gauge.data_points.into_iter().map(number_point).collect(),
-        Some(Data::Sum(sum)) => sum.data_points.into_iter().map(number_point).collect(),
+        Some(Data::Gauge(gauge)) => gauge
+            .data_points
+            .into_iter()
+            .map(|point| number_point(point, limits))
+            .collect(),
+        Some(Data::Sum(sum)) => sum
+            .data_points
+            .into_iter()
+            .map(|point| number_point(point, limits))
+            .collect(),
         Some(Data::Histogram(histogram)) => histogram
             .data_points
             .into_iter()
-            .map(histogram_point)
+            .map(|point| histogram_point(point, limits))
             .collect(),
         Some(Data::ExponentialHistogram(histogram)) => histogram
             .data_points
             .into_iter()
-            .map(exponential_histogram_point)
+            .map(|point| exponential_histogram_point(point, limits))
             .collect(),
-        Some(Data::Summary(summary)) => {
-            summary.data_points.into_iter().map(summary_point).collect()
-        }
+        Some(Data::Summary(summary)) => summary
+            .data_points
+            .into_iter()
+            .map(|point| summary_point(point, limits))
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -545,7 +631,10 @@ pub(crate) fn point_count(proto: &wire_metrics::Metric) -> usize {
     }
 }
 
-fn number_point(proto: wire_metrics::NumberDataPoint) -> Translated<MetricPoint> {
+fn number_point(
+    proto: wire_metrics::NumberDataPoint,
+    limits: &BudgetLimits,
+) -> Translated<MetricPoint> {
     use crate::otlp::opentelemetry::metrics::v1::number_data_point::Value;
     let value = match proto.value {
         Some(Value::AsDouble(double)) => MetricNumber::double(double),
@@ -557,24 +646,27 @@ fn number_point(proto: wire_metrics::NumberDataPoint) -> Translated<MetricPoint>
         }
     };
     Ok(MetricPoint::Number(NumberPoint {
-        attributes: attributes(proto.attributes, "data point attribute")?,
+        attributes: attributes(proto.attributes, "data point attribute", limits)?,
         start_time_unix_nano: (proto.start_time_unix_nano != 0)
             .then_some(proto.start_time_unix_nano),
         time_unix_nano: proto.time_unix_nano,
         value,
         flags: proto.flags,
-        exemplars: exemplars(proto.exemplars)?,
+        exemplars: exemplars(proto.exemplars, limits)?,
     }))
 }
 
-fn histogram_point(proto: wire_metrics::HistogramDataPoint) -> Translated<MetricPoint> {
+fn histogram_point(
+    proto: wire_metrics::HistogramDataPoint,
+    limits: &BudgetLimits,
+) -> Translated<MetricPoint> {
     let Ok(start_time_unix_nano) = require_start_time(proto.start_time_unix_nano) else {
         return unrepresentable(Unrepresentable::MissingValue {
             field: "histogram start_time_unix_nano",
         });
     };
     Ok(MetricPoint::Histogram(HistogramPoint {
-        attributes: attributes(proto.attributes, "data point attribute")?,
+        attributes: attributes(proto.attributes, "data point attribute", limits)?,
         start_time_unix_nano,
         time_unix_nano: proto.time_unix_nano,
         count: proto.count,
@@ -584,12 +676,13 @@ fn histogram_point(proto: wire_metrics::HistogramDataPoint) -> Translated<Metric
         min: proto.min.map(Float::new),
         max: proto.max.map(Float::new),
         flags: proto.flags,
-        exemplars: exemplars(proto.exemplars)?,
+        exemplars: exemplars(proto.exemplars, limits)?,
     }))
 }
 
 fn exponential_histogram_point(
     proto: wire_metrics::ExponentialHistogramDataPoint,
+    limits: &BudgetLimits,
 ) -> Translated<MetricPoint> {
     let Ok(start_time_unix_nano) = require_start_time(proto.start_time_unix_nano) else {
         return unrepresentable(Unrepresentable::MissingValue {
@@ -598,7 +691,7 @@ fn exponential_histogram_point(
     };
     Ok(MetricPoint::ExponentialHistogram(
         ExponentialHistogramPoint {
-            attributes: attributes(proto.attributes, "data point attribute")?,
+            attributes: attributes(proto.attributes, "data point attribute", limits)?,
             start_time_unix_nano,
             time_unix_nano: proto.time_unix_nano,
             count: proto.count,
@@ -629,19 +722,22 @@ fn exponential_histogram_point(
             min: proto.min.map(Float::new),
             max: proto.max.map(Float::new),
             flags: proto.flags,
-            exemplars: exemplars(proto.exemplars)?,
+            exemplars: exemplars(proto.exemplars, limits)?,
         },
     ))
 }
 
-fn summary_point(proto: wire_metrics::SummaryDataPoint) -> Translated<MetricPoint> {
+fn summary_point(
+    proto: wire_metrics::SummaryDataPoint,
+    limits: &BudgetLimits,
+) -> Translated<MetricPoint> {
     let Ok(start_time_unix_nano) = require_start_time(proto.start_time_unix_nano) else {
         return unrepresentable(Unrepresentable::MissingValue {
             field: "summary start_time_unix_nano",
         });
     };
     Ok(MetricPoint::Summary(SummaryPoint {
-        attributes: attributes(proto.attributes, "data point attribute")?,
+        attributes: attributes(proto.attributes, "data point attribute", limits)?,
         start_time_unix_nano,
         time_unix_nano: proto.time_unix_nano,
         count: proto.count,
@@ -679,6 +775,7 @@ fn require_start_time(start_time_unix_nano: u64) -> Result<u64, ()> {
 
 fn exemplars(
     proto: Vec<wire_metrics::Exemplar>,
+    limits: &BudgetLimits,
 ) -> Translated<Vec<runtime_trail_telemetry_model::Exemplar>> {
     proto
         .into_iter()
@@ -699,6 +796,7 @@ fn exemplars(
                 filtered_attributes: attributes(
                     exemplar.filtered_attributes,
                     "exemplar filtered attribute",
+                    limits,
                 )?,
                 trace_id: optional_trace_id(&exemplar.trace_id)?,
                 span_id: optional_span_id(&exemplar.span_id)?,

@@ -397,18 +397,22 @@ impl Pipeline {
             let resource = decode::resource(
                 resource_spans.resource.unwrap_or_default(),
                 &resource_spans.schema_url,
+                &self.limits,
             );
             for scope_spans in resource_spans.scope_spans {
                 let envelope = Self::envelope(
                     &resource,
                     scope_spans.scope.unwrap_or_default(),
                     &scope_spans.schema_url,
+                    &self.limits,
                 );
                 for proto in scope_spans.spans {
                     let recorded = match &envelope {
-                        Ok(envelope) => {
-                            self.admit_span(&mut ledger, now, decode::span(proto, envelope))
-                        }
+                        Ok(envelope) => self.admit_span(
+                            &mut ledger,
+                            now,
+                            decode::span(proto, envelope, &self.limits),
+                        ),
                         Err(reason) => Ok(RecordOutcome::Rejected {
                             reason: reason.clone(),
                         }),
@@ -453,18 +457,22 @@ impl Pipeline {
             let resource = decode::resource(
                 resource_logs.resource.unwrap_or_default(),
                 &resource_logs.schema_url,
+                &self.limits,
             );
             for scope_logs in resource_logs.scope_logs {
                 let envelope = Self::envelope(
                     &resource,
                     scope_logs.scope.unwrap_or_default(),
                     &scope_logs.schema_url,
+                    &self.limits,
                 );
                 for proto in scope_logs.log_records {
                     let recorded = match &envelope {
-                        Ok(envelope) => {
-                            self.admit_log(&mut ledger, now, decode::log_record(proto, envelope))
-                        }
+                        Ok(envelope) => self.admit_log(
+                            &mut ledger,
+                            now,
+                            decode::log_record(proto, envelope, &self.limits),
+                        ),
                         Err(reason) => Ok(RecordOutcome::Rejected {
                             reason: reason.clone(),
                         }),
@@ -513,11 +521,13 @@ impl Pipeline {
             let resource = decode::resource(
                 resource_metrics.resource.unwrap_or_default(),
                 &resource_metrics.schema_url,
+                &self.limits,
             );
             for scope_metrics in resource_metrics.scope_metrics {
                 let scope = decode::scope(
                     scope_metrics.scope.unwrap_or_default(),
                     &scope_metrics.schema_url,
+                    &self.limits,
                 );
                 for metric in scope_metrics.metrics {
                     let identity = match (&resource, &scope) {
@@ -527,10 +537,11 @@ impl Pipeline {
                                 resource: Arc::clone(resource),
                                 scope: Arc::clone(scope),
                             },
+                            &self.limits,
                         ),
                         (Err(reason), _) | (_, Err(reason)) => Err(reason.clone()),
                     };
-                    for point in decode::into_points(metric) {
+                    for point in decode::into_points(metric, &self.limits) {
                         // A point whose translation failed is refused with
                         // its own reason inside `admit_point`, keeping its
                         // position.
@@ -575,8 +586,9 @@ impl Pipeline {
         resource: &Result<Arc<Resource>, RecordRejection>,
         scope: wire::InstrumentationScope,
         scope_schema_url: &str,
+        limits: &BudgetLimits,
     ) -> Result<Envelope, RecordRejection> {
-        let scope = decode::scope(scope, scope_schema_url)?;
+        let scope = decode::scope(scope, scope_schema_url, limits)?;
         let resource = resource.as_ref().map_err(RecordRejection::clone)?;
         Ok(Envelope {
             resource: Arc::clone(resource),

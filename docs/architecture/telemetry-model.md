@@ -67,6 +67,12 @@ once, in the `telemetry-model` crate (tag `layer-model`), which — per
   everything above them. A reader must not assume the high bits are zero.
 - `tracestate` is an ordered list of (vendor, opaque value) entries. The order
   is semantic; entries are never merged, deduplicated, or sorted.
+- The W3C Trace Context caps on `tracestate` (32 list members, 512 bytes
+  total) are enforced at the decode boundary, before any per-member
+  allocation. Tracestate is transport metadata, not a required part of the
+  model, so the caps are transport constants (W3C), not operator-tunable
+  budgets; a `tracestate` past either cap refuses the record, naming only the
+  measured counts — the raw wire string is never echoed.
 
 ## Spans
 
