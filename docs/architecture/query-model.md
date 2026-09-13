@@ -156,7 +156,15 @@ Every budget expiry is one of exactly two honest outcomes:
 The choice is per dimension and pinned in the table above. The engine never
 returns a partial aggregate as if it were complete, and never refuses a
 traversal that could have degraded truthfully — refusals are for wrongness,
-not for slowness.
+not for slowness. "Could have degraded truthfully" is the operative qualifier:
+a traversal that **cannot** name a truncation point because it examined
+**nothing** — a continuation handed an already-spent deadline before any new
+examination — has no truth to degrade to. Echoing the presented cursor would
+name no truncation point (invariant 4) and would be indistinguishable from
+progress. Such a request refuses with a budget error naming the deadline,
+its limit and the observed spend, exactly as a first page dead before any
+examination does. A page that examined anything and then expired still
+degrades with a cursor, per the table.
 
 ## Who enforces what
 
