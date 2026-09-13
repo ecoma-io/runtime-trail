@@ -49,6 +49,12 @@ use runtime_trail_telemetry_model::{
 };
 
 use crate::DRAIN_DEADLINE;
+use crate::transport_guard::InflightBodyBudget;
+
+/// The default per-request body read deadline ([ADR 0010]).
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an idle pump waits before re-checking the drain state.
 ///
@@ -164,6 +170,16 @@ pub struct RuntimeConfig {
     /// The hand-off queue's accounted-byte ceiling — the number a
     /// saturation backs up against.
     pub queue_ceiling_bytes: usize,
+    /// The transport-edge aggregate: how many request-body bytes may be
+    /// buffered at the OTLP transports before admission
+    /// ([ADR 0010](../docs/decisions/0010-transport-edge-in-flight-body-budget.md)).
+    /// Defaults to one queue ceiling's worth, so the transport edge can never
+    /// hold more buffering than the queue it feeds.
+    pub inflight_body_ceiling_bytes: usize,
+    /// The per-request body read deadline, shared by both OTLP transports. A
+    /// body that has not arrived in full within this bound is refused so a
+    /// single slow-drip client cannot hold its buffered bytes indefinitely.
+    pub body_read_timeout: Duration,
     /// Where admission times come from. Production:
     /// [`SystemWallClock`].
     pub clock: Box<dyn WallClock>,
@@ -178,6 +194,8 @@ impl Default for RuntimeConfig {
             budgets: BudgetLimits::default(),
             payload_ceiling_bytes: OTLP_PAYLOAD_BYTES,
             queue_ceiling_bytes: QUEUE_CEILING_BYTES,
+            inflight_body_ceiling_bytes: QUEUE_CEILING_BYTES,
+            body_read_timeout: BODY_READ_TIMEOUT,
             clock: Box::new(SystemWallClock),
         }
     }
@@ -190,6 +208,11 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("budgets", &self.budgets)
             .field("payload_ceiling_bytes", &self.payload_ceiling_bytes)
             .field("queue_ceiling_bytes", &self.queue_ceiling_bytes)
+            .field(
+                "inflight_body_ceiling_bytes",
+                &self.inflight_body_ceiling_bytes,
+            )
+            .field("body_read_timeout", &self.body_read_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -375,6 +398,12 @@ pub struct CoreRuntime {
     drain_deadline: Mutex<Option<Instant>>,
     payload_ceiling_bytes: usize,
     grpc_decoding_ceiling_bytes: usize,
+    /// The transport-edge aggregate in-flight body budget and the per-request
+    /// read deadline, shared by both OTLP transports ([ADR 0010]).
+    ///
+    /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+    transport_guard: Arc<InflightBodyBudget>,
+    body_read_timeout: Duration,
     workers: Mutex<Option<Workers>>,
 }
 
@@ -428,6 +457,8 @@ impl CoreRuntime {
             drain_deadline: Mutex::new(None),
             payload_ceiling_bytes: config.payload_ceiling_bytes,
             grpc_decoding_ceiling_bytes,
+            transport_guard: Arc::new(InflightBodyBudget::new(config.inflight_body_ceiling_bytes)),
+            body_read_timeout: config.body_read_timeout,
             workers: Mutex::new(None),
         });
         runtime.spawn_workers();
@@ -500,6 +531,25 @@ impl CoreRuntime {
     #[must_use]
     pub(crate) fn grpc_decoding_ceiling_bytes(&self) -> usize {
         self.grpc_decoding_ceiling_bytes
+    }
+
+    /// The transport-edge aggregate in-flight body budget — the shared gate
+    /// both OTLP transports charge before buffering a request body
+    /// ([ADR 0010]).
+    ///
+    /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+    #[must_use]
+    pub(crate) fn inflight_body_budget(&self) -> &Arc<InflightBodyBudget> {
+        &self.transport_guard
+    }
+
+    /// The per-request body read deadline — the bound a single body's
+    /// buffering window must fit within ([ADR 0010]).
+    ///
+    /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+    #[must_use]
+    pub(crate) fn body_read_timeout(&self) -> Duration {
+        self.body_read_timeout
     }
 
     /// The admission clock's next reading: the `admitted_at` every

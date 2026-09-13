@@ -5,15 +5,19 @@
 use std::sync::Arc;
 
 use runtime_trail_telemetry_model::{
-    AdmissionTime, BudgetName, DATA_POINT_FLAG_NO_RECORDED_VALUE, Float, MetricNumber, MetricPoint,
-    PointShape, StreamShapeError, Temporality, budgets::OTLP_PAYLOAD_BYTES,
+    AdmissionTime, BudgetLimits, BudgetName, DATA_POINT_FLAG_NO_RECORDED_VALUE, Float,
+    MetricNumber, MetricPoint, PointShape, StreamShapeError, Temporality,
+    budgets::OTLP_PAYLOAD_BYTES,
 };
 
 use crate::fixtures::*;
 use crate::otlp::opentelemetry::{
     common::v1 as common, metrics::v1 as metrics, resource::v1 as resource,
 };
-use crate::queue::{QueuedRecord, StoredRecord};
+use crate::pipeline::Pipeline;
+use crate::queue::{
+    BoundedQueue, PIPELINE_QUEUE_NAME, QUEUE_CEILING_BYTES, QueuedRecord, RecordSink, StoredRecord,
+};
 use crate::signal::{AdmissionSignal, RecordOutcome, RecordRejection, Unrepresentable};
 
 // ---------------------------------------------------------- stream identity
@@ -843,13 +847,21 @@ fn an_empty_metric_carries_nothing() {
 
     // And at the decode layer, the identity builder names the refusal.
     let envelope = crate::decode::Envelope {
-        resource: crate::decode::resource(resource::Resource::default(), "")
-            .expect("an empty resource translates"),
-        scope: crate::decode::scope(common::InstrumentationScope::default(), "")
-            .expect("an empty scope translates"),
+        resource: crate::decode::resource(
+            resource::Resource::default(),
+            "",
+            &BudgetLimits::default(),
+        )
+        .expect("an empty resource translates"),
+        scope: crate::decode::scope(
+            common::InstrumentationScope::default(),
+            "",
+            &BudgetLimits::default(),
+        )
+        .expect("an empty scope translates"),
     };
     assert!(matches!(
-        crate::decode::stream_identity(&empty, &envelope),
+        crate::decode::stream_identity(&empty, &envelope, &BudgetLimits::default()),
         Err(RecordRejection::Unrepresentable(
             Unrepresentable::EmptyMetric
         ))
@@ -931,6 +943,139 @@ fn an_export_at_the_point_cap_admits_in_full() {
     assert_eq!(outcome.admitted(), 10_000);
     assert_eq!(outcome.rejected(), 0);
     assert_eq!(harness.drain().len(), 10_000, "every point handed off");
+}
+
+#[test]
+fn a_data_point_attribute_list_over_the_count_budget_is_refused() {
+    // MINOR #1 on the metric path: a point's attribute set is held to the
+    // per-signal count budget at the decode boundary — refused before the
+    // set's members are materialized, naming the budget, limit and count.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_signal: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut point = number_point(as_double(1.0));
+    point.attributes = vec![
+        attr("a", str_value("1")),
+        attr("b", str_value("2")),
+        attr("c", str_value("3")),
+    ];
+    let outcome = pipeline
+        .ingest_metrics(now(), &one_point_export(point))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerSignal
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+}
+
+#[test]
+fn a_point_attribute_list_at_the_count_budget_is_admitted() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_signal: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut point = number_point(as_double(1.0));
+    point.attributes = vec![attr("a", str_value("1")), attr("b", str_value("2"))];
+    let outcome = pipeline
+        .ingest_metrics(now(), &one_point_export(point))
+        .expect("walked");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    let queued = drain_queue(&queue);
+    let StoredRecord::Point { point, .. } = &queued[0].record else {
+        panic!()
+    };
+    assert_eq!(
+        point.attributes().len(),
+        2,
+        "both point attributes materialized"
+    );
+}
+
+#[test]
+fn a_point_metadata_list_over_the_count_budget_is_refused() {
+    // The metric's metadata set is stream identity content; the decode
+    // boundary holds it to the per-signal count budget like the point's own
+    // attributes.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_signal: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let metric = described_metric(
+        "requests",
+        "d",
+        "s",
+        vec![
+            attr("a", str_value("1")),
+            attr("b", str_value("2")),
+            attr("c", str_value("3")),
+        ],
+        vec![number_point(as_double(1.0))],
+    );
+    let outcome = pipeline
+        .ingest_metrics(now(), &one_metric_export(metric))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerSignal
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+}
+
+#[test]
+fn an_exemplar_filtered_attribute_list_over_the_nested_set_budget_is_refused() {
+    // The exemplar's filtered-attribute set is one of the three nested sets;
+    // the decode boundary holds it to the nested-set count budget before its
+    // members are materialized.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_nested_set: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut point = number_point(as_double(1.0));
+    point.exemplars = vec![metrics::Exemplar {
+        value: Some(metrics::exemplar::Value::AsInt(1)),
+        time_unix_nano: 11,
+        trace_id: Vec::new(),
+        span_id: Vec::new(),
+        filtered_attributes: vec![
+            attr("a", str_value("1")),
+            attr("b", str_value("2")),
+            attr("c", str_value("3")),
+        ],
+    }];
+    let outcome = pipeline
+        .ingest_metrics(now(), &one_point_export(point))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerNestedSet
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
 }
 
 #[test]
@@ -1204,4 +1349,51 @@ fn a_number_point_without_a_value_is_refused() {
         })
     ));
     assert!(harness.drain().is_empty());
+}
+
+// ---------------------------------------------------------- local helpers
+
+/// A pipeline over a fresh [`BoundedQueue`] with its ceiling at
+/// `ceiling_bytes`, sharing the queue through the [`RecordSink`] port — the
+/// same fixture the spans/logs suite carries in `tests`.
+fn pipeline_over(ceiling_bytes: usize, limits: BudgetLimits) -> (Arc<BoundedQueue>, Arc<Pipeline>) {
+    let queue = BoundedQueue::new(PIPELINE_QUEUE_NAME, ceiling_bytes);
+    let pipeline = Arc::new(
+        Pipeline::with_config(
+            Arc::clone(&queue) as Arc<dyn RecordSink>,
+            limits,
+            OTLP_PAYLOAD_BYTES,
+        )
+        .expect("the ceiling clears the bound"),
+    );
+    (queue, pipeline)
+}
+
+/// Drains a queue from the consumer side, front to back.
+fn drain_queue(queue: &BoundedQueue) -> Vec<QueuedRecord> {
+    let mut drained = Vec::new();
+    while let Some(record) = queue.pop_timeout(std::time::Duration::ZERO) {
+        drained.push(record);
+    }
+    drained
+}
+
+/// One single-point export of the named gauge whose point is `point` — the
+/// point is the payload's whole record.
+fn one_point_export(point: metrics::NumberDataPoint) -> Vec<u8> {
+    encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("g", gauge(vec![point]))],
+        )],
+    )]))
+}
+
+/// One single-point export of `metric` itself.
+fn one_metric_export(metric: metrics::Metric) -> Vec<u8> {
+    encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(Some(scope("test")), vec![metric])],
+    )]))
 }

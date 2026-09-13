@@ -1,33 +1,27 @@
-//! The Query Engine: filtering, search and aggregation over the telemetry
+//! The Query Engine: budgeted, deterministic reads over the telemetry
 //! model, through the storage abstraction.
 //!
-//! Every query carries its budget and the engine refuses work it cannot
-//! answer within one — [`layer-query`] sees the storage *contract*, never a
-//! concrete driver. The contract is
-//! `docs/architecture/investigation-model.md`; budgets are
-//! `docs/architecture/runtime-constraints.md`; the dependency law is
-//! `docs/architecture/boundaries.md`.
+//! Every query admits with a budget and the engine refuses or degrades
+//! within it; ordering is total and deterministic; cursors are opaque and
+//! bound to their query's fingerprint. The contract is
+//! [query-model.md](../../docs/architecture/query-model.md); the envelope
+//! the API layer later composes from results is
+//! [investigation-model.md](../../docs/architecture/investigation-model.md);
+//! reads flow through the
+//! [storage contract](../../docs/architecture/storage-model.md) - the
+//! engine sees the *contract*, never a concrete driver (ADR 0003).
 //!
-//! [`layer-query`]: ../../docs/architecture/boundaries.md
+//! # Status
 //!
-//! # Bootstrap status
-//!
-//! Scaffolding only; the engine lands with Phase 2 —
-//! `docs/roadmap/phases.md`.
+//! In progress - the machinery lands with Phase 2's M2 milestone (issue #6).
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn exposes_a_version() {
-        assert!(!super::VERSION.is_empty());
-    }
-
-    #[test]
-    fn depends_on_the_storage_contract_and_the_model() {
-        assert!(!runtime_trail_storage::VERSION.is_empty());
-        assert!(!runtime_trail_telemetry_model::VERSION.is_empty());
-    }
-}
+pub mod budget;
+pub mod cursor;
+pub mod engine;
+pub mod filters;
+pub mod order;
+pub mod result;
+pub mod spend;

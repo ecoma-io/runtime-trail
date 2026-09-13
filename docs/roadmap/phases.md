@@ -38,12 +38,18 @@ this phase closes when the full acceptance sketch is met. The
 [numeric-limit](../architecture/runtime-constraints.md) contracts are
 binding for this phase.
 
-## Phase 2 — Investigation runtime — `planned`
+## Phase 2 — Investigation runtime — `in progress`
 
 The product's centre of gravity: query engine over the telemetry model,
 correlation engine (trace↔logs, log→trace, metric-window↔traces), one
 Investigation API, and the first Loom UI investigation surfaces (trace
 waterfall/span tree, log list, logs↔trace navigation).
+
+**Landed so far** (2026-09-13): the Query Engine's budgeted records flow —
+ordered, snapshot-bounded, cursor-chained pages over the ingested signals
+under the five-dimension budget (issue #6). The Investigation API,
+correlation and the investigation surfaces are later milestones of the
+phase.
 
 **Acceptance sketch:** from one ingested trace, a developer reaches its logs
 and surrounding metrics in a handful of interactions; the same answers are

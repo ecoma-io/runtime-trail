@@ -94,23 +94,44 @@ impl PartialOrd for AdmissionKey {
     }
 }
 
+/// One resident record as a scan yields it: the record together with the
+/// residency-order position it was yielded at.
+///
+/// The key is not extra work the driver did for the scan — it is the same
+/// [`AdmissionKey`] the walk orders and retention evicts by, carried across
+/// the seam instead of being dropped there
+/// ([ADR 0009](../../docs/decisions/0009-ordered-scans-yield-residency-keys.md)).
+/// A consumer that needs a record's admission time or entity id reads them
+/// from the key; it never re-derives identity from record content — for
+/// log records and metric points the admission-assigned id exists nowhere
+/// else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanItem<T> {
+    /// The record's residency-order position: its admission key.
+    pub key: AdmissionKey,
+    /// The record, shared as stored.
+    pub record: T,
+}
+
 /// One page of an ordered scan over the resident set.
 ///
-/// A scan is a location primitive, not a query: it yields records in the
-/// residency order ([`AdmissionKey`]) from a position, never filtering by
-/// content. `cursor` is the key of the *last record in the page*, set only
+/// A scan is a location primitive, not a query: it yields keyed records in
+/// the residency order ([`AdmissionKey`]) from a position, never filtering
+/// by content. `cursor` is the key of the *last item in the page*, set only
 /// when a record follows it — pass it as the next call's `after` (which
 /// resumes strictly after that key) and no record is ever skipped or
-/// repeated. `cursor` is `None` at the end of the resident set, so a full
-/// walk is: scan from `None`, then from each page's `cursor`, until a page
-/// comes back with `cursor: None`. Within one call the page is a stable
-/// snapshot; across calls the resident set may have changed, and a cursor
-/// simply continues from its key in whatever the set now holds.
+/// repeated. Whenever `cursor` is `Some` it is exactly the last item's
+/// `key`: two channels naming one position. `cursor` is `None` at the end
+/// of the resident set, so a full walk is: scan from `None`, then from each
+/// page's `cursor`, until a page comes back with `cursor: None`. Within one
+/// call the page is a stable snapshot; across calls the resident set may
+/// have changed, and a cursor simply continues from its key in whatever the
+/// set now holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPage<T> {
-    /// The records of this page, in residency order. Empty only when the
+    /// The page's keyed records, in residency order. Empty only when the
     /// scan started past the last resident record (or the set is empty).
-    pub items: Vec<T>,
+    pub items: Vec<ScanItem<T>>,
     /// The key to resume from; `None` at the end of the resident set.
     pub cursor: Option<AdmissionKey>,
 }

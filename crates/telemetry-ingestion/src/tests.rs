@@ -178,9 +178,126 @@ fn a_trace_state_member_without_a_value_is_refused() {
         .expect("walked");
     assert!(matches!(
         rejected_reason(&outcome, 0),
-        RecordRejection::Unrepresentable(Unrepresentable::TraceState { raw })
-            if raw == "not-a-pair"
+        RecordRejection::Unrepresentable(Unrepresentable::TraceState { member })
+            if member == "not-a-pair"
     ));
+    assert!(harness.drain().is_empty());
+}
+
+#[test]
+fn a_trace_state_at_the_w3c_caps_is_admitted() {
+    // The W3C Trace Context caps ride the decode boundary: exactly 32
+    // members and exactly 512 bytes are admitted — the next member or byte
+    // refuses (asserted below by its sibling fixtures).
+    let harness = Harness::new();
+    let mut many = trace_span("state", T1, S1);
+    many.trace_state = (0..32)
+        .map(|index| format!("v{index}={index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        many.trace_state.len() <= 512,
+        "the fixture must sit under the byte cap so the member cap is the edge"
+    );
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(many))
+        .expect("32 members are at the cap");
+    assert_eq!(outcome.admitted(), 1);
+    harness.drain();
+
+    let mut big = trace_span("state", T1, S2);
+    big.trace_state = format!("v={}", "a".repeat(510)); // 2 + 510 == 512 bytes
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(big))
+        .expect("512 bytes are at the cap");
+    assert_eq!(outcome.admitted(), 1);
+    harness.drain();
+}
+
+#[test]
+fn a_trace_state_beyond_32_members_is_refused() {
+    let harness = Harness::new();
+    let trace_state = (0..33)
+        .map(|index| format!("v{index}={index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        trace_state.len() <= 512,
+        "the fixture must trip the member cap, not the byte cap"
+    );
+    let mut span = trace_span("state", T1, S1);
+    span.trace_state = trace_state;
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Unrepresentable(Unrepresentable::TraceStateOverCap {
+            members: 33,
+            bytes,
+        }) if *bytes <= 512
+    ));
+    assert!(harness.drain().is_empty());
+}
+
+#[test]
+fn a_trace_state_over_512_bytes_is_refused() {
+    let harness = Harness::new();
+    let mut span = trace_span("state", T1, S1);
+    // 2 + 513 == 515 bytes, one member: the byte cap fires, the member cap
+    // does not.
+    span.trace_state = format!("v={}", "a".repeat(513));
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Unrepresentable(Unrepresentable::TraceStateOverCap {
+            members: 1,
+            bytes: 515,
+        })
+    ));
+    assert!(harness.drain().is_empty());
+}
+
+#[test]
+fn a_malformed_trace_state_refusal_does_not_echo_the_raw_string() {
+    let harness = Harness::new();
+    // The offending member is not the whole string: a sibling carries the
+    // bulk of the transport content, and the refusal must not bury it in the
+    // message. The raw string is unbounded transport input — the refusal
+    // names only the member, preserving the honest error meaning.
+    let carrier = "x".repeat(200);
+    let raw = format!("big={carrier},not-a-pair");
+    let mut span = trace_span("state", T1, S1);
+    span.trace_state = raw.clone();
+    let outcome = harness
+        .pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    let reason = rejected_reason(&outcome, 0);
+    assert!(matches!(
+        reason,
+        RecordRejection::Unrepresentable(Unrepresentable::TraceState { member })
+            if member == "not-a-pair"
+    ));
+    let message = reason.to_string();
+    assert!(
+        message.contains("not-a-pair"),
+        "the refusal names the offending member: {message}"
+    );
+    assert!(
+        !message.contains("big="),
+        "the raw string is not cloned into the message: {message}"
+    );
+    assert!(
+        !message.contains(&raw),
+        "the refusal does not echo the full raw string: {message}"
+    );
     assert!(harness.drain().is_empty());
 }
 
@@ -504,6 +621,138 @@ fn an_oversized_attribute_value_names_the_budget() {
             if rejection.budget == BudgetName::AttributeValueSize
     ));
     assert!(harness.drain().is_empty());
+}
+
+#[test]
+fn an_oversized_attribute_list_is_refused_before_materialization() {
+    // MINOR #1: the attribute-count budget is consulted BEFORE any
+    // per-attribute allocation. A three-attribute span against a
+    // two-attribute limit is refused at the count boundary, naming the
+    // budget, its limit and the observed count — the same refusal shape the
+    // ledger gate uses, and the same trigger counts.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_signal: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut span = trace_span("big", T1, S1);
+    span.attributes = vec![
+        attr("a", str_value("1")),
+        attr("b", str_value("2")),
+        attr("c", str_value("3")),
+    ];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerSignal
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+}
+
+#[test]
+fn an_attribute_list_at_the_count_budget_is_admitted() {
+    // The boundary is "the next attribute refuses": exactly the cap is
+    // admitted, and its attributes are all materialized.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_signal: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut span = trace_span("fit", T1, S1);
+    span.attributes = vec![attr("a", str_value("1")), attr("b", str_value("2"))];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.admitted(), 1);
+    let queued = drain_queue(&queue);
+    let StoredRecord::Span(span) = &queued[0].record else {
+        panic!()
+    };
+    assert_eq!(span.attributes.len(), 2, "both attributes materialized");
+}
+
+#[test]
+fn an_event_attribute_list_over_the_nested_set_budget_is_refused() {
+    // The per-signal/per-nested-set split rides the decode boundary too: an
+    // event's attribute set is held to the nested-set budget, and an
+    // over-cap set is refused before its members are allocated.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_nested_set: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut span = trace_span("event", T1, S1);
+    span.events = vec![trace::span::Event {
+        time_unix_nano: 1,
+        name: "e".to_owned(),
+        attributes: vec![
+            attr("a", str_value("1")),
+            attr("b", str_value("2")),
+            attr("c", str_value("3")),
+        ],
+        dropped_attributes_count: 0,
+    }];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerNestedSet
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+}
+
+#[test]
+fn a_link_attribute_list_over_the_nested_set_budget_is_refused() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            attributes_per_nested_set: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let mut span = trace_span("link", T1, S1);
+    span.links = vec![trace::span::Link {
+        trace_id: T2.to_vec(),
+        span_id: S2.to_vec(),
+        trace_state: "k=v".to_owned(),
+        attributes: vec![
+            attr("a", str_value("1")),
+            attr("b", str_value("2")),
+            attr("c", str_value("3")),
+        ],
+        dropped_attributes_count: 0,
+        flags: 0,
+    }];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::AttributesPerNestedSet
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
 }
 
 #[test]
@@ -1618,6 +1867,11 @@ fn pipeline_over(ceiling_bytes: usize, limits: BudgetLimits) -> (Arc<BoundedQueu
 
 /// The shrunken budgets the saturation fixtures share: small enough that a
 /// queue at the derived legal-record bound saturates within a few records.
+///
+/// `numeric_vector_entries_per_data_point` is zero on purpose: the
+/// saturation fixtures queue number points and spans, never histograms or
+/// summaries, so the gate never fires, and a zero keeps the derived bound
+/// (which now includes the vector-shaped spend) small.
 fn shrunken_limits() -> BudgetLimits {
     BudgetLimits {
         attributes_per_signal: 1,
@@ -1628,6 +1882,8 @@ fn shrunken_limits() -> BudgetLimits {
         exemplars_per_data_point: 0,
         key_value_list_depth: 8,
         data_points_per_export: 10_000,
+        records_per_export: 10_000,
+        numeric_vector_entries_per_data_point: 0,
     }
 }
 
@@ -1907,4 +2163,175 @@ fn only_queue_saturation_is_retryable_anywhere() {
 #[test]
 fn the_crate_names_its_version() {
     assert!(!crate::VERSION.is_empty());
+}
+
+// -------------------------------------------------- per-export record gates
+
+/// The spans/logs symmetric of the metrics point cap: a single export that
+/// carries more records than `records_per_export` is refused whole, before
+/// anything is admitted or handed off.
+#[test]
+fn an_export_over_the_record_cap_is_refused_whole() {
+    // A shrunken record cap keeps the fixture tiny; a cap of one refuses any
+    // export that carries two spans in the same request.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 1,
+            ..shrunken_limits()
+        },
+    );
+
+    let payload = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![
+            scope_spans(Some(scope("test")), vec![trace_span("one", T1, S1)]),
+            scope_spans(Some(scope("test")), vec![trace_span("two", T1, S2)]),
+        ],
+    )]));
+    assert!(
+        payload.len() < OTLP_PAYLOAD_BYTES,
+        "the record cap fires before the payload cap"
+    );
+
+    let signal = pipeline
+        .ingest_spans(now(), &payload)
+        .expect_err("two records cross a one-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 1
+                && rejection.observed == 2
+    ));
+    assert!(!signal.is_retryable(), "retrying cannot shrink an export");
+    assert!(drain_queue(&queue).is_empty(), "nothing is handed off");
+}
+
+/// The logs path carrries the same whole-export record gate, counting log
+/// records across every `ScopeLogs` of every `ResourceLogs`.
+#[test]
+fn a_logs_export_over_the_record_cap_is_refused_whole() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 1,
+            ..shrunken_limits()
+        },
+    );
+
+    let payload = encode(&logs_request(vec![resource_logs(
+        Some(resource(Vec::new())),
+        vec![
+            scope_logs(Some(scope("test")), vec![log_record()]),
+            scope_logs(Some(scope("test")), vec![log_record()]),
+        ],
+    )]));
+    assert!(
+        payload.len() < OTLP_PAYLOAD_BYTES,
+        "the record cap fires before the payload cap"
+    );
+
+    let signal = pipeline
+        .ingest_logs(now(), &payload)
+        .expect_err("two records cross a one-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 1
+                && rejection.observed == 2
+    ));
+    assert!(!signal.is_retryable(), "retrying cannot shrink an export");
+    assert!(drain_queue(&queue).is_empty(), "nothing is handed off");
+}
+
+/// The record gate admits the exact cap in full, on both the spans and the
+/// logs paths — the metrics point cap's contract, symmetric.
+#[test]
+fn an_export_at_the_record_cap_admits_in_full() {
+    // Two spans against a two-record cap: both admitted, both handed off.
+    let (queue, spans_pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let spans_payload = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![scope_spans(
+            Some(scope("test")),
+            vec![trace_span("one", T1, S1), trace_span("two", T1, S2)],
+        )],
+    )]));
+    let outcome = spans_pipeline
+        .ingest_spans(now(), &spans_payload)
+        .expect("at the cap is legal");
+    assert_eq!(outcome.admitted(), 2);
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(drain_queue(&queue).len(), 2, "both spans handed off");
+
+    // Two log records against a two-record cap, symmetric.
+    let (queue, logs_pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let logs_payload = encode(&logs_request(vec![resource_logs(
+        Some(resource(Vec::new())),
+        vec![scope_logs(
+            Some(scope("test")),
+            vec![log_record(), log_record()],
+        )],
+    )]));
+    let outcome = logs_pipeline
+        .ingest_logs(now(), &logs_payload)
+        .expect("at the cap is legal");
+    assert_eq!(outcome.admitted(), 2);
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(drain_queue(&queue).len(), 2, "both log records handed off");
+}
+
+/// The record count is the whole export's, summed across resources and
+/// scopes — not per `ScopeSpans`. A cap of two still counts one span in a
+/// second scope and refuses.
+#[test]
+fn the_record_cap_counts_the_whole_export_across_resources_and_scopes() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let payload = encode(&traces_request(vec![
+        resource_spans(
+            Some(resource(Vec::new())),
+            vec![scope_spans(
+                Some(scope("test")),
+                vec![trace_span("one", T1, S1), trace_span("two", T1, S2)],
+            )],
+        ),
+        resource_spans(
+            Some(resource(Vec::new())),
+            vec![scope_spans(
+                Some(scope("next")),
+                vec![trace_span("three", T1, [0x33; 8])],
+            )],
+        ),
+    ]));
+    let signal = pipeline
+        .ingest_spans(now(), &payload)
+        .expect_err("three spans across two resources cross a two-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
 }

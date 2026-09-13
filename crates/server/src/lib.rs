@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, State};
+use axum::middleware;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -40,6 +41,7 @@ use crate::runtime::{CoreRuntime, RunSummary, RuntimeConfig};
 mod otlp_grpc;
 mod otlp_http;
 pub mod runtime;
+mod transport_guard;
 
 /// The product name reported by the version surface.
 pub const PRODUCT: &str = "runtime-trail";
@@ -111,12 +113,24 @@ struct VersionInfo {
 /// its own body read with the same number.
 pub fn build_router(runtime: Arc<CoreRuntime>, config: ServerConfig) -> Router {
     let payload_ceiling = runtime.payload_ceiling_bytes();
-    let router: Router<Arc<CoreRuntime>> = Router::new()
-        .route("/healthz", get(health))
-        .route("/version", get(version))
+    // The OTLP/HTTP endpoints are their own router so the transport-edge
+    // aggregate gate can wrap exactly them ([ADR 0010]). The body-budgetting
+    // middleware must not wrap the gRPC services (they acquire on the same
+    // budget at their own seam) or the health/version/UI surfaces (they never
+    // buffer a request body).
+    let otlp_http: Router<Arc<CoreRuntime>> = Router::new()
         .route("/v1/traces", post(otlp_http::export_traces))
         .route("/v1/metrics", post(otlp_http::export_metrics))
         .route("/v1/logs", post(otlp_http::export_logs))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&runtime),
+            otlp_http::inflight_body_guard,
+        ))
+        .layer(DefaultBodyLimit::max(payload_ceiling));
+    let router: Router<Arc<CoreRuntime>> = Router::new()
+        .route("/healthz", get(health))
+        .route("/version", get(version))
+        .merge(otlp_http)
         .nest_service(
             TRACE_SERVICE_PREFIX,
             otlp_grpc::TraceServiceServer::new(Arc::clone(&runtime)),
@@ -128,8 +142,7 @@ pub fn build_router(runtime: Arc<CoreRuntime>, config: ServerConfig) -> Router {
         .nest_service(
             LOGS_SERVICE_PREFIX,
             otlp_grpc::LogsServiceServer::new(Arc::clone(&runtime)),
-        )
-        .layer(DefaultBodyLimit::max(payload_ceiling));
+        );
     let router = router.with_state(runtime);
     match config.web_dist {
         Some(dir) => router.fallback_service(ServeDir::new(dir)),

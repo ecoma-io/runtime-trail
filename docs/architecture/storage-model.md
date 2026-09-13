@@ -61,7 +61,13 @@ coverage — an investigator must be able to see what has been evicted from
 the window they are looking at. "Oldest" is by **admission time** — the
 model's added metadata ([telemetry-model.md](telemetry-model.md)) — never
 by emitter event time, which out-of-order emitters would make
-unpredictable.
+unpredictable. That total order — admission time first, [entity
+id](telemetry-model.md) as tie-break — is the **residency order**: one
+deterministic sequence that retention evicts by and that the storage
+contract's ordered scans walk — each scanned record yielding with its
+residency key ([ADR 0009](../decisions/0009-ordered-scans-yield-residency-keys.md)) —
+so an eviction and a cursor's continuation ([query-model.md](query-model.md))
+remove and resume on the same line.
 
 **The byte ceiling counts what residency pins — including stream
 identities.** A metric point references a stream identity (resource,

@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use runtime_trail_storage::{
-    AdmissionKey, EvictionCause, EvictionHook, KeepOutcome, PointView, ScanPage, StoreStats,
-    TelemetryStore,
+    AdmissionKey, EvictionCause, EvictionHook, KeepOutcome, PointView, ScanItem, ScanPage,
+    StoreStats, TelemetryStore,
 };
 use runtime_trail_telemetry_model::{
     Accounted, AdmissionTime, Admitted, EntityId, LogRecord, MetricPoint, Span, StreamIdentity,
@@ -546,9 +546,12 @@ impl TelemetryStore for InMemoryStore {
             items: page
                 .items
                 .into_iter()
-                .map(|slot| PointView {
-                    point: Arc::clone(&slot.point),
-                    stream: Arc::clone(&slot.stream),
+                .map(|item| ScanItem {
+                    key: item.key,
+                    record: PointView {
+                        point: Arc::clone(&item.record.point),
+                        stream: Arc::clone(&item.record.stream),
+                    },
                 })
                 .collect(),
         }

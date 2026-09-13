@@ -94,7 +94,10 @@ Every response is an **`Investigation`** — one envelope with five parts:
   the answer was truncated, per the [refuse-or-degrade
   policy](query-model.md)); opaque cursors for continuation; and **coverage**
   — what was and was not covered (residency gaps under
-  [eviction](storage-model.md), suppressed relation evidence under
+  [eviction](storage-model.md), the continuation's
+  [snapshot boundary](query-model.md), the uncounted rest of a
+  byte-ceiling omission whose counting walk was cut short by a stop,
+  suppressed relation evidence under
   [strongest-evidence-wins](correlation-model.md), relation shrinkage under
   eviction, **admission anomalies** — identity conflicts under the model's
   [duplicate-delivery rules](telemetry-model.md) — and the metric-window
@@ -177,9 +180,14 @@ The name is the product's own word for "an answer with its honesty attached"
 
 ## Status
 
-**Contracts pinned (M0).** The envelope, the three-engine composition and
-the committed capabilities are the contract Phase 1–2 implement. The three
-crates (`investigation`, `query`, `correlation`) exist as declared
-boundaries with scaffolding only; the crates' structure and dependency
-directions are real and enforced from this commit on, and
-[boundaries.md](boundaries.md) is the mechanical form of that law.
+**Contracts pinned (M0); the Query Engine's records flow implemented
+(Phase 2, in progress).** The envelope, the three-engine composition and
+the committed capabilities are the contract Phase 1–2 implement. Of the
+three crates, `query` is implemented: the budgeted records flow — ordered,
+snapshot-bounded, cursor-chained pages under the five-dimension budget —
+exists and runs in the Query Engine crate (its contract and status are
+[query-model.md](query-model.md)'s to own). `investigation` and
+`correlation` exist as declared boundaries with scaffolding only; the
+crates' structure and dependency directions are real and enforced from this
+commit on, and [boundaries.md](boundaries.md) is the mechanical form of
+that law.

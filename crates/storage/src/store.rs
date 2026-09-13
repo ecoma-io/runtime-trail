@@ -110,7 +110,8 @@ pub trait TelemetryStore: Send + Sync {
 
     /// Scans resident spans in residency order, starting strictly after
     /// `after` (from the oldest record when `None`), yielding at most
-    /// `limit` records — a location primitive over the resident set, never
+    /// `limit` records, each with the residency key it was yielded at
+    /// ([`ScanItem`]) — a location primitive over the resident set, never
     /// a content filter. A `limit` of zero yields an empty page and no
     /// cursor.
     #[must_use]

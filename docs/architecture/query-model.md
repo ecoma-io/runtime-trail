@@ -18,6 +18,17 @@ storage concepts: no table, no index, no driver type appears in a query or
 its result. That is what makes one contract serve both
 [storage modes](storage-model.md).
 
+The records flow admits **content filters** drawn from that same vocabulary:
+service (resource identity), a half-open time range over the record's
+kind-specific model timestamps, a minimum severity (log records — the filter
+is unexpressible for spans and metric points), and scope identity (name and
+version, exact). Filters are predicates over the record view: they never
+reorder the total order and never enter a storage driver. A filtered-out
+record was still examined — the scan charge stands and the deadline ran on
+it — but it is never returned, never byte-charged, and never counted into an
+omission. The cursor's query fingerprint binds the filter set, so a cursor
+continues only under the filters that minted it.
+
 ## Every query carries a budget
 
 Every query admits with a budget. A query without a budget is invalid — not
@@ -58,12 +69,21 @@ driver symmetry per [ADR 0003](../decisions/0003-storage-strategy.md). A
 driver may use an index and report fewer units examined; it may never widen
 the meaning of the unit itself.
 
-A driver may never inflate accounting either: the engine cross-checks the
-reported count against the budget, and a driver that cannot produce a
-faithful count reports its in-exactness through coverage. A driver that
-cannot bound its own work within the ceiling produces a budget error — the
-error remains a budget error; the engine never exceeds the caller's ceiling
-by accepting made-up units.
+Scan accounting is the engine's, charged as it walks. A driver reports its
+work only by yielding records through the ordered scan surface — it reports
+no separate count for the engine to cross-check. The engine accounts each
+examination against the budget itself (the scan charge stands whether or
+not the record is returned, and a filtered-out record still consumed its
+scan allowance), and a driver that cannot bound its own work within the
+ceiling produces a budget error — the error remains a budget error; the
+engine never exceeds the caller's ceiling by accepting made-up units. A
+batched walk may pull up to a bounded batch ahead of examination; records
+pulled but not examined at a stop consume scan allowance up to the
+remaining ceiling at the moment of the stop; the engine never charges
+fabricated units and never exceeds the ceiling. There is no driver-reported
+count and no coverage entry for driver in-exactness in the implemented
+records flow — coverage names the answer's own gaps and boundaries, not a
+driver's internal accounting.
 
 ## Deadlines
 
@@ -81,12 +101,27 @@ tie in the order keys is broken by the record's
 pagination, and an investigator paging through results would see records
 appear twice or vanish between pages.
 
-A **cursor** is opaque to callers. It encodes (position in the total order,
-last entity id, query fingerprint). The engine **rejects a cursor whose
+A **cursor** is opaque to users and callers. It encodes (position in the
+total order, last entity id, query fingerprint, and the snapshot boundary
+the continuation stays within). The position is the order key value — for
+the records flow, the anchor record's admission-time nanoseconds — so
+position and last entity id together reconstruct the anchor's admission
+key, and a resume is exact under eviction, needing neither a re-walk nor
+the anchor record's residency. The engine **rejects a cursor whose
 embedded fingerprint differs from the query it is presented to** — a cursor
 belongs to one query's result set (same shape and parameters), and
 presenting it anywhere else is an error. The fingerprint tracks the query,
-not residency; gaps from later eviction are coverage's job.
+not residency; the snapshot boundary travels in the cursor, so a stateless
+surface can hand back the continuation and the engine can bound it at the
+first page's residency frontier — an admission key in the storage
+contract's residency order ([storage-model.md](storage-model.md)) — and
+gaps from later eviction are coverage's job.
+
+Cursor bytes are not authenticated: beyond canonical decoding, the
+fingerprint is the only validity test, so a hand-altered cursor that still
+decodes continues a view its page never minted. The runtime's local-trust
+posture covers this — the caller is the operator's own process on this
+machine; a multi-tenant surface would need an authenticator.
 
 When [eviction](storage-model.md) has removed records the cursor points
 into, the response still returns what remains resident, ordered as before,
@@ -108,7 +143,8 @@ Every budget expiry is one of exactly two honest outcomes:
 
 - **Degrade** — return a truncated answer that is true: the records
   returned are a subset of the true answer set, the truncation point is
-  named, and a cursor or coverage entry says what was not visited. Allowed
+  named, and a cursor, a coverage entry, or the last-examined entity says
+  what was not visited. Allowed
   for traversal-shaped work (search, scan, relation traversal) because a
   subset of a set answer is still a true set answer.
 - **Refuse** — fail with a budget error naming the dimension, the limit and
@@ -120,13 +156,21 @@ Every budget expiry is one of exactly two honest outcomes:
 The choice is per dimension and pinned in the table above. The engine never
 returns a partial aggregate as if it were complete, and never refuses a
 traversal that could have degraded truthfully — refusals are for wrongness,
-not for slowness.
+not for slowness. "Could have degraded truthfully" is the operative qualifier:
+a traversal that **cannot** name a truncation point because it examined
+**nothing** — a continuation handed an already-spent deadline before any new
+examination — has no truth to degrade to. Echoing the presented cursor would
+name no truncation point (invariant 4) and would be indistinguishable from
+progress. Such a request refuses with a budget error naming the deadline,
+its limit and the observed spend, exactly as a first page dead before any
+examination does. A page that examined anything and then expired still
+degrades with a cursor, per the table.
 
 ## Who enforces what
 
 - The **Query Engine enforces** every dimension; storage drivers report
-  their work in the scan unit and may be cross-checked, but the ceiling is
-  the engine's, not the driver's.
+  their work in the scan unit by yielding records, and the ceiling is the
+  engine's, not the driver's.
 - The **caller sets** the budget; flow-scoped defaults for the committed
   investigation flows are owned by layer-api, and the same defaults serve
   both [surfaces](mcp-model.md) — the UI and MCP ask for the same flows,
@@ -149,8 +193,9 @@ not for slowness.
 2. Ordering is total and deterministic; ties break by entity id.
 3. A cursor is valid only for its query fingerprint, and gaps under
    eviction are named in coverage.
-4. Traversal truncation always names its truncation point (cursor or
-   coverage); aggregation never returns a partial aggregate as complete.
+4. Traversal truncation always names its truncation point (a cursor, a
+   coverage entry, or the last-examined entity); aggregation never returns
+   a partial aggregate as complete.
 5. Scan accounting means the same thing in both storage modes.
 6. A refused query names the dimension, the limit and the observed spend.
 7. No query path ever writes to disk.
@@ -162,9 +207,12 @@ not for slowness.
 
 ## Status
 
-**Contracts pinned (M0).** The five-dimension budget, scan accounting,
-deadline semantics, ordering/cursor rules and refuse-or-degrade policy are
-the contract the Phase 2 Query Engine implements. The Query Engine crate
-remains scaffolding until then per [the roadmap](../roadmap/phases.md);
-[the benchmarks README](../benchmarks/README.md) will hold the measurements
-that later prove the ceilings honoured in practice.
+**Contracts pinned (M0); the records flow implemented (Phase 2, in
+progress).** The five-dimension budget, scan accounting, deadline
+semantics, ordering/cursor rules and refuse-or-degrade policy are the
+contract the Phase 2 Query Engine implements; the budgeted records flow is
+implemented in the Query Engine crate and adversarially reviewed. The
+remaining flows compose at the Investigation API in a later milestone of
+the phase per [the roadmap](../roadmap/phases.md); [the benchmarks
+README](../benchmarks/README.md) will hold the measurements that prove the
+ceilings honoured in practice.

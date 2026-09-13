@@ -14,10 +14,11 @@
 //!    including payloads nested past the protobuf decoder's recursion
 //!    limit (which is why an arbitrarily deep payload cannot overflow this
 //!    process's stack).
-//! 3. **Export budgets** — before anything is admitted, the metrics path
-//!    counts the export's data points and refuses the whole export over
-//!    the per-export cap ([`AdmissionSignal::ExportOverCap`], 10,000 by
-//!    contract). Nothing from a refused export is admitted.
+//! 3. **Export budgets** — before anything is admitted, every path counts
+//!    the export's records (metric data points, spans and log records
+//!    alike) and refuses the whole export over the per-export cap
+//!    ([`AdmissionSignal::ExportOverCap`], 10,000 records by contract).
+//!    Nothing from a refused export is admitted.
 //! 4. **Per record** — translate wire → model (refusing what no model
 //!    record can carry), then hand the record to the
 //!    [`AdmissionLedger`](runtime_trail_telemetry_model::AdmissionLedger):
@@ -77,8 +78,9 @@ use std::sync::{
 use prost::Message;
 use runtime_trail_telemetry_model::{
     ATTRIBUTE_MAP_NODE_BYTES, AdmissionAnomalies, AdmissionLedger, AdmissionOutcome, AdmissionTime,
-    BudgetLimits, EntityId, LogRecord, MetricPoint, Resource, Span, StreamIdentity,
-    budgets::OTLP_PAYLOAD_BYTES, budgets::check_export_point_count,
+    BudgetLimits, EntityId, Float, LogRecord, MetricPoint, QuantileValue, Resource,
+    STRUCTURE_FIXED_BYTES, Span, StreamIdentity, budgets::OTLP_PAYLOAD_BYTES,
+    budgets::check_export_point_count, budgets::check_export_record_count, slot_bytes,
 };
 
 use crate::decode::{self, Envelope};
@@ -243,16 +245,19 @@ impl Pipeline {
     /// `count × attribute_value_bytes`. A record's budget-shaped spend is
     /// its own attribute set plus its resource's and scope's, and — per
     /// span — every event's and link's set; per point — the stream
-    /// identity's metadata set and every exemplar's. Taking the three
-    /// record kinds' worst case gives the bound: a sink below it can
-    /// refuse a legal record forever, so [`Pipeline::with_config`]
-    /// refuses the sink first.
+    /// identity's metadata set, every exemplar's, and every numeric vector
+    /// entry the point carries (bucket counts, explicit bounds and
+    /// quantiles are gated too, by
+    /// `numeric_vector_entries_per_data_point`). Taking the three record
+    /// kinds' worst case gives the bound: a sink below it can refuse a
+    /// legal record forever, so [`Pipeline::with_config`] refuses the sink
+    /// first.
     ///
     /// Everything a record carries *outside* those sets — names, ids,
-    /// timestamps, fixed-width fields, and value payloads the budgets do
-    /// not shape — arrives inside the payload, which the payload ceiling
-    /// bounds; this bound is the budget-shaped part a queue ceiling must
-    /// clear.
+    /// timestamps, fixed-width fields, and value payloads that arrive
+    /// inside the payload — is bounded by the payload ceiling; this bound
+    /// is the budget-shaped part a queue ceiling must clear, and it now
+    /// covers every point shape the admission gates admit.
     #[must_use]
     pub fn legal_record_bound_bytes(limits: &BudgetLimits) -> usize {
         let attribute_set =
@@ -265,9 +270,24 @@ impl Pipeline {
             + limits.span_links_per_span * attribute_set(limits.attributes_per_nested_set);
         // A metric point's stream identity carries a fourth per-signal set:
         // the metric's metadata.
+        //
+        // The numeric-vector spend: `size.rs` accounts a heap vector as, per
+        // element, its inline slot doubled (the slot plus growth headroom) —
+        // `slot_bytes::<u64>()` is 16 and `slot_bytes::<Float>()` is 16 —
+        // plus, for structs like a summary quantile, the element's own
+        // accounted parts (`STRUCTURE_FIXED_BYTES + quantile + value`). The
+        // summary quantile is the worst per-entry charge among the shapes
+        // the vector gate numbers, so that charge times the gate's cap is
+        // the conservative vector-shaped part of the bound.
+        let quantile_charge = slot_bytes::<QuantileValue>()
+            + STRUCTURE_FIXED_BYTES
+            + 2 * std::mem::size_of::<Float>();
         let point = signal_sets
             + attribute_set(limits.attributes_per_signal)
-            + limits.exemplars_per_data_point * attribute_set(limits.attributes_per_nested_set);
+            + limits.exemplars_per_data_point * attribute_set(limits.attributes_per_nested_set)
+            + limits
+                .numeric_vector_entries_per_data_point
+                .saturating_mul(quantile_charge);
         span.max(point)
     }
 
@@ -340,12 +360,18 @@ impl Pipeline {
 
     /// Ingests one OTLP `ExportTraceServiceRequest`.
     ///
+    /// The export's record count is checked **before** anything is
+    /// admitted; an export over the per-export cap is refused whole — no
+    /// partial admission of a too-big export.
+    ///
     /// # Errors
     ///
     /// [`AdmissionSignal::Draining`] once draining has begun,
     /// [`AdmissionSignal::PayloadOverCap`] over the payload ceiling,
     /// [`AdmissionSignal::MalformedRequest`] when the bytes do not parse,
-    /// and [`AdmissionSignal::QueueSaturated`] — the one retryable signal —
+    /// [`AdmissionSignal::ExportOverCap`] when the export carries more
+    /// records than the per-export budget allows, and
+    /// [`AdmissionSignal::QueueSaturated`] — the one retryable signal —
     /// when the hand-off queue saturates mid-export.
     pub fn ingest_spans(
         &self,
@@ -354,24 +380,39 @@ impl Pipeline {
     ) -> Result<ExportOutcome, AdmissionSignal> {
         self.gate(payload)?;
         let request = Self::decode::<wire_trace::ExportTraceServiceRequest>(payload)?;
+
+        let mut total_records = 0;
+        for resource_spans in &request.resource_spans {
+            for scope_spans in &resource_spans.scope_spans {
+                total_records += scope_spans.spans.len();
+            }
+        }
+        if let Err(rejection) = check_export_record_count(total_records, &self.limits) {
+            return Err(AdmissionSignal::ExportOverCap { rejection });
+        }
+
         let mut ledger = self.lock_ledger();
         let mut outcome = ExportOutcome::default();
         for resource_spans in request.resource_spans {
             let resource = decode::resource(
                 resource_spans.resource.unwrap_or_default(),
                 &resource_spans.schema_url,
+                &self.limits,
             );
             for scope_spans in resource_spans.scope_spans {
                 let envelope = Self::envelope(
                     &resource,
                     scope_spans.scope.unwrap_or_default(),
                     &scope_spans.schema_url,
+                    &self.limits,
                 );
                 for proto in scope_spans.spans {
                     let recorded = match &envelope {
-                        Ok(envelope) => {
-                            self.admit_span(&mut ledger, now, decode::span(proto, envelope))
-                        }
+                        Ok(envelope) => self.admit_span(
+                            &mut ledger,
+                            now,
+                            decode::span(proto, envelope, &self.limits),
+                        ),
                         Err(reason) => Ok(RecordOutcome::Rejected {
                             reason: reason.clone(),
                         }),
@@ -385,6 +426,10 @@ impl Pipeline {
 
     /// Ingests one OTLP `ExportLogsServiceRequest`.
     ///
+    /// The export's record count is checked **before** anything is
+    /// admitted; an export over the per-export cap is refused whole — no
+    /// partial admission of a too-big export.
+    ///
     /// # Errors
     ///
     /// As [`Pipeline::ingest_spans`].
@@ -395,24 +440,39 @@ impl Pipeline {
     ) -> Result<ExportOutcome, AdmissionSignal> {
         self.gate(payload)?;
         let request = Self::decode::<wire_logs::ExportLogsServiceRequest>(payload)?;
+
+        let mut total_records = 0;
+        for resource_logs in &request.resource_logs {
+            for scope_logs in &resource_logs.scope_logs {
+                total_records += scope_logs.log_records.len();
+            }
+        }
+        if let Err(rejection) = check_export_record_count(total_records, &self.limits) {
+            return Err(AdmissionSignal::ExportOverCap { rejection });
+        }
+
         let mut ledger = self.lock_ledger();
         let mut outcome = ExportOutcome::default();
         for resource_logs in request.resource_logs {
             let resource = decode::resource(
                 resource_logs.resource.unwrap_or_default(),
                 &resource_logs.schema_url,
+                &self.limits,
             );
             for scope_logs in resource_logs.scope_logs {
                 let envelope = Self::envelope(
                     &resource,
                     scope_logs.scope.unwrap_or_default(),
                     &scope_logs.schema_url,
+                    &self.limits,
                 );
                 for proto in scope_logs.log_records {
                     let recorded = match &envelope {
-                        Ok(envelope) => {
-                            self.admit_log(&mut ledger, now, decode::log_record(proto, envelope))
-                        }
+                        Ok(envelope) => self.admit_log(
+                            &mut ledger,
+                            now,
+                            decode::log_record(proto, envelope, &self.limits),
+                        ),
                         Err(reason) => Ok(RecordOutcome::Rejected {
                             reason: reason.clone(),
                         }),
@@ -461,11 +521,13 @@ impl Pipeline {
             let resource = decode::resource(
                 resource_metrics.resource.unwrap_or_default(),
                 &resource_metrics.schema_url,
+                &self.limits,
             );
             for scope_metrics in resource_metrics.scope_metrics {
                 let scope = decode::scope(
                     scope_metrics.scope.unwrap_or_default(),
                     &scope_metrics.schema_url,
+                    &self.limits,
                 );
                 for metric in scope_metrics.metrics {
                     let identity = match (&resource, &scope) {
@@ -475,10 +537,11 @@ impl Pipeline {
                                 resource: Arc::clone(resource),
                                 scope: Arc::clone(scope),
                             },
+                            &self.limits,
                         ),
                         (Err(reason), _) | (_, Err(reason)) => Err(reason.clone()),
                     };
-                    for point in decode::into_points(metric) {
+                    for point in decode::into_points(metric, &self.limits) {
                         // A point whose translation failed is refused with
                         // its own reason inside `admit_point`, keeping its
                         // position.
@@ -523,8 +586,9 @@ impl Pipeline {
         resource: &Result<Arc<Resource>, RecordRejection>,
         scope: wire::InstrumentationScope,
         scope_schema_url: &str,
+        limits: &BudgetLimits,
     ) -> Result<Envelope, RecordRejection> {
-        let scope = decode::scope(scope, scope_schema_url)?;
+        let scope = decode::scope(scope, scope_schema_url, limits)?;
         let resource = resource.as_ref().map_err(RecordRejection::clone)?;
         Ok(Envelope {
             resource: Arc::clone(resource),

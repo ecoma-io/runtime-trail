@@ -406,7 +406,7 @@ fn a_backwards_reading_expires_nothing_and_a_backwards_admission_orders_first() 
     assert_eq!(page.items.len(), 1);
     assert_eq!(
         store.log_record(earlier).as_deref(),
-        page.items.first().map(std::convert::AsRef::as_ref)
+        page.items.first().map(|item| item.record.as_ref())
     );
     // And the backwards reading still expires nothing.
     assert_eq!(store.enforce_retention(at(0)), 0);
