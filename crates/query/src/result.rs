@@ -144,9 +144,11 @@ pub enum CoverageEntry {
     SnapshotBoundary { admission: AdmissionKey },
     /// The walk that counts a byte-ceiling omission stopped here — its
     /// scan or deadline expired mid-count — so every snapshot record
-    /// after it is uncounted: the truncation's `omitted` stays zero, and
-    /// this entry names the rest instead of dressing a partial number up
-    /// as a count.
+    /// after it is uncounted: the truncation's `omitted` reports the
+    /// count the walk had established before the stop (the confirmed
+    /// byte omissions), and this entry names the rest — the records the
+    /// walk never reached — instead of dressing the uncounted fragment
+    /// up as a complete count.
     UncountedTail {
         /// The last record the counting walk examined; everything the
         /// snapshot holds after it is uncounted.
