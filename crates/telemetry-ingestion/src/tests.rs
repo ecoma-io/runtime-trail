@@ -1618,6 +1618,11 @@ fn pipeline_over(ceiling_bytes: usize, limits: BudgetLimits) -> (Arc<BoundedQueu
 
 /// The shrunken budgets the saturation fixtures share: small enough that a
 /// queue at the derived legal-record bound saturates within a few records.
+///
+/// `numeric_vector_entries_per_data_point` is zero on purpose: the
+/// saturation fixtures queue number points and spans, never histograms or
+/// summaries, so the gate never fires, and a zero keeps the derived bound
+/// (which now includes the vector-shaped spend) small.
 fn shrunken_limits() -> BudgetLimits {
     BudgetLimits {
         attributes_per_signal: 1,
@@ -1628,6 +1633,8 @@ fn shrunken_limits() -> BudgetLimits {
         exemplars_per_data_point: 0,
         key_value_list_depth: 8,
         data_points_per_export: 10_000,
+        records_per_export: 10_000,
+        numeric_vector_entries_per_data_point: 0,
     }
 }
 
@@ -1907,4 +1914,175 @@ fn only_queue_saturation_is_retryable_anywhere() {
 #[test]
 fn the_crate_names_its_version() {
     assert!(!crate::VERSION.is_empty());
+}
+
+// -------------------------------------------------- per-export record gates
+
+/// The spans/logs symmetric of the metrics point cap: a single export that
+/// carries more records than `records_per_export` is refused whole, before
+/// anything is admitted or handed off.
+#[test]
+fn an_export_over_the_record_cap_is_refused_whole() {
+    // A shrunken record cap keeps the fixture tiny; a cap of one refuses any
+    // export that carries two spans in the same request.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 1,
+            ..shrunken_limits()
+        },
+    );
+
+    let payload = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![
+            scope_spans(Some(scope("test")), vec![trace_span("one", T1, S1)]),
+            scope_spans(Some(scope("test")), vec![trace_span("two", T1, S2)]),
+        ],
+    )]));
+    assert!(
+        payload.len() < OTLP_PAYLOAD_BYTES,
+        "the record cap fires before the payload cap"
+    );
+
+    let signal = pipeline
+        .ingest_spans(now(), &payload)
+        .expect_err("two records cross a one-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 1
+                && rejection.observed == 2
+    ));
+    assert!(!signal.is_retryable(), "retrying cannot shrink an export");
+    assert!(drain_queue(&queue).is_empty(), "nothing is handed off");
+}
+
+/// The logs path carrries the same whole-export record gate, counting log
+/// records across every `ScopeLogs` of every `ResourceLogs`.
+#[test]
+fn a_logs_export_over_the_record_cap_is_refused_whole() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 1,
+            ..shrunken_limits()
+        },
+    );
+
+    let payload = encode(&logs_request(vec![resource_logs(
+        Some(resource(Vec::new())),
+        vec![
+            scope_logs(Some(scope("test")), vec![log_record()]),
+            scope_logs(Some(scope("test")), vec![log_record()]),
+        ],
+    )]));
+    assert!(
+        payload.len() < OTLP_PAYLOAD_BYTES,
+        "the record cap fires before the payload cap"
+    );
+
+    let signal = pipeline
+        .ingest_logs(now(), &payload)
+        .expect_err("two records cross a one-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 1
+                && rejection.observed == 2
+    ));
+    assert!(!signal.is_retryable(), "retrying cannot shrink an export");
+    assert!(drain_queue(&queue).is_empty(), "nothing is handed off");
+}
+
+/// The record gate admits the exact cap in full, on both the spans and the
+/// logs paths — the metrics point cap's contract, symmetric.
+#[test]
+fn an_export_at_the_record_cap_admits_in_full() {
+    // Two spans against a two-record cap: both admitted, both handed off.
+    let (queue, spans_pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let spans_payload = encode(&traces_request(vec![resource_spans(
+        Some(resource(Vec::new())),
+        vec![scope_spans(
+            Some(scope("test")),
+            vec![trace_span("one", T1, S1), trace_span("two", T1, S2)],
+        )],
+    )]));
+    let outcome = spans_pipeline
+        .ingest_spans(now(), &spans_payload)
+        .expect("at the cap is legal");
+    assert_eq!(outcome.admitted(), 2);
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(drain_queue(&queue).len(), 2, "both spans handed off");
+
+    // Two log records against a two-record cap, symmetric.
+    let (queue, logs_pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let logs_payload = encode(&logs_request(vec![resource_logs(
+        Some(resource(Vec::new())),
+        vec![scope_logs(
+            Some(scope("test")),
+            vec![log_record(), log_record()],
+        )],
+    )]));
+    let outcome = logs_pipeline
+        .ingest_logs(now(), &logs_payload)
+        .expect("at the cap is legal");
+    assert_eq!(outcome.admitted(), 2);
+    assert_eq!(outcome.rejected(), 0);
+    assert_eq!(drain_queue(&queue).len(), 2, "both log records handed off");
+}
+
+/// The record count is the whole export's, summed across resources and
+/// scopes — not per `ScopeSpans`. A cap of two still counts one span in a
+/// second scope and refuses.
+#[test]
+fn the_record_cap_counts_the_whole_export_across_resources_and_scopes() {
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            records_per_export: 2,
+            ..shrunken_limits()
+        },
+    );
+    let payload = encode(&traces_request(vec![
+        resource_spans(
+            Some(resource(Vec::new())),
+            vec![scope_spans(
+                Some(scope("test")),
+                vec![trace_span("one", T1, S1), trace_span("two", T1, S2)],
+            )],
+        ),
+        resource_spans(
+            Some(resource(Vec::new())),
+            vec![scope_spans(
+                Some(scope("next")),
+                vec![trace_span("three", T1, [0x33; 8])],
+            )],
+        ),
+    ]));
+    let signal = pipeline
+        .ingest_spans(now(), &payload)
+        .expect_err("three spans across two resources cross a two-record cap");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::ExportOverCap { rejection }
+            if rejection.budget == BudgetName::RecordsPerExport
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
 }

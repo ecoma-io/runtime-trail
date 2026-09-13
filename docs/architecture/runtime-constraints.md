@@ -54,7 +54,9 @@ above).
 | Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                                                                                                                     |
 | Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                                                                                                                |
 | Key-value list depth                        | ≤ 8                                                 | every container nesting a record carries — key-value lists and arrays alike, in attribute values, log bodies, exemplar filtered attributes, metric metadata and event/link attributes                                                           |
-| Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                               |
+| Data points per export                      | ≤ 10,000                                            | one metrics export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                       |
+| Records per export (spans / logs)           | ≤ 10,000                                            | one spans or logs export; overflow rejects the whole export — **non-retryable**, the records gate's symmetric of the data-point cap                                                                                                             |
+| Numeric-vector entries per data point       | ≤ 100,000                                           | total entries a histogram, exponential histogram or summary point carries across its vectors (bucket counts, explicit bounds, quantiles); overflow refuses the point — **non-retryable**                                                        |
 | Series cap (active)                         | ≤ 100,000                                           | distinct resident streams; enforced by the store at keep time ([mechanism](storage-model.md)); refusal names the cap and is non-retryable, with an observable counter; a slot frees when the stream's last point is [evicted](storage-model.md) |
 | In-flight per queue                         | ≤ 64 MiB accounted                                  | the bounded ingestion→store hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                               |
 | Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                      |
@@ -100,8 +102,9 @@ Overload is a designed-for state, not later hardening:
    - saturated queue → **HTTP 429 + `Retry-After`** (gRPC
      `RESOURCE_EXHAUSTED`). This is the **only retryable** admission signal:
      saturation is transient, so a retry can succeed.
-   - per-signal cap violation → OTLP **`partial_success`** naming the
-     rejected records where the transport allows it, otherwise a
+   - per-signal cap violation (a data point or record over the per-export
+     cap, a point refused by an information budget) → OTLP **`partial_success`**
+     naming the rejected records where the transport allows it, otherwise a
      **non-retryable** export reject. Never 429: the payload is the problem,
      and retrying an over-cap payload cannot shrink it.
    - draining (SIGTERM received) → **HTTP 503 / gRPC `UNAVAILABLE`** — an

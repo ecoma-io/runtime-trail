@@ -302,7 +302,11 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   record, data point, resource and scope; attribute count per span event,
   link and exemplar; attribute value size — with attribute keys and
   structure names counted; events per span; links per span; exemplars per
-  point; data points per export; key-value-list depth. The numbers live in
+  point; data points per export and records per export — both whole-export
+  caps, the latter covering spans and log records; numeric-vector entries
+  per data point — the total entries a histogram, exponential histogram or
+  summary point carries across its vectors (bucket counts, explicit bounds,
+  quantiles); key-value-list depth. The numbers live in
   [runtime-constraints.md](runtime-constraints.md), which owns them; the
   model carries them as one startup-configurable limit set that every
   admission gate consumes.

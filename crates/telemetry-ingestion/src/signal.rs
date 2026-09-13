@@ -72,12 +72,14 @@ pub enum AdmissionSignal {
         /// The ceiling it exceeded (default 4 MiB).
         ceiling_bytes: usize,
     },
-    /// The export carried more data points than the per-export cap. Refused
-    /// whole — nothing from the export is admitted. A property of the
-    /// payload: retrying cannot shrink it.
+    /// The export carried more data points (metrics path) or more records
+    /// (spans/logs path) than the per-export cap. Refused whole — nothing
+    /// from the export is admitted. A property of the payload: retrying
+    /// cannot shrink it.
     ExportOverCap {
-        /// The named budget: [`runtime_trail_telemetry_model::BudgetName::DataPointsPerExport`],
-        /// its limit and the observed count.
+        /// The named budget: [`runtime_trail_telemetry_model::BudgetName::DataPointsPerExport`]
+        /// for metrics or [`runtime_trail_telemetry_model::BudgetName::RecordsPerExport`]
+        /// for spans/logs, its limit and the observed count.
         rejection: BudgetRejection,
     },
     /// The payload did not parse as an OTLP export request at all (including
