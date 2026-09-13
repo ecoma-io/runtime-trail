@@ -56,7 +56,7 @@ above).
 | Key-value list depth                        | ≤ 8                                                 | every container nesting a record carries — key-value lists and arrays alike, in attribute values, log bodies, exemplar filtered attributes, metric metadata and event/link attributes                                                           |
 | Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                               |
 | Series cap (active)                         | ≤ 100,000                                           | distinct resident streams; enforced by the store at keep time ([mechanism](storage-model.md)); refusal names the cap and is non-retryable, with an observable counter; a slot frees when the stream's last point is [evicted](storage-model.md) |
-| In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                                              |
+| In-flight per queue                         | ≤ 64 MiB accounted                                  | the bounded ingestion→store hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                               |
 | Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                      |
 | File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                                                                                                               |
 | Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                                                                                                                    |
@@ -111,10 +111,18 @@ Overload is a designed-for state, not later hardening:
      not retry.
    - over-ceiling payload → non-retryable reject at the transport edge,
      before the payload is parsed.
-2. **Bounded queues everywhere** — every hand-off (ingestion → store, query →
-   storage) runs through a queue bounded in accounted bytes (table above)
-   with a defined overflow policy: overflow **rejects the producer** —
-   drop-oldest exists only in retention eviction, never in queues.
+2. **The ingestion→store hand-off is queued; the query→storage path is
+   synchronous.** The one bounded hand-off today is ingestion → store — the
+   admission pump hands each newly admitted record to a queue bounded in
+   accounted bytes (table above) with a defined overflow policy: overflow
+   **rejects the producer** — drop-oldest exists only in retention eviction,
+   never in queues. The query→storage path does not queue: the Query Engine
+   reads the [storage contract](storage-model.md) synchronously inside its
+   own walk, under its query budget (`max_scan`, `deadline`
+   — [query-model.md](query-model.md)); the transfer-buffer memory for those
+   reads is bounded by the engine's budget accounting ([batched
+   walks](query-model.md)), not by a queue. A queued query→storage path is
+   future work and will appear here when a phase owns it.
 3. **Refuse or degrade, never grow** — a query that cannot be answered within
    its budget either returns a truthfully-truncated answer or fails with a
    budget error naming the dimension, limit and spend

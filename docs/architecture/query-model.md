@@ -69,15 +69,21 @@ driver symmetry per [ADR 0003](../decisions/0003-storage-strategy.md). A
 driver may use an index and report fewer units examined; it may never widen
 the meaning of the unit itself.
 
-A driver may never inflate accounting either: the engine cross-checks the
-reported count against the budget, and a driver that cannot produce a
-faithful count reports its in-exactness through coverage. A driver that
-cannot bound its own work within the ceiling produces a budget error — the
-error remains a budget error; the engine never exceeds the caller's ceiling
-by accepting made-up units. A batched walk may pull up to a bounded batch
-ahead of examination; records pulled but not examined at a stop consume
-scan allowance up to the remaining ceiling at the moment of the stop; the
-engine never charges fabricated units and never exceeds the ceiling.
+Scan accounting is the engine's, charged as it walks. A driver reports its
+work only by yielding records through the ordered scan surface — it reports
+no separate count for the engine to cross-check. The engine accounts each
+examination against the budget itself (the scan charge stands whether or
+not the record is returned, and a filtered-out record still consumed its
+scan allowance), and a driver that cannot bound its own work within the
+ceiling produces a budget error — the error remains a budget error; the
+engine never exceeds the caller's ceiling by accepting made-up units. A
+batched walk may pull up to a bounded batch ahead of examination; records
+pulled but not examined at a stop consume scan allowance up to the
+remaining ceiling at the moment of the stop; the engine never charges
+fabricated units and never exceeds the ceiling. There is no driver-reported
+count and no coverage entry for driver in-exactness in the implemented
+records flow — coverage names the answer's own gaps and boundaries, not a
+driver's internal accounting.
 
 ## Deadlines
 
@@ -155,8 +161,8 @@ not for slowness.
 ## Who enforces what
 
 - The **Query Engine enforces** every dimension; storage drivers report
-  their work in the scan unit and may be cross-checked, but the ceiling is
-  the engine's, not the driver's.
+  their work in the scan unit by yielding records, and the ceiling is the
+  engine's, not the driver's.
 - The **caller sets** the budget; flow-scoped defaults for the committed
   investigation flows are owned by layer-api, and the same defaults serve
   both [surfaces](mcp-model.md) — the UI and MCP ask for the same flows,

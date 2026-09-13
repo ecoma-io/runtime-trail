@@ -180,9 +180,14 @@ The name is the product's own word for "an answer with its honesty attached"
 
 ## Status
 
-**Contracts pinned (M0).** The envelope, the three-engine composition and
-the committed capabilities are the contract Phase 1–2 implement. The three
-crates (`investigation`, `query`, `correlation`) exist as declared
-boundaries with scaffolding only; the crates' structure and dependency
-directions are real and enforced from this commit on, and
-[boundaries.md](boundaries.md) is the mechanical form of that law.
+**Contracts pinned (M0); the Query Engine's records flow implemented
+(Phase 2, in progress).** The envelope, the three-engine composition and
+the committed capabilities are the contract Phase 1–2 implement. Of the
+three crates, `query` is implemented: the budgeted records flow — ordered,
+snapshot-bounded, cursor-chained pages under the five-dimension budget —
+exists and runs in the Query Engine crate (its contract and status are
+[query-model.md](query-model.md)'s to own). `investigation` and
+`correlation` exist as declared boundaries with scaffolding only; the
+crates' structure and dependency directions are real and enforced from this
+commit on, and [boundaries.md](boundaries.md) is the mechanical form of
+that law.

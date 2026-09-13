@@ -43,9 +43,13 @@ the honesty is not inspectable.
 4. **Post-admission shrinking is eviction only, and eviction is observable
    twice** — at the store (dropped-record counters) and in every response
    whose result set it touched (coverage). Silent shrinkage does not exist.
-5. A driver or layer that cannot honour a budget honestly says so through
-   coverage ("cannot produce a faithful count") rather than redefining the
-   [scan unit](../architecture/query-model.md).
+5. Scan accounting is the engine's, never the driver's. A driver reports
+   its work only by yielding records through the ordered scan surface — no
+   separate count for the engine to cross-check — and the [scan
+   unit](../architecture/query-model.md) is the driver's unit of work, not
+   a figure the driver is trusted to report.
+   A driver or layer that cannot honour the budget produces a budget error
+   rather than redefining the scan unit.
 
 ## Consequences
 
