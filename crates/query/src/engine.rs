@@ -433,24 +433,34 @@ impl Walk<'_> {
     /// The walk stops at a record whose scan charge was refused: the
     /// record was never examined. Inside a counting walk the cut leaves
     /// the omission uncounted and coverage names the uncounted rest;
-    /// otherwise the degrade anchors at the last examined record, a
-    /// continuation echoes its presented cursor, and a first page that
-    /// examined nothing refuses — nothing was examined, so no truthful
-    /// degrade is expressible and the refusal's numbers are the only
-    /// honest shape (invariant 6).
+    /// otherwise the degrade anchors at the last examined record. A
+    /// continuation whose deadline was already spent before this page
+    /// examined anything has no truthful degrade — nothing was examined,
+    /// so no cursor of its own was arrived at and an echo of the presented
+    /// cursor is a fabricated position, not a named truncation point — and
+    /// refuses (invariant 6), exactly as a deadline-dead first page does.
     fn stop_before_examining(&mut self, refusal: BudgetRefusal) {
         if let Some(counting) = self.counting.take() {
             self.coverage.push(CoverageEntry::UncountedTail {
                 after: counting.last,
                 dimension: refusal.dimension,
             });
-            self.stopped = Some(self.include_anchored_degrade(Dimension::Bytes, 0, counting.last));
+            // The omission stays byte-dimensional — the byte ceiling is what
+            // these records would not fit — and it reports the count the
+            // walk had established before the cut: the examined records that
+            // were confirmed byte-omissions. The `UncountedTail` entry names
+            // the rest the walk never reached, so the reported count is a
+            // confirmed fragment, never a partial number dressed up as
+            // complete.
+            self.stopped = Some(self.include_anchored_degrade(
+                Dimension::Bytes,
+                counting.omitted,
+                counting.last,
+            ));
             return;
         }
         let position = if let Some(anchor) = self.last_examined {
             TruncationPoint::Cursor(self.cursor_bytes(anchor))
-        } else if let Some(echo) = self.presented_echo() {
-            echo
         } else {
             self.stopped = Some(PartOutcome::Refused(refusal));
             return;
@@ -677,29 +687,47 @@ pub fn records(
 
     // A zero results ceiling demands the empty answer: no examination, no
     // omission — the budget itself is the whole answer, and nothing was
-    // left out by expiry. A continuation still names its boundary.
+    // left out by expiry. A continuation still names its boundary, and the
+    // page is empty by budget, never eviction-blind: an anchor the store has
+    // evicted is still a hole with a name, even though the walk will yield
+    // nothing to resolve it — the gap names the snapshot boundary's entity,
+    // the named rest, exactly as an unresolvable gap does in [`Walk::assemble`].
     if session.ledger().remaining_results() == 0 {
-        let coverage = presented.map_or_else(
-            || Coverage {
-                entries: Vec::new(),
-            },
-            |payload| Coverage {
-                entries: vec![CoverageEntry::SnapshotBoundary {
-                    admission: payload.snapshot(),
-                }],
-            },
-        );
+        let mut entries = Vec::new();
+        if let Some(payload) = &presented {
+            entries.push(CoverageEntry::SnapshotBoundary {
+                admission: payload.snapshot(),
+            });
+            if !anchor_is_resident(store, query.kind(), payload.last_entity()) {
+                entries.push(CoverageEntry::EvictionGap {
+                    after: payload.last_entity(),
+                    before: payload.snapshot().entity(),
+                });
+            }
+        }
         return Ok(Page {
             items: Vec::new(),
             next_cursor: None,
             execution: Execution {
                 parts: vec![PartOutcome::Complete],
-                coverage,
+                coverage: Coverage { entries },
             },
         });
     }
 
     Ok(walk_records(store, query, &mut session, presented))
+}
+
+/// Whether a continuation anchor's record is still resident: one direct
+/// lookup per continuation, never a scan — checking residency costs no
+/// examination. An evicted anchor is a named hole in coverage, never a
+/// silent skip.
+fn anchor_is_resident(store: &dyn TelemetryStore, kind: SignalKind, anchor: EntityId) -> bool {
+    match kind {
+        SignalKind::Spans => store.span(anchor).is_some(),
+        SignalKind::LogRecords => store.log_record(anchor).is_some(),
+        SignalKind::MetricPoints => store.metric_point(anchor).is_some(),
+    }
 }
 
 /// The walk itself, over an already-admitted session: split from
@@ -742,12 +770,7 @@ fn walk_records(
     // examination is charged.
     if let Some(payload) = &presented {
         let anchor = payload.last_entity();
-        let resident = match query.kind() {
-            SignalKind::Spans => store.span(anchor).is_some(),
-            SignalKind::LogRecords => store.log_record(anchor).is_some(),
-            SignalKind::MetricPoints => store.metric_point(anchor).is_some(),
-        };
-        if !resident {
+        if !anchor_is_resident(store, query.kind(), anchor) {
             walk.pending_gap = Some(anchor);
         }
     }
@@ -885,6 +908,11 @@ mod tests {
             panic!("the page degrades");
         };
         truncation
+    }
+
+    /// A cursor's admission-time position, for comparing anchors directly.
+    fn fresh_position(payload: &CursorPayload) -> u64 {
+        payload.position()
     }
 
     fn span_entity_of(view: &RecordView) -> Option<EntityId> {
@@ -1874,11 +1902,12 @@ mod tests {
         assert!(spans_of_logs.next_cursor.is_none());
     }
 
-    /// A counting walk cut short by its scan ceiling reports an uncounted
-    /// omission — zero, not a partial number — and coverage names the
-    /// uncounted rest. Zero without the entry would be a lie in both
-    /// directions: a dressed-up partial count, or a silence about what
-    /// was never counted.
+    /// A counting walk cut short by its scan ceiling reports the count it
+    /// had already established — the records it had confirmed as
+    /// byte-omissions before the cut — and coverage names the one record
+    /// the cut denied it. The reported number is a confirmed fragment,
+    /// never zero pretending nothing was counted and never a partial
+    /// count dressed up as complete.
     #[test]
     fn a_counting_walk_cut_short_is_uncounted_and_coverage_names_it() {
         let mut store = FixtureStore::empty();
@@ -1913,8 +1942,9 @@ mod tests {
         let truncation = degraded_of(&page);
         assert_eq!(truncation.dimension, Dimension::Bytes);
         assert_eq!(
-            truncation.omitted, 0,
-            "the count was cut: uncounted, not zero"
+            truncation.omitted, 1,
+            "e3 was a confirmed byte-omission before the counting walk was \
+             cut — the count reports the confirmed fragment, never zero"
         );
         assert_eq!(
             page.execution.coverage.entries,
@@ -1935,16 +1965,70 @@ mod tests {
         assert_eq!(payload.last_entity(), span_entity(2, 2));
     }
 
-    /// A continuation whose deadline is dead before its first record
-    /// degrades by echoing the presented cursor: nothing was examined,
-    /// the caller's position did not move, and the echo is the truthful
-    /// continuation. Refusing here would refuse a traversal that could
-    /// degrade truthfully.
+    /// A byte-ceiling counting walk cut by the scan ceiling on a
+    /// continuation keeps its count: the scan stop is where the walk
+    /// stops, but the omission is still byte-dimensional — the byte
+    /// ceiling is what the records would not fit — and `omitted` reports
+    /// the confirmed count the walk had established (e3 and e4, both
+    /// confirmed byte-omissions), never a dressed-down zero. The
+    /// [`CoverageEntry::UncountedTail`] names the last counted record and
+    /// the scan stop for the rest.
     ///
-    /// Kills the no-op where a dead continuation mints a fresh cursor
-    /// (moving the caller without returning anything) or refuses.
+    /// Kills the no-op where the scan cut swallows the byte-ceiling count
+    /// (`omitted` reset to zero) or renames the omission to the scan
+    /// dimension (`dimension: Scan`), which would misstate what was cut.
     #[test]
-    fn a_dead_continuation_degrades_by_echoing_the_presented_cursor() {
+    fn a_byte_ceiling_count_survives_a_scan_cut_in_a_continuation() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        // Byte ceiling 1: below every span's evidence, so the counting walk
+        // opens at e3. Scan ceiling 2: e3 and e4 are examined and counted,
+        // and the stop is the refusal of e5's charge.
+        let second = records(&store, &query, budget_with(1_000, 1, 2), Some(&cursor))
+            .expect("the query answers");
+        assert!(second.items.is_empty());
+        let truncation = degraded_of(&second);
+        assert_eq!(
+            truncation.dimension,
+            Dimension::Bytes,
+            "the omission stays byte-dimensional — the byte ceiling is what \
+             the records would not fit"
+        );
+        assert_eq!(
+            truncation.omitted, 2,
+            "the count the walk had confirmed before the cut survives"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![
+                CoverageEntry::SnapshotBoundary {
+                    admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+                },
+                CoverageEntry::UncountedTail {
+                    after: span_entity(4, 4),
+                    dimension: Dimension::Scan,
+                },
+            ],
+            "the uncounted tail names the last counted record and the scan stop"
+        );
+    }
+
+    /// A continuation whose deadline is dead before its first record
+    /// refuses: nothing was examined, so no cursor of its own was
+    /// arrived at and the presented cursor is a fabricated position —
+    /// the same honest shape a deadline-dead first page produces.
+    /// The refusal names dimension (Deadline), limit and observed spend
+    /// per invariant 6, and is distinguishable from a retryable echo.
+    ///
+    /// Kills the echo loop where a dead continuation returned a cursor
+    /// identical to its input — indistinguishable from progress —
+    /// creating an infinite retry cycle.
+    #[test]
+    fn a_dead_continuation_refuses_when_nothing_was_examined() {
         let store = five_spans();
         let first = records(
             &store,
@@ -1964,19 +2048,111 @@ mod tests {
         .expect("the query answers");
 
         assert!(second.items.is_empty());
-        assert_eq!(
-            second.next_cursor.as_deref(),
-            Some(cursor.as_slice()),
-            "the presented cursor is echoed byte for byte"
+        // The continuation has no cursor to offer — the budget has no
+        // scan work to do, so nothing is a truthful continuation.
+        assert!(
+            second.next_cursor.is_none(),
+            "a refused continuation offers no cursor — the budget is spent"
         );
-        let truncation = degraded_of(&second);
-        assert_eq!(truncation.dimension, Dimension::Deadline);
-        assert_eq!(truncation.omitted, 0);
+        // The refusal is the honest shape, identical in structure to a
+        // deadline-dead first page: it names the dimension, the limit and
+        // the observed spend.
+        let [PartOutcome::Refused(refusal)] = &second.execution.parts[..] else {
+            panic!("a dead continuation refuses, not degrades");
+        };
+        assert_eq!(refusal.dimension, Dimension::Deadline);
+        assert_eq!(
+            refusal.limit,
+            Magnitude::Duration(Duration::ZERO),
+            "the admitted deadline was zero"
+        );
+        assert!(
+            matches!(refusal.observed, Magnitude::Duration(_)),
+            "the observed spend is a duration"
+        );
         assert_eq!(
             second.execution.coverage.entries,
             vec![CoverageEntry::SnapshotBoundary {
                 admission: AdmissionKey::new(at(500), span_entity(5, 5)),
             }],
+            "the snapshot boundary is still named"
+        );
+    }
+
+    /// A dead continuation refuses, but a *live* continuation cut by the
+    /// scan ceiling mid-walk is a different shape: the walk examined and
+    /// included records, so the degrade anchors at the last included
+    /// record and mints a FRESH cursor from it — never a blank echo of
+    /// the presented cursor. The fresh cursor is strictly past the
+    /// presented one (the anchor moved past it), so the caller's position
+    /// genuinely advances and the continuation is what makes endless
+    /// retry impossible — the anti-echo sibling of MINOR-4.
+    #[test]
+    fn an_examined_continuation_cut_by_scan_mints_a_fresh_continuation_cursor() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        // Beyond the ceiling, this continuation WOULD include more. First
+        // page minted at e2, snapshot e5. The walk resumes from e2
+        // strictly past with only one scan unit: it examines and includes
+        // e3, then the charge to examine e4 is refused. The stop anchors
+        // at the last *included* record (e3), which is past the presented
+        // anchor — no room for an echo that would loop forever, and the
+        // next page resumes losslessly after e3.
+        let second = records(
+            &store,
+            &query,
+            budget_with(1_000, 1 << 40, 1),
+            Some(&cursor),
+        )
+        .expect("the query answers");
+        let entities: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3)],
+            "the one record the scan allowance bought was examined and included"
+        );
+        let truncation = degraded_of(&second);
+        assert_eq!(
+            truncation.dimension,
+            Dimension::Scan,
+            "the scan ceiling is what cut this continuation"
+        );
+        // The truncated position is not a blank echo: it is a cursor minted
+        // from the anchor the walk actually reached before the ceiling died.
+        let fresh = second.next_cursor.as_deref().expect("a minted cursor");
+        assert_ne!(
+            fresh,
+            cursor.as_slice(),
+            "the continuation's fresh cursor is not a byte-for-byte echo of \
+             the presented cursor — the walk moved at least one record"
+        );
+        let payload = CursorPayload::decode(fresh).expect("the engine's own cursor");
+        assert_eq!(
+            payload.last_entity(),
+            span_entity(3, 3),
+            "the fresh cursor anchors at the last included record"
+        );
+        let presented = CursorPayload::decode(&cursor).expect("the presented cursor");
+        assert!(
+            fresh_position(&payload) > fresh_position(&presented),
+            "the fresh cursor's position is strictly past the presented one — \
+             the byte anchor moved, so the caller's position advances and the \
+             next page resumes losslessly"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+            "the continuation still names its snapshot boundary"
         );
     }
 
@@ -2269,6 +2445,84 @@ mod tests {
             vec![CoverageEntry::SnapshotBoundary {
                 admission: AdmissionKey::new(at(500), span_entity(5, 5)),
             }],
+        );
+    }
+
+    /// A zero-results continuation whose cursor anchor the store has
+    /// evicted is empty-but-not-eviction-blind: the budget demands the
+    /// empty answer and the early return never walks, so the anchor's
+    /// residency is checked directly and the hole is named in coverage —
+    /// the evicted record, with the snapshot boundary's entity as the
+    /// named rest, exactly as an unresolvable gap names it in the walk.
+    ///
+    /// Kills the no-op where a zero-results budget returns an empty page
+    /// with no [`CoverageEntry::EvictionGap`] for an evicted anchor — silent
+    /// shrinkage.
+    #[test]
+    fn a_zero_results_continuation_names_an_evicted_anchor_as_a_gap() {
+        let mut store = five_spans();
+        let first = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            budget_with(2, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+
+        assert!(store.evict(span_entity(2, 2)), "the anchor was resident");
+
+        let continuation = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            budget_with(0, 1 << 40, 10_000),
+            Some(&cursor),
+        )
+        .expect("the query answers");
+        assert!(continuation.items.is_empty());
+        assert!(continuation.next_cursor.is_none());
+        assert_eq!(continuation.execution.parts, vec![PartOutcome::Complete]);
+        assert_eq!(
+            continuation.execution.coverage.entries,
+            vec![
+                CoverageEntry::SnapshotBoundary {
+                    admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+                },
+                CoverageEntry::EvictionGap {
+                    after: span_entity(2, 2),
+                    before: span_entity(5, 5),
+                },
+            ],
+            "the evicted anchor is a named hole even though the walk never \
+             runs to resolve it"
+        );
+
+        // The complement: the same zero-results continuation with a resident
+        // anchor stays empty and Complete with only the boundary — never a
+        // phantom gap.
+        let resident = five_spans();
+        let page_one = records(
+            &resident,
+            &RecordsQuery::new(SignalKind::Spans),
+            budget_with(2, 1 << 40, 10_000),
+            None,
+        )
+        .expect("the query answers");
+        let resident_cursor = page_one.next_cursor.expect("a truncated page continues");
+        let empty = records(
+            &resident,
+            &RecordsQuery::new(SignalKind::Spans),
+            budget_with(0, 1 << 40, 10_000),
+            Some(&resident_cursor),
+        )
+        .expect("the query answers");
+        assert!(empty.items.is_empty());
+        assert_eq!(
+            empty.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+            "a resident anchor produces no gap"
         );
     }
 
@@ -2982,14 +3236,19 @@ mod tests {
         );
     }
 
-    /// A dead continuation under filters degrades by echoing the presented
-    /// cursor byte for byte — and that echo is anchored at the last
-    /// matching included record, because only matches mint cursors (F7).
+    /// A dead continuation under filters refuses exactly like one without
+    /// filters: the deadline was spent before the page examined anything,
+    /// so no cursor of its own was arrived at and the presented cursor is a
+    /// fabricated position — the same honest shape a deadline-dead first
+    /// page produces, filters or none (invariant 6). Only matches mint
+    /// cursors (F7), and under a dead deadline no match is ever examined,
+    /// so there is nothing to anchor at.
     ///
     /// Kills the no-op where a filtered walk moves the caller without
-    /// returning anything.
+    /// returning anything — and the echo loop where a dead continuation
+    /// returned a cursor identical to its input.
     #[test]
-    fn a_dead_continuation_under_filters_degrades_at_the_last_matching_anchor() {
+    fn a_dead_continuation_under_filters_refuses_at_the_dead_deadline() {
         let store = service_store();
         let first = records(
             &store,
@@ -3009,25 +3268,30 @@ mod tests {
         .expect("the query answers");
 
         assert!(second.items.is_empty());
-        assert_eq!(
-            second.next_cursor.as_deref(),
-            Some(cursor.as_slice()),
-            "the presented cursor is echoed byte for byte"
+        assert!(
+            second.next_cursor.is_none(),
+            "a refused continuation offers no cursor — an echo would be a \
+             fabricated position, indistinguishable from progress"
         );
-        let truncation = degraded_of(&second);
-        assert_eq!(truncation.dimension, Dimension::Deadline);
+        let [PartOutcome::Refused(refusal)] = &second.execution.parts[..] else {
+            panic!("a dead continuation refuses, not degrades");
+        };
+        assert_eq!(refusal.dimension, Dimension::Deadline);
         assert_eq!(
-            truncation.position,
-            crate::result::TruncationPoint::Cursor(cursor.clone()),
-            "the truncation names the echo, not a fresh cursor"
+            refusal.limit,
+            Magnitude::Duration(Duration::ZERO),
+            "the admitted deadline was zero"
         );
-        let payload = CursorPayload::decode(second.next_cursor.as_deref().expect("the echo"))
-            .expect("the echoed cursor");
+        assert!(
+            matches!(refusal.observed, Magnitude::Duration(_)),
+            "the observed spend is a duration"
+        );
         assert_eq!(
-            payload.last_entity(),
-            span_entity(1, 1),
-            "the echo sits at the last matching included record — the anchor \
-             only matches mint"
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+            "the continuation still names its snapshot boundary"
         );
     }
 
