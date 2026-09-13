@@ -109,8 +109,9 @@ indefinitely.**
   answers 429 + `Retry-After` naming the budget, without touching the body.
   Non-OTLP surfaces (`/healthz`, `/version`, the UI fallback) never buffer a
   request body and pass through. Requests refused by an earlier honest gate —
-  draining (503) or declared-over-ceiling (413) — also pass through so the
-  already-contracted answer is the one on the wire.
+  draining (503), content-type (415, the same gate the handler runs), or
+  declared-over-ceiling (413) — also pass through so the already-contracted
+  answer — never the budget's 429 — is the one on the wire.
 - **OTLP/gRPC:** tonic's frame reader bounds one body to
   `payload_ceiling + GRPC_DECODING_SLACK_BYTES` via
   `max_decoding_message_size`, but nothing bounds how many frames buffer
@@ -128,7 +129,10 @@ indefinitely.**
 - **Honest refusal ordering preserved:** the existing gates (draining 503 →
   content-type 415 → declared-over-ceiling 413 → bounded read) keep their
   precedence; the aggregate answers only where no earlier gate owns the
-  refusal.
+  refusal. The middleware runs the same three gates in the same order the
+  handler answers them, so the aggregate's 429 is never dressed over a
+  request an earlier gate already refused — the wire answer does not depend
+  on whether the budget happens to be hot.
 - **Behavior change, rarely hit:** a local SDK that sends a full body quickly
   sees no change; the 429/`RESOURCE_EXHAUSTED` and 408/`DEADLINE_EXCEEDED`
   answers are new refuse-shapes for the misbehaving cases the finding names.

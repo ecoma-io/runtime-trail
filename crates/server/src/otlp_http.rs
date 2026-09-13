@@ -438,10 +438,19 @@ pub(crate) async fn inflight_body_guard(
         return next.run(request).await;
     }
     let ceiling_bytes = runtime.payload_ceiling_bytes();
-    // Draining and declared-over-ceiling are answered by their own gates
-    // before any body byte is buffered; charging the aggregate for them would
-    // only contrive a 429 where the contracted answer is 503/413.
-    if runtime.is_draining() || declared_over_ceiling(request.headers(), ceiling_bytes) {
+    // The earlier honest gates answer before any body byte is buffered and
+    // before the aggregate is charged — in the same order the handler answers
+    // them (draining 503, content-type 415, declared over-ceiling 413), so the
+    // wire answer does not depend on whether the budget is hot. Charging the
+    // aggregate for a request one of these gates owns would contrive a 429
+    // where the contracted answer is 503/415/413.
+    if runtime.is_draining() {
+        return next.run(request).await;
+    }
+    if let Some(refusal) = content_type_gate(request.headers()) {
+        return refusal;
+    }
+    if declared_over_ceiling(request.headers(), ceiling_bytes) {
         return next.run(request).await;
     }
     let charge = declared_length_bounded(request.headers(), ceiling_bytes);
@@ -1131,6 +1140,94 @@ mod tests {
         // Let the held bodies go: aborting the tasks cancels them at the next
         // scheduler tick, dropping the middleware's guard and returning the
         // charges — so the drain is polled, not asserted synchronously.
+        for handle in held {
+            handle.abort();
+        }
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "every held charge is returned when the body future goes away"
+        );
+        runtime.shutdown();
+    }
+
+    /// The earlier gates keep their precedence even when the aggregate
+    /// budget is hot: a request whose content-type this phase does not speak
+    /// answers 415 (the content-type gate's own refusal), never 429. The
+    /// content-type gate owns the answer before the body is read; a wrong
+    /// content-type is a protocol refusal, not transient overload — so it must
+    /// not be dressed as the retryable aggregate-overload 429.
+    #[tokio::test]
+    async fn wrong_content_type_still_answers_415_when_the_budget_is_hot() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            inflight_body_ceiling_bytes: 2000,
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // Two bodies each declare 1000 bytes and never deliver them, filling
+        // the 2 KiB aggregate exactly — the same shape the 429 test uses, so
+        // the budget is genuinely hot when the JSON request arrives.
+        let drip_request = |body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .header("content-length", "1000")
+                .body(body)
+                .expect("a static request builds")
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let router = router.clone();
+            held.push(tokio::spawn(async move {
+                router.oneshot(drip_request(endless())).await
+            }));
+        }
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() == 2000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            2000,
+            "both drip bodies held their charges"
+        );
+
+        // A wrong-content-type request while the budget is exhausted answers
+        // the content-type gate's 415 — not the aggregate's 429. The wire
+        // answer must not depend on how hot the budget is.
+        let json = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"resource_spans": []}"#.to_vec()))
+            .expect("a static request builds");
+        let refusal = router
+            .clone()
+            .oneshot(json)
+            .await
+            .expect("the router answers every request");
+        assert_eq!(
+            refusal.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "the content-type gate answers 415 even with the budget hot"
+        );
+        assert_eq!(
+            refusal.headers().get("retry-after"),
+            None,
+            "415 is not a transient-overload answer and carries no retry hint"
+        );
+
         for handle in held {
             handle.abort();
         }

@@ -150,9 +150,13 @@ transport edge bounds what the sockets buffer _before_ admission
 overload answers honestly at whichever edge it hits first: the aggregate
 in-flight body budget (429 / gRPC `RESOURCE_EXHAUSTED`), the per-body read
 timeout (408 / gRPC `DEADLINE_EXCEEDED`), the queue ceiling (429 /
-`RESOURCE_EXHAUSTED`), or a retention ceiling. Both transport edges and the
-queue share the retryable-transient 429 family; the wire shapes stay the
-contracted ones below.
+`RESOURCE_EXHAUSTED`), or a retention ceiling. The transport-edge 429 is
+subordinate to the earlier contract gates — draining (503), content-type
+(415), over-ceiling (413) — which answer before any body byte buffers and
+before the budget is charged, so the wire answer never depends on how hot
+the budget happens to be. Both transport edges and the queue share the
+retryable-transient 429 family; the wire shapes stay the contracted ones
+below.
 
 ### Ownership law
 
