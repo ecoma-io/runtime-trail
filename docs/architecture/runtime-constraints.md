@@ -45,21 +45,23 @@ operator may tune them at startup only — never mid-session — and changing a
 default is an architecture change (the PR states its effect on the table
 above).
 
-| Limit                                       | Default                                             | Applies to                                                                                                                                                                                                                                      |
-| ------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OTLP payload ceiling                        | 4 MiB                                               | one OTLP export request; rejected non-retryably at the transport edge                                                                                                                                                                           |
-| Attributes per signal                       | ≤ 256                                               | per span, log record, data point, resource, scope                                                                                                                                                                                               |
-| Attributes per span event, link or exemplar | ≤ 64                                                | each carries its own attribute set                                                                                                                                                                                                              |
-| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — key, entry overhead and payload all count)                                                                                                                                 |
-| Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                                                                                                                     |
-| Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                                                                                                                |
-| Key-value list depth                        | ≤ 8                                                 | every container nesting a record carries — key-value lists and arrays alike, in attribute values, log bodies, exemplar filtered attributes, metric metadata and event/link attributes                                                           |
-| Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                               |
-| Series cap (active)                         | ≤ 100,000                                           | distinct resident streams; enforced by the store at keep time ([mechanism](storage-model.md)); refusal names the cap and is non-retryable, with an observable counter; a slot frees when the stream's last point is [evicted](storage-model.md) |
-| In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                                              |
-| Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                      |
-| File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                                                                                                               |
-| Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                                                                                                                    |
+| Limit                                       | Default                                             | Applies to                                                                                                                                                                                                                                                          |
+| ------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OTLP payload ceiling                        | 4 MiB                                               | one OTLP export request; rejected non-retryably at the transport edge                                                                                                                                                                                               |
+| Attributes per signal                       | ≤ 256                                               | per span, log record, data point, resource, scope                                                                                                                                                                                                                   |
+| Attributes per span event, link or exemplar | ≤ 64                                                | each carries its own attribute set                                                                                                                                                                                                                                  |
+| Attribute value size                        | ≤ 4 KiB                                             | one value's accounted size ([model](telemetry-model.md) accounting — key, entry overhead and payload all count)                                                                                                                                                     |
+| Events / links per span                     | ≤ 128 / ≤ 32                                        | span events; links per span                                                                                                                                                                                                                                         |
+| Exemplars per data point                    | ≤ 4                                                 | metric exemplars                                                                                                                                                                                                                                                    |
+| Key-value list depth                        | ≤ 8                                                 | every container nesting a record carries — key-value lists and arrays alike, in attribute values, log bodies, exemplar filtered attributes, metric metadata and event/link attributes                                                                               |
+| Data points per export                      | ≤ 10,000                                            | one export; overflow rejects the whole export — **non-retryable** (a payload property; retrying cannot shrink it)                                                                                                                                                   |
+| Series cap (active)                         | ≤ 100,000                                           | distinct resident streams; enforced by the store at keep time ([mechanism](storage-model.md)); refusal names the cap and is non-retryable, with an observable counter; a slot frees when the stream's last point is [evicted](storage-model.md)                     |
+| In-flight per queue                         | ≤ 64 MiB accounted                                  | each bounded hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                                                                  |
+| In-flight request body (transport edge)     | ≤ 64 MiB                                            | aggregate bytes being buffered at the OTLP transports before admission ([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)); overflow = reject the producer (429 / gRPC `RESOURCE_EXHAUSTED`) — transient, retryable, alongside queue saturation |
+| Request body read timeout                   | ≤ 10 s                                              | one OTLP body arriving over either transport; a stuck/drip client is refused (408 / gRPC `DEADLINE_EXCEEDED`) so no single body holds its buffered bytes indefinitely                                                                                               |
+| Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                                          |
+| File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                                                                                                                                   |
+| Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                                                                                                                                        |
 
 Byte-bounded queues are why these numbers compose: a queue holds at most
 64 MiB regardless of how large any single legal record is, so in-flight
@@ -98,8 +100,17 @@ Overload is a designed-for state, not later hardening:
    behaviour is contracted, not implied, and each signal names what kind of
    problem it is:
    - saturated queue → **HTTP 429 + `Retry-After`** (gRPC
-     `RESOURCE_EXHAUSTED`). This is the **only retryable** admission signal:
-     saturation is transient, so a retry can succeed.
+     `RESOURCE_EXHAUSTED`). This is retryable outright: saturation is
+     transient, so a retry can succeed.
+   - aggregate in-flight body budget exceeded → **HTTP 429 + `Retry-After`**
+     (gRPC `RESOURCE_EXHAUSTED`) — the same retryable answer, for the
+     transport edge ([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)).
+     Both 429s are the transient-overload family: the budget frees as bodies
+     complete, so a retry can succeed.
+   - a request body that never arrives in time → **HTTP 408** (gRPC
+     `DEADLINE_EXCEEDED`) — the read timeout, a non-retryable transport
+     refusal: the payload never arrived complete and a retry of the same slow
+     body is not the answer.
    - per-signal cap violation → OTLP **`partial_success`** naming the
      rejected records where the transport allows it, otherwise a
      **non-retryable** export reject. Never 429: the payload is the problem,
@@ -123,6 +134,18 @@ Overload is a designed-for state, not later hardening:
 4. **Persistence never blocks admission** —
    [storage-model.md](storage-model.md) owns this rule; restated here because
    it is a resource guarantee: the hot path never waits on durable I/O.
+
+### The transport-edge gate
+
+The queue ceilings bound what the pipeline holds _after_ admission; the
+transport edge bounds what the sockets buffer _before_ admission
+([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)). An
+overload answers honestly at whichever edge it hits first: the aggregate
+in-flight body budget (429 / gRPC `RESOURCE_EXHAUSTED`), the per-body read
+timeout (408 / gRPC `DEADLINE_EXCEEDED`), the queue ceiling (429 /
+`RESOURCE_EXHAUSTED`), or a retention ceiling. Both transport edges and the
+queue share the retryable-transient 429 family; the wire shapes stay the
+contracted ones below.
 
 ### Ownership law
 
