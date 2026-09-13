@@ -29,10 +29,13 @@
 //! decoded — and before its bytes are buffered past the bound.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use prost::Message;
 use runtime_trail_telemetry_ingestion::{
@@ -42,7 +45,6 @@ use runtime_trail_telemetry_ingestion::{
 };
 
 use crate::runtime::CoreRuntime;
-use std::sync::Arc;
 
 /// The `Retry-After` hint a saturated queue answers with, in seconds.
 ///
@@ -164,8 +166,13 @@ async fn export(runtime: Arc<CoreRuntime>, request: Request, signal: Signal) -> 
     if declared_over_ceiling(request.headers(), ceiling_bytes) {
         return payload_over_cap_response(None, ceiling_bytes);
     }
-    let payload = match to_bytes(request.into_body(), ceiling_bytes).await {
-        Ok(payload) => payload,
+    // The per-request body read deadline bounds a single body's buffering
+    // window — a stuck or slow-drip client is refused 408 instead of holding
+    // its bytes indefinitely ([ADR 0010]).
+    let timeout = runtime.body_read_timeout();
+    let payload = match read_body(request.into_body(), ceiling_bytes, timeout).await {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return body_read_timeout_response(timeout),
         Err(error) => {
             // Two honest ways a read fails: the body grew past the ceiling
             // mid-read (an undeclared over-cap — the refusal, but the size
@@ -361,6 +368,125 @@ fn body_read_failure_response() -> Response {
         "the request body could not be read in full; the payload never \
          arrived complete, so nothing was parsed or admitted",
     )
+}
+
+/// The read-timeout answer: the body did not arrive in full within the
+/// per-request deadline. It is a transport refusal, not an admission signal:
+/// the payload never arrived, so there is nothing to parse and a retry of the
+/// same slow body is not the answer ([ADR 0010]).
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+fn body_read_timeout_response(timeout: Duration) -> Response {
+    text_response(
+        StatusCode::REQUEST_TIMEOUT,
+        format!(
+            "the request body did not arrive in full within the {}-millisecond \
+             read deadline; nothing was parsed or admitted, and the operation \
+             was refused at the transport edge",
+            timeout.as_millis(),
+        ),
+    )
+}
+
+/// Reads the request body with two bounds: the transport-edge byte ceiling
+/// (shared with the per-request `to_bytes` contract) and the per-request read
+/// timeout ([ADR 0010]).
+///
+/// Returns `Ok(Some(payload))` on a full read within the deadline, `Ok(None)`
+/// when the deadline elapsed first, and `Err(_)` when the body errored (the
+/// caller tells a length-limit error from a broken connection).
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+async fn read_body(
+    body: axum::body::Body,
+    ceiling_bytes: usize,
+    timeout: Duration,
+) -> Result<Option<bytes::Bytes>, axum::Error> {
+    match tokio::time::timeout(timeout, to_bytes(body, ceiling_bytes)).await {
+        Ok(result) => result.map(Some),
+        Err(_elapsed) => Ok(None),
+    }
+}
+
+/// The aggregate in-flight body-budget gate for the OTLP/HTTP routes
+/// ([ADR 0010]).
+///
+/// Applied as `middleware::from_fn` in `build_router`, this runs for every
+/// request but only acts on the three OTLP/HTTP export endpoints: it charges
+/// the request's declared body length (≤ the payload ceiling) to the shared
+/// transport-edge budget before the body is read, and releases it when the
+/// handler is done. A request that would push the aggregate past its budget is
+/// refused **429 + `Retry-After`** before a body byte is buffered — the honest
+/// retryable answer for transient transport-edge overload, sibling to queue
+/// saturation.
+///
+/// Requests the earlier honest gates own are passed through without charging:
+/// a draining runtime (the handler answers 503 before reading) and a declared
+/// over-ceiling body (the handler answers 413 before reading). Non-OTLP
+/// surfaces (health, version, the UI) never buffer a request body and are
+/// passed through.
+pub(crate) async fn inflight_body_guard(
+    State(runtime): State<Arc<CoreRuntime>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // The three OTLP/HTTP export endpoints are the only routes that buffer a
+    // request body. Everything else — health, version, the UI, the gRPC
+    // services (which acquire on the same budget at their own seam) — passes
+    // through untouched.
+    if request.method() != Method::POST || !is_otlp_http_export(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let ceiling_bytes = runtime.payload_ceiling_bytes();
+    // Draining and declared-over-ceiling are answered by their own gates
+    // before any body byte is buffered; charging the aggregate for them would
+    // only contrive a 429 where the contracted answer is 503/413.
+    if runtime.is_draining() || declared_over_ceiling(request.headers(), ceiling_bytes) {
+        return next.run(request).await;
+    }
+    let charge = declared_length_bounded(request.headers(), ceiling_bytes);
+    let Some(_guard) = runtime.inflight_body_budget().try_acquire(charge) else {
+        return inflight_over_budget_response(runtime.inflight_body_budget().ceiling_bytes());
+    };
+    // The guard is held across the whole handler call: the body is buffered
+    // inside it, and no body byte is buffered before the acquire.
+    next.run(request).await
+}
+
+/// Whether the path is one of the three OTLP/HTTP export endpoints.
+fn is_otlp_http_export(path: &str) -> bool {
+    matches!(path, "/v1/traces" | "/v1/metrics" | "/v1/logs")
+}
+
+/// The charge a request makes against the aggregate body budget: the declared
+/// `Content-Length`, bounded to the payload ceiling — the worst case the
+/// bounded read can buffer. An absent or unparseable length is charged at the
+/// ceiling (a chunked body with no declared size could still buffer up to it).
+fn declared_length_bounded(headers: &axum::http::HeaderMap, ceiling_bytes: usize) -> usize {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(ceiling_bytes, |declared| declared.min(ceiling_bytes))
+}
+
+/// The aggregate-over-budget answer: 429 + `Retry-After`, the retryable
+/// transient-overload shape, naming the budget. A request refused here holds
+/// no body bytes — the refusal is the whole answer.
+fn inflight_over_budget_response(budget_bytes: usize) -> Response {
+    let mut response = text_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "the transport edge's in-flight-body budget of {budget_bytes} bytes \
+             is exhausted; buffering another body now would breach the runtime's \
+             bounded-memory law. Retry when a buffered body completes"
+        ),
+    );
+    response.headers_mut().insert(
+        "Retry-After",
+        header::HeaderValue::from_static(RETRY_AFTER_SECS),
+    );
+    response
 }
 
 /// An OTLP protobuf answer: 200, `application/x-protobuf`.
@@ -836,6 +962,8 @@ mod tests {
             },
             payload_ceiling_bytes: 64 * 1024,
             queue_ceiling_bytes: 4096,
+            inflight_body_ceiling_bytes: 1024 * 1024,
+            body_read_timeout: Duration::from_secs(10),
             clock: Box::new(crate::runtime::SystemWallClock),
         }
     }
@@ -883,5 +1011,299 @@ mod tests {
             message.contains("6 further rejected records not named"),
             "the truncation is stated: {message:?}"
         );
+    }
+
+    /// A body stream that never yields — the transport-edge drip the aggregate
+    /// budget and the read deadline exist for.
+    fn endless() -> Body {
+        Body::from_stream(tonic::codegen::tokio_stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >())
+    }
+
+    /// One HTTP/1.1 request over a real TCP connection; the whole response as
+    /// bytes. The mirror of the crate-level helper, named differently so the
+    /// two modules stay independent.
+    async fn httpexchange(bind: std::net::SocketAddr, request: &str, body: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(bind)
+            .await
+            .expect("a client connects");
+        let head = format!(
+            "{request}\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head writes");
+        stream.write_all(body).await.expect("the body writes");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("the response reads");
+        response
+    }
+
+    /// N concurrent slow-drip bodies over the aggregate in-flight-body budget
+    /// are refused 429 + `Retry-After` at the transport edge, and the runtime
+    /// stays alive for the surfaces that never buffer a body.
+    #[tokio::test]
+    async fn concurrent_slow_drip_bodies_over_the_aggregate_are_refused_429() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            inflight_body_ceiling_bytes: 2000,
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // Two bodies each declare 1000 bytes and never deliver them: each
+        // holds its charge, filling the 2 KiB aggregate exactly. The bodies
+        // run as spawned tasks so the middleware's acquire (which precedes the
+        // body read) happens before the third request arrives.
+        let drip_request = |body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .header("content-length", "1000")
+                .body(body)
+                .expect("a static request builds")
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let router = router.clone();
+            held.push(tokio::spawn(async move {
+                router.oneshot(drip_request(endless())).await
+            }));
+        }
+
+        // Wait for the aggregate to fill: both acquires must land before the
+        // third request, so the third is refused for *this* test's reason.
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() == 2000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            2000,
+            "both drip bodies held their charges"
+        );
+
+        // The third body, also a drip, is refused before a body byte is
+        // buffered: 429 + Retry-After, naming the budget.
+        let refusal = router
+            .clone()
+            .oneshot(drip_request(endless()))
+            .await
+            .expect("the router answers every request");
+        assert_eq!(refusal.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            refusal.headers()["retry-after"],
+            "1",
+            "the aggregate refusal is the retryable transient-overload answer"
+        );
+        let message = String::from_utf8_lossy(&body_bytes(refusal).await).to_string();
+        assert!(
+            message.contains("in-flight-body budget"),
+            "the refused request names the budget: {message}"
+        );
+
+        // The runtime stays alive: a surface that never buffers a request
+        // body still answers, even with the transport edge exhausted.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("a static request builds"),
+            )
+            .await
+            .expect("the router answers every request");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        // Let the held bodies go: aborting the tasks cancels them at the next
+        // scheduler tick, dropping the middleware's guard and returning the
+        // charges — so the drain is polled, not asserted synchronously.
+        for handle in held {
+            handle.abort();
+        }
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "every held charge is returned when the body future goes away"
+        );
+        runtime.shutdown();
+    }
+
+    /// A body within its declared length passes the gate unchanged — the
+    /// aggregate budget never touches a healthy small export.
+    #[tokio::test]
+    async fn a_within_bound_body_still_passes_through_the_gate() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            inflight_body_ceiling_bytes: 2000,
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // A declared length is the honest charge: a real client declares its
+        // body, and the gate must admit it without holding the whole budget.
+        let payload = one_span_payload(fx::T1, fx::S1);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/traces")
+                    .header("content-type", "application/x-protobuf")
+                    .header("content-length", payload.len().to_string())
+                    .body(Body::from(payload))
+                    .expect("a static request builds"),
+            )
+            .await
+            .expect("the router answers every request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let answer = ExportTraceServiceResponse::decode(&body_bytes(response).await[..])
+            .expect("the admitted answer decodes");
+        assert!(
+            answer.partial_success.is_some(),
+            "the export is admitted through the gate carrying partial_success"
+        );
+        wait_for_resident(&runtime, 1);
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "the healthy body's charge was returned"
+        );
+        runtime.shutdown();
+    }
+
+    /// A body that never arrives in full within the per-request read deadline
+    /// is refused 408 — and the runtime stays alive.
+    #[tokio::test]
+    async fn a_body_beyond_the_read_deadline_answers_408() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            body_read_timeout: Duration::from_millis(50),
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // A body that never yields a byte: without the deadline the handler
+        // would wait forever; with it, the bounded read answers 408.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/traces")
+                    .header("content-type", "application/x-protobuf")
+                    .body(endless())
+                    .expect("a static request builds"),
+            )
+            .await
+            .expect("the router answers every request");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let message = String::from_utf8_lossy(&body_bytes(response).await).to_string();
+        assert!(
+            message.contains("read deadline"),
+            "the deadline is named: {message}"
+        );
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "the timed-out body returned its charge"
+        );
+
+        // The runtime stays alive and still admits a healthy export.
+        let healthy = post(router, "/v1/traces", one_span_payload(fx::T2, fx::S2)).await;
+        assert_eq!(healthy.status(), StatusCode::OK);
+        wait_for_resident(&runtime, 1);
+        runtime.shutdown();
+    }
+
+    /// The real socket proves the served wire refuses a slow-drip body with
+    /// 408 when it passes the read deadline, and that the process keeps
+    /// serving after — the whole accept loop, not just the in-process router.
+    #[tokio::test]
+    async fn a_real_socket_drip_is_refused_408_and_the_server_keeps_serving() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            body_read_timeout: Duration::from_millis(50),
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral bind");
+        let addr = listener.local_addr().expect("an ephemeral address");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let drain_runtime = Arc::clone(&runtime);
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+            let _ = gate.await;
+            drain_runtime.begin_drain();
+        });
+        let server = tokio::spawn(async move { serve.await });
+
+        // A connection that declares a large body and sends a trickle, then
+        // stalls: the read deadline fires and the server answers 408.
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("a client connects");
+        let head = "POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n\
+                    Content-Type: application/x-protobuf\r\n\
+                    Content-Length: 4000000\r\n\r\n";
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the head writes");
+        stream
+            .write_all(b"trickle")
+            .await
+            .expect("the trickle writes");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the server answers in time")
+            .expect("the response reads");
+        let answer = String::from_utf8_lossy(&response);
+        assert!(
+            answer.starts_with("HTTP/1.1 408"),
+            "the served wire refuses the drip with 408: {answer}"
+        );
+
+        // The server is still serving: a healthy export succeeds next.
+        let export = httpexchange(
+            addr,
+            "POST /v1/traces HTTP/1.1",
+            &one_span_payload(fx::T1, fx::S1),
+        )
+        .await;
+        let export = String::from_utf8_lossy(&export);
+        assert!(
+            export.starts_with("HTTP/1.1 200 OK"),
+            "the serve loop lives on: {export}"
+        );
+        wait_for_resident(&runtime, 1);
+
+        trigger.send(()).expect("the server is still running");
+        server
+            .await
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
+        runtime.shutdown();
     }
 }

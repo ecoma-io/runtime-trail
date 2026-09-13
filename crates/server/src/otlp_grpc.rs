@@ -42,6 +42,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use prost::Message;
@@ -58,6 +59,24 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status};
 
 use crate::otlp_http::{rejected_count, rejected_summary};
 use crate::runtime::CoreRuntime;
+
+/// The gRPC answer when the transport-edge aggregate in-flight-body budget is
+/// exhausted ([ADR 0010]): `RESOURCE_EXHAUSTED`, the retryable
+/// transient-overload shape — the same family as queue saturation. The honest
+/// message names the budget, not the ingestion queue.
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+fn inflight_over_budget_status(budget_bytes: usize) -> Status {
+    tracing::warn!(
+        budget_bytes,
+        "transport-edge in-flight body budget exhausted: refusing the producer retryably"
+    );
+    Status::resource_exhausted(format!(
+        "the transport edge's in-flight-body budget of {budget_bytes} bytes is \
+         exhausted; buffering another body now would breach the runtime's \
+         bounded-memory law. Retry when a buffered body completes"
+    ))
+}
 
 /// The gRPC service prefix the OTLP/HTTP router nests the trace service
 /// under (a gRPC method's path is `/<service>/<method>`).
@@ -310,6 +329,48 @@ fn signal_to_status(signal: AdmissionSignal) -> Status {
     }
 }
 
+/// The read-timeout answer for a gRPC request: `DEADLINE_EXCEEDED`, naming
+/// the transport-edge bound. The body never arrived complete, so nothing was
+/// parsed or admitted ([ADR 0010]).
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+fn body_read_timeout_status() -> Status {
+    Status::deadline_exceeded(
+        "the request body did not arrive in full within the read deadline; \
+         refused at the transport edge",
+    )
+}
+
+/// Runs one gRPC unary under the transport-edge guard ([ADR 0010]).
+///
+/// The frame reader buffers the whole request body before the unary service
+/// runs, so the aggregate in-flight-body charge and the per-request read
+/// deadline wrap the *entire* unary future. A charge refused answers
+/// `RESOURCE_EXHAUSTED` — the retryable transient-overload shape, sibling to
+/// queue saturation. A body that never arrives in full within the deadline
+/// answers `DEADLINE_EXCEEDED`.
+///
+/// `unary` is not a future-producing closure but the future itself, built
+/// outside — the caller owns the frame reader, so the future the timeout wraps
+/// can borrow it without leaving the closure's scope.
+///
+/// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
+async fn guarded_unary(
+    runtime: &CoreRuntime,
+    deadline: Duration,
+    charge: usize,
+    unary: impl std::future::Future<Output = http::Response<GrpcBody>>,
+) -> http::Response<GrpcBody> {
+    let Some(_guard) = runtime.inflight_body_budget().try_acquire(charge) else {
+        return inflight_over_budget_status(runtime.inflight_body_budget().ceiling_bytes())
+            .into_http();
+    };
+    match tokio::time::timeout(deadline, unary).await {
+        Ok(response) => response,
+        Err(_elapsed) => body_read_timeout_status().into_http(),
+    }
+}
+
 // ------------------------------------------------------------------
 // The per-service unary handlers
 // ------------------------------------------------------------------
@@ -404,7 +465,20 @@ impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
                     }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportTraceServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
-                    Ok(grpc.unary(ExportSpans { runtime }, req).await)
+                    let charge = runtime.grpc_decoding_ceiling_bytes();
+                    let deadline = runtime.body_read_timeout();
+                    Ok(guarded_unary(
+                        &runtime,
+                        deadline,
+                        charge,
+                        grpc.unary(
+                            ExportSpans {
+                                runtime: Arc::clone(&runtime),
+                            },
+                            req,
+                        ),
+                    )
+                    .await)
                 }
                 path => Ok(unimplemented_response(path)),
             }
@@ -449,7 +523,20 @@ impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
                     let mut grpc =
                         Grpc::new(PassthroughCodec::<ExportMetricsServiceResponse>::new())
                             .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
-                    Ok(grpc.unary(ExportMetrics { runtime }, req).await)
+                    let charge = runtime.grpc_decoding_ceiling_bytes();
+                    let deadline = runtime.body_read_timeout();
+                    Ok(guarded_unary(
+                        &runtime,
+                        deadline,
+                        charge,
+                        grpc.unary(
+                            ExportMetrics {
+                                runtime: Arc::clone(&runtime),
+                            },
+                            req,
+                        ),
+                    )
+                    .await)
                 }
                 path => Ok(unimplemented_response(path)),
             }
@@ -493,7 +580,20 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
                     }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportLogsServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
-                    Ok(grpc.unary(ExportLogs { runtime }, req).await)
+                    let charge = runtime.grpc_decoding_ceiling_bytes();
+                    let deadline = runtime.body_read_timeout();
+                    Ok(guarded_unary(
+                        &runtime,
+                        deadline,
+                        charge,
+                        grpc.unary(
+                            ExportLogs {
+                                runtime: Arc::clone(&runtime),
+                            },
+                            req,
+                        ),
+                    )
+                    .await)
                 }
                 path => Ok(unimplemented_response(path)),
             }
@@ -745,6 +845,8 @@ mod tests {
             },
             payload_ceiling_bytes: 64 * 1024,
             queue_ceiling_bytes: 4096,
+            inflight_body_ceiling_bytes: 1024 * 1024,
+            body_read_timeout: Duration::from_secs(10),
             clock: Box::new(crate::runtime::SystemWallClock),
         }
     }
@@ -1432,6 +1534,132 @@ mod tests {
             .await
             .expect("the server task joins")
             .expect("the server serves cleanly");
+        runtime.shutdown();
+    }
+
+    /// A slow-drip frame that never completes: the timeout the read deadline
+    /// bounds, on the gRPC side, is the whole unary future.
+    #[tokio::test]
+    async fn a_frame_beyond_the_read_deadline_answers_deadline_exceeded() {
+        use tonic::codegen::tokio_stream::StreamExt;
+
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            body_read_timeout: Duration::from_millis(50),
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // A body that yields a partial frame (the opening 5 framing bytes,
+        // then nothing): the unary cannot complete, so the read deadline
+        // answers DEADLINE_EXCEEDED — never an INTERNAL, never a hang.
+        let endless = Body::from_stream(
+            tonic::codegen::tokio_stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                bytes::Bytes::from_static(&[0u8, 0, 0, 0, 4]),
+            )])
+            .chain(tonic::codegen::tokio_stream::pending()),
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(endless)
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        let answer = answer(response).await;
+        assert_eq!(answer.code, Some(4), "DEADLINE_EXCEEDED");
+        assert!(
+            answer.message.contains("read deadline"),
+            "the deadline is named: {:?}",
+            answer.message
+        );
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "the timed-out frame returned its charge"
+        );
+        runtime.shutdown();
+    }
+
+    /// Two taken-in-flight charges exhaust the aggregate, and the next
+    /// export is refused `RESOURCE_EXHAUSTED` before its frame is buffered.
+    #[tokio::test]
+    async fn concurrent_frames_over_the_aggregate_are_refused_resource_exhausted() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            // A gRPC charge is the decoding ceiling — payload ceiling plus the
+            // 8 KiB framing slack. With a 1 KiB payload ceiling each frame
+            // charges 9 KiB, so a 18 KiB aggregate holds exactly two frames.
+            payload_ceiling_bytes: 1024,
+            inflight_body_ceiling_bytes: 2 * (1024 + 8 * 1024),
+            ..RuntimeConfig::default()
+        })
+        .expect("the config is buildable");
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        // Frames that never complete, each charging the decoding ceiling. The
+        // gRPC frame reader and the aggregate budget both hold the charge.
+        let framed_request = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(TRACE_EXPORT)
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(Body::from_stream(tonic::codegen::tokio_stream::pending::<
+                    Result<bytes::Bytes, std::convert::Infallible>,
+                >()))
+                .expect("a static request builds")
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let router = router.clone();
+            held.push(tokio::spawn(async move {
+                router.oneshot(framed_request()).await
+            }));
+        }
+
+        let ceiling = runtime.inflight_body_budget().ceiling_bytes();
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() >= ceiling {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            runtime.inflight_body_budget().in_flight() >= ceiling,
+            "both frames held their charges"
+        );
+
+        let refusal = router
+            .clone()
+            .oneshot(framed_request())
+            .await
+            .expect("the router answers every request");
+        let answer = answer(refusal).await;
+        assert_eq!(answer.code, Some(8), "RESOURCE_EXHAUSTED");
+        assert!(
+            answer.message.contains("in-flight-body budget"),
+            "the refused frame names the budget: {:?}",
+            answer.message
+        );
+
+        for handle in held {
+            handle.abort();
+        }
+        for _ in 0..5_000 {
+            if runtime.inflight_body_budget().in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            runtime.inflight_body_budget().in_flight(),
+            0,
+            "every held charge is returned when the frame future goes away"
+        );
         runtime.shutdown();
     }
 
