@@ -79,6 +79,19 @@ pub struct BudgetLimits {
     /// Data points per export; overflow rejects the whole export — a
     /// payload property, non-retryable.
     pub data_points_per_export: usize,
+    /// Records per export (spans and log records); overflow rejects the
+    /// whole export — a payload property, non-retryable, exactly like the
+    /// data-point cap it mirrors. A queue-shared by every signal, the
+    /// per-export record gate is what keeps one signal's payload-ceiling
+    /// export from monopolising the shared hand-off queue.
+    pub records_per_export: usize,
+    /// Numeric-vector entries per data point: the total entries a
+    /// histogram, exponential histogram or summary point may carry across
+    /// its numeric vectors (bucket counts, explicit bounds, quantiles).
+    /// Ungated, a single point's vectors would dominate the hand-off
+    /// queue; overflow refuses the point at admission — non-retryable —
+    /// like every other model budget.
+    pub numeric_vector_entries_per_data_point: usize,
 }
 
 impl Default for BudgetLimits {
@@ -94,6 +107,8 @@ impl Default for BudgetLimits {
             exemplars_per_data_point: 4,
             key_value_list_depth: 8,
             data_points_per_export: 10_000,
+            records_per_export: 10_000,
+            numeric_vector_entries_per_data_point: 100_000,
         }
     }
 }
@@ -157,6 +172,11 @@ pub enum BudgetName {
     KeyValueListDepth,
     /// Data points per export; overflow rejects the whole export.
     DataPointsPerExport,
+    /// Spans or log records per export; overflow rejects the whole export.
+    RecordsPerExport,
+    /// Numeric-vector entries per data point (histogram buckets, exponential
+    /// histogram buckets, summary quantiles).
+    NumericVectorEntriesPerDataPoint,
 }
 
 impl BudgetName {
@@ -173,6 +193,8 @@ impl BudgetName {
             Self::ExemplarsPerDataPoint => "exemplars_per_data_point",
             Self::KeyValueListDepth => "key_value_list_depth",
             Self::DataPointsPerExport => "data_points_per_export",
+            Self::RecordsPerExport => "records_per_export",
+            Self::NumericVectorEntriesPerDataPoint => "numeric_vector_entries_per_data_point",
         }
     }
 }
@@ -349,6 +371,49 @@ pub fn check_point(point: &MetricPoint, limits: &BudgetLimits) -> Result<(), Bud
             limits,
         )?;
     }
+    // The numeric vectors: a point's bucket counts, explicit bounds and
+    // quantiles are heap vectors whose accounted cost rides the point into
+    // the byte-bounded queue. Ungated, one point could alone occupy the
+    // whole hand-off queue; the gate numbers the entries and refuses the
+    // point when any shape's vectors overflow — a payload property,
+    // non-retryable, like every model budget.
+    let vector_entries = numeric_vector_entries(point);
+    check_numeric_vector_entries(vector_entries, limits)?;
+    Ok(())
+}
+
+/// The total numeric-vector entries one point carries across every shape —
+/// what the numeric-vector budget measures. A number point carries none.
+fn numeric_vector_entries(point: &MetricPoint) -> usize {
+    match point {
+        MetricPoint::Number(_) => 0,
+        MetricPoint::Histogram(point) => point.bucket_counts.len() + point.explicit_bounds.len(),
+        MetricPoint::ExponentialHistogram(point) => {
+            point.positive.bucket_counts.len() + point.negative.bucket_counts.len()
+        }
+        MetricPoint::Summary(point) => point.quantiles.len(),
+    }
+}
+
+/// The admission gate for one point's numeric-vector entry count. Overflow
+/// refuses the point — non-retryable, like every model budget.
+///
+/// # Errors
+///
+/// Returns [`BudgetRejection`] naming
+/// [`BudgetName::NumericVectorEntriesPerDataPoint`] when `count` exceeds
+/// the cap.
+fn check_numeric_vector_entries(
+    count: usize,
+    limits: &BudgetLimits,
+) -> Result<(), BudgetRejection> {
+    if count > limits.numeric_vector_entries_per_data_point {
+        return Err(refuse(
+            BudgetName::NumericVectorEntriesPerDataPoint,
+            limits.numeric_vector_entries_per_data_point,
+            count,
+        ));
+    }
     Ok(())
 }
 
@@ -448,6 +513,29 @@ pub fn check_export_point_count(
         return Err(refuse(
             BudgetName::DataPointsPerExport,
             limits.data_points_per_export,
+            count,
+        ));
+    }
+    Ok(())
+}
+
+/// The admission gate for one export's record count (spans and log
+/// records). Overflow rejects the whole export — a payload property,
+/// non-retryable; the caller (ingestion) applies the verdict to the entire
+/// request, exactly as [`check_export_point_count`] does for metric points.
+///
+/// # Errors
+///
+/// Returns [`BudgetRejection`] naming
+/// [`BudgetName::RecordsPerExport`] when `count` exceeds the cap.
+pub fn check_export_record_count(
+    count: usize,
+    limits: &BudgetLimits,
+) -> Result<(), BudgetRejection> {
+    if count > limits.records_per_export {
+        return Err(refuse(
+            BudgetName::RecordsPerExport,
+            limits.records_per_export,
             count,
         ));
     }
@@ -602,6 +690,8 @@ mod tests {
         assert_eq!(default.exemplars_per_data_point, 4);
         assert_eq!(default.key_value_list_depth, 8);
         assert_eq!(default.data_points_per_export, 10_000);
+        assert_eq!(default.records_per_export, 10_000);
+        assert_eq!(default.numeric_vector_entries_per_data_point, 100_000);
         assert_eq!(OTLP_PAYLOAD_BYTES, 4 * 1024 * 1024);
     }
 
@@ -937,6 +1027,96 @@ mod tests {
             BudgetName::DataPointsPerExport,
             limits().data_points_per_export,
             limits().data_points_per_export + 1,
+        );
+    }
+
+    #[test]
+    fn records_per_export_rejects_the_whole_export() {
+        assert!(check_export_record_count(limits().records_per_export, &limits()).is_ok());
+        assert_rejected(
+            check_export_record_count(limits().records_per_export + 1, &limits()),
+            BudgetName::RecordsPerExport,
+            limits().records_per_export,
+            limits().records_per_export + 1,
+        );
+    }
+
+    #[test]
+    fn numeric_vector_entries_per_data_point_is_gated() {
+        // The gate numbers the total entries across a shape's vectors: a
+        // histogram with one bucket count and two bounds carries three.
+        let histogram = MetricPoint::Histogram(crate::metrics::HistogramPoint {
+            attributes: Attributes::default(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 1,
+            sum: None,
+            bucket_counts: vec![1],
+            explicit_bounds: vec![
+                crate::values::Float::new(1.0),
+                crate::values::Float::new(2.0),
+            ],
+            min: None,
+            max: None,
+            flags: 0,
+            exemplars: Vec::new(),
+        });
+        assert!(
+            check_point(&histogram, &limits()).is_ok(),
+            "a tiny histogram passes the vector gate"
+        );
+
+        let tight = BudgetLimits {
+            numeric_vector_entries_per_data_point: 2,
+            ..limits()
+        };
+        assert_rejected(
+            check_point(&histogram, &tight),
+            BudgetName::NumericVectorEntriesPerDataPoint,
+            2,
+            3,
+        );
+
+        // The summary shape's quantiles count too, as do both of an
+        // exponential histogram's bucket layouts.
+        let summary = MetricPoint::Summary(crate::metrics::SummaryPoint {
+            attributes: Attributes::default(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 1,
+            sum: None,
+            quantiles: vec![
+                crate::metrics::QuantileValue {
+                    quantile: crate::values::Float::new(0.5),
+                    value: crate::values::Float::new(1.0),
+                },
+                crate::metrics::QuantileValue {
+                    quantile: crate::values::Float::new(0.9),
+                    value: crate::values::Float::new(2.0),
+                },
+                crate::metrics::QuantileValue {
+                    quantile: crate::values::Float::new(0.99),
+                    value: crate::values::Float::new(3.0),
+                },
+            ],
+            flags: 0,
+            exemplars: Vec::new(),
+        });
+        assert_rejected(
+            check_point(&summary, &tight),
+            BudgetName::NumericVectorEntriesPerDataPoint,
+            2,
+            3,
+        );
+        assert!(
+            check_point(&summary, &limits()).is_ok(),
+            "three quantiles pass the default cap"
+        );
+
+        // A number point carries no vectors and never trips the gate.
+        assert!(
+            check_point(&number_point(Attributes::default(), Vec::new()), &tight).is_ok(),
+            "a number point carries no numeric vectors"
         );
     }
 

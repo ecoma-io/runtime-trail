@@ -742,6 +742,8 @@ mod tests {
                 exemplars_per_data_point: 0,
                 key_value_list_depth: 1,
                 data_points_per_export: 10,
+                records_per_export: 10,
+                numeric_vector_entries_per_data_point: 0,
             },
             payload_ceiling_bytes: 64 * 1024,
             queue_ceiling_bytes: 4096,
