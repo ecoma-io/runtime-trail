@@ -791,6 +791,170 @@ fn a_deep_value_is_refused_by_the_model_depth_budget() {
     assert_eq!(outcome.admitted(), 1);
 }
 
+#[test]
+fn an_event_list_over_the_count_budget_is_refused() {
+    // The events-per-span budget rides the same boundary as the attribute
+    // count: an over-cap event list is refused at the count boundary,
+    // naming the budget, its limit and the observed count — nothing of the
+    // span reaches the hand-off, and the ledger never interned it, so a
+    // clean re-delivery of the same identity admits fresh.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            span_events_per_span: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let event = || trace::span::Event {
+        time_unix_nano: 1,
+        name: "e".to_owned(),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+    };
+    let mut span = trace_span("events", T1, S1);
+    span.events = vec![event(), event(), event()];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::EventsPerSpan
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+
+    // The refusal left the identity free: the same span, in budget,
+    // re-admits fresh instead of collapsing onto a stranded entry.
+    let clean = pipeline
+        .ingest_spans(now(), &one_span_export(trace_span("events", T1, S1)))
+        .expect("walked");
+    assert!(
+        matches!(&clean.records[0], RecordOutcome::Admitted { .. }),
+        "the refused event list left no ledger entry: {clean:?}"
+    );
+    drain_queue(&queue);
+}
+
+#[test]
+fn an_event_list_at_the_count_budget_is_admitted() {
+    // The boundary is "the next event refuses": exactly the cap is
+    // admitted, and every event is materialized.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            span_events_per_span: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let event = || trace::span::Event {
+        time_unix_nano: 1,
+        name: "e".to_owned(),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+    };
+    let mut span = trace_span("events", T1, S1);
+    span.events = vec![event(), event()];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.admitted(), 1);
+    let queued = drain_queue(&queue);
+    let StoredRecord::Span(span) = &queued[0].record else {
+        panic!()
+    };
+    assert_eq!(span.events.len(), 2, "both events materialized");
+}
+
+#[test]
+fn a_link_list_over_the_count_budget_is_refused() {
+    // The links-per-span budget rides the same boundary as the event and
+    // attribute counts: an over-cap link list is refused at the count
+    // boundary, naming the budget, its limit and the observed count —
+    // nothing of the span reaches the hand-off, and the identity stays
+    // free for a clean re-delivery.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            span_links_per_span: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let link = || trace::span::Link {
+        trace_id: T2.to_vec(),
+        span_id: S2.to_vec(),
+        trace_state: String::new(),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        flags: 0,
+    };
+    let mut span = trace_span("links", T1, S1);
+    span.links = vec![link(), link(), link()];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::LinksPerSpan
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+
+    // The refusal left the identity free: the same span, in budget,
+    // re-admits fresh instead of collapsing onto a stranded entry.
+    let clean = pipeline
+        .ingest_spans(now(), &one_span_export(trace_span("links", T1, S1)))
+        .expect("walked");
+    assert!(
+        matches!(&clean.records[0], RecordOutcome::Admitted { .. }),
+        "the refused link list left no ledger entry: {clean:?}"
+    );
+    drain_queue(&queue);
+}
+
+#[test]
+fn a_link_list_at_the_count_budget_is_admitted() {
+    // The boundary is "the next link refuses": exactly the cap is
+    // admitted, and every link is materialized.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            span_links_per_span: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let link = || trace::span::Link {
+        trace_id: T2.to_vec(),
+        span_id: S2.to_vec(),
+        trace_state: String::new(),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        flags: 0,
+    };
+    let mut span = trace_span("links", T1, S1);
+    span.links = vec![link(), link()];
+    let outcome = pipeline
+        .ingest_spans(now(), &one_span_export(span))
+        .expect("walked");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.admitted(), 1);
+    let queued = drain_queue(&queue);
+    let StoredRecord::Span(span) = &queued[0].record else {
+        panic!()
+    };
+    assert_eq!(span.links.len(), 2, "both links materialized");
+}
+
 // ------------------------------------------------------------------ logs
 
 #[test]

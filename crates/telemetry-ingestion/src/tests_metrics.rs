@@ -1144,6 +1144,204 @@ fn a_point_over_the_exemplar_budget_refuses_at_its_position() {
 }
 
 #[test]
+fn an_exemplar_list_at_the_cap_is_admitted() {
+    // The boundary is "the next exemplar refuses": exactly the per-point
+    // budget of four is admitted, and every exemplar is materialized.
+    let harness = Harness::new();
+    let exemplar = || metrics::Exemplar {
+        filtered_attributes: Vec::new(),
+        time_unix_nano: 11,
+        span_id: Vec::new(),
+        trace_id: Vec::new(),
+        value: Some(metrics::exemplar::Value::AsInt(1)),
+    };
+    let mut point = number_point(as_double(1.0));
+    point.exemplars = vec![exemplar(), exemplar(), exemplar(), exemplar()];
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("exemplared", gauge(vec![point]))],
+        )],
+    )]));
+    let outcome = harness
+        .pipeline
+        .ingest_metrics(now(), &payload)
+        .expect("admitted");
+    assert_eq!(outcome.admitted(), 1);
+    let queued = harness.drain();
+    let StoredRecord::Point { point, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    assert_eq!(
+        point.exemplars().len(),
+        4,
+        "all four exemplars materialized"
+    );
+}
+
+#[test]
+fn a_histogram_over_the_numeric_vector_budget_is_refused() {
+    // The numeric-vector budget numbers the total entries across a point's
+    // vectors: a histogram with two bucket counts and one bound carries
+    // three. Against a two-entry limit the point is refused at the count
+    // boundary, naming the budget, its limit and the observed count —
+    // nothing reaches the hand-off, and the stream the admission would
+    // have interned is never interned: a budget refusal precedes
+    // interning, so the ledger stays as quiet as before the export.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            numeric_vector_entries_per_data_point: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let point = metrics::HistogramDataPoint {
+        attributes: Vec::new(),
+        start_time_unix_nano: 1,
+        time_unix_nano: 10,
+        count: 3,
+        sum: Some(6.0),
+        bucket_counts: vec![1, 2],
+        explicit_bounds: vec![1.0],
+        exemplars: Vec::new(),
+        flags: 0,
+        min: Some(1.0),
+        max: Some(3.0),
+    };
+    let histogram = metrics::metric::Data::Histogram(metrics::Histogram {
+        data_points: vec![point],
+        aggregation_temporality: metrics::AggregationTemporality::Cumulative as i32,
+    });
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("bucketed", histogram)],
+        )],
+    )]));
+    let outcome = pipeline.ingest_metrics(now(), &payload).expect("walked");
+    assert!(matches!(
+        rejected_reason(&outcome, 0),
+        RecordRejection::Budget(rejection)
+            if rejection.budget == BudgetName::NumericVectorEntriesPerDataPoint
+                && rejection.limit == 2
+                && rejection.observed == 3
+    ));
+    assert!(drain_queue(&queue).is_empty());
+    assert_eq!(
+        pipeline
+            .ledger()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resident_streams(),
+        0,
+        "a budget refusal precedes interning: the stream stayed free"
+    );
+
+    // The refusal left the identity free: the same stream, in budget,
+    // admits fresh — a stranded intern would have collided here.
+    let in_budget = metrics::metric::Data::Histogram(metrics::Histogram {
+        data_points: vec![metrics::HistogramDataPoint {
+            attributes: Vec::new(),
+            start_time_unix_nano: 2,
+            time_unix_nano: 11,
+            count: 1,
+            sum: Some(1.0),
+            bucket_counts: vec![1],
+            explicit_bounds: vec![1.0],
+            exemplars: Vec::new(),
+            flags: 0,
+            min: Some(1.0),
+            max: Some(1.0),
+        }],
+        aggregation_temporality: metrics::AggregationTemporality::Cumulative as i32,
+    });
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("bucketed", in_budget)],
+        )],
+    )]));
+    let outcome = pipeline.ingest_metrics(now(), &payload).expect("admitted");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "the refused point left no ledger entry: {outcome:?}"
+    );
+    assert_eq!(
+        pipeline
+            .ledger()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resident_streams(),
+        1,
+        "the in-budget re-delivery interned its stream for real residency now"
+    );
+    drain_queue(&queue);
+}
+
+#[test]
+fn a_histogram_at_the_numeric_vector_budget_is_admitted() {
+    // The boundary is "the next vector entry refuses": exactly two entries
+    // (one bucket count, one bound) are admitted, and the point's vectors
+    // are materialized whole.
+    let (queue, pipeline) = pipeline_over(
+        QUEUE_CEILING_BYTES,
+        BudgetLimits {
+            numeric_vector_entries_per_data_point: 2,
+            ..BudgetLimits::default()
+        },
+    );
+    let histogram = metrics::metric::Data::Histogram(metrics::Histogram {
+        data_points: vec![metrics::HistogramDataPoint {
+            attributes: Vec::new(),
+            start_time_unix_nano: 1,
+            time_unix_nano: 10,
+            count: 1,
+            sum: Some(1.0),
+            bucket_counts: vec![1],
+            explicit_bounds: vec![1.0],
+            exemplars: Vec::new(),
+            flags: 0,
+            min: Some(1.0),
+            max: Some(1.0),
+        }],
+        aggregation_temporality: metrics::AggregationTemporality::Cumulative as i32,
+    });
+    let payload = encode(&metrics_request(vec![resource_metrics(
+        Some(resource(Vec::new())),
+        vec![scope_metrics(
+            Some(scope("test")),
+            vec![metric("bucketed", histogram)],
+        )],
+    )]));
+    let outcome = pipeline.ingest_metrics(now(), &payload).expect("admitted");
+    assert!(
+        matches!(&outcome.records[0], RecordOutcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.admitted(), 1);
+    let queued = drain_queue(&queue);
+    let StoredRecord::Point { point, .. } = &queued[0].record else {
+        panic!("expected a queued point");
+    };
+    let MetricPoint::Histogram(histogram) = point.as_ref() else {
+        panic!("expected a histogram point");
+    };
+    assert_eq!(
+        histogram.bucket_counts.len(),
+        1,
+        "the bucket vector materialized"
+    );
+    assert_eq!(
+        histogram.explicit_bounds.len(),
+        1,
+        "the bound vector materialized"
+    );
+}
+
+#[test]
 fn a_summary_sum_keeps_negative_zero_and_reads_positive_zero_as_absent() {
     let harness = Harness::new();
 
