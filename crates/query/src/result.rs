@@ -113,6 +113,15 @@ pub enum PartOutcome {
     Degraded { truncation: Truncation },
     /// The part refused, naming the dimension, limit and observed spend.
     Refused(BudgetRefusal),
+    /// The walk stalled: the driver returned an empty page while
+    /// claiming a successor cursor, for long enough that the engine
+    /// stopped paging rather than spin. What was collected is a true
+    /// subset of the answer set — the walk did not reach the kind's
+    /// end, and no further cursor is minted
+    /// ([`CoverageEntry::DriverStall`] names where it stopped). A
+    /// conforming driver can never produce this outcome: it exists so
+    /// a violated storage contract stalls the page, never the engine.
+    Stalled,
 }
 
 /// What was and was not covered — the entries that make truncation and
@@ -155,6 +164,20 @@ pub enum CoverageEntry {
         after: EntityId,
         /// The dimension whose expiry cut the counting walk.
         dimension: Dimension,
+    },
+    /// The driver stalled: it yielded an empty page while reporting a
+    /// successor cursor, and the engine stopped paging after a bounded
+    /// run of consecutive empty continuations rather than spin
+    /// ([`PartOutcome::Stalled`] carries the outcome). The position
+    /// names where the walk stopped — the last examined record, or the
+    /// driver's own successor-cursor anchor when nothing was examined.
+    /// A conforming storage driver can never produce this entry; it
+    /// exists so a violated storage contract is named in coverage,
+    /// never silently spun on. No further cursor is minted after a
+    /// stall.
+    DriverStall {
+        /// The entity the stalled continuation claimed to continue past.
+        after: EntityId,
     },
 }
 
