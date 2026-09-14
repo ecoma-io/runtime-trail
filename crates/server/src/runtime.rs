@@ -180,6 +180,14 @@ pub struct RuntimeConfig {
     /// body that has not arrived in full within this bound is refused so a
     /// single slow-drip client cannot hold its buffered bytes indefinitely.
     pub body_read_timeout: Duration,
+    /// The maximum number of concurrently accepted connections, enforced at
+    /// the accept seam ([ADR 0010](../docs/decisions/0010-transport-edge-in-flight-body-budget.md)):
+    /// each accepted connection holds an owned semaphore permit for exactly
+    /// as long as its socket lives, and when the cap is exhausted `accept`
+    /// pends so the kernel backlog bounds pending sockets. Default 256 — the
+    /// "Concurrent connections" row of
+    /// `docs/architecture/runtime-constraints.md`.
+    pub max_connections: usize,
     /// Where admission times come from. Production:
     /// [`SystemWallClock`].
     pub clock: Box<dyn WallClock>,
@@ -196,6 +204,7 @@ impl Default for RuntimeConfig {
             queue_ceiling_bytes: QUEUE_CEILING_BYTES,
             inflight_body_ceiling_bytes: QUEUE_CEILING_BYTES,
             body_read_timeout: BODY_READ_TIMEOUT,
+            max_connections: 256,
             clock: Box::new(SystemWallClock),
         }
     }
@@ -404,6 +413,7 @@ pub struct CoreRuntime {
     /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
     transport_guard: Arc<InflightBodyBudget>,
     body_read_timeout: Duration,
+    max_connections: usize,
     workers: Mutex<Option<Workers>>,
 }
 
@@ -459,6 +469,7 @@ impl CoreRuntime {
             grpc_decoding_ceiling_bytes,
             transport_guard: Arc::new(InflightBodyBudget::new(config.inflight_body_ceiling_bytes)),
             body_read_timeout: config.body_read_timeout,
+            max_connections: config.max_connections,
             workers: Mutex::new(None),
         });
         runtime.spawn_workers();
@@ -550,6 +561,13 @@ impl CoreRuntime {
     #[must_use]
     pub(crate) fn body_read_timeout(&self) -> Duration {
         self.body_read_timeout
+    }
+
+    /// The maximum number of concurrently accepted connections, enforced at
+    /// the accept seam ([ADR 0010](../../docs/decisions/0010-transport-edge-in-flight-body-budget.md)).
+    #[must_use]
+    pub(crate) fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     /// The admission clock's next reading: the `admitted_at` every

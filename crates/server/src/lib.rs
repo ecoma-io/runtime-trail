@@ -31,13 +31,16 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::middleware;
 use axum::response::Html;
 use axum::routing::{get, post};
+use axum::serve::Listener;
 use axum::{Json, Router};
 use serde::Serialize;
 use tower_http::services::ServeDir;
 
+use crate::listener::BoundedListener;
 use crate::otlp_grpc::{LOGS_SERVICE_PREFIX, METRICS_SERVICE_PREFIX, TRACE_SERVICE_PREFIX};
 use crate::runtime::{CoreRuntime, RunSummary, RuntimeConfig};
 
+mod listener;
 mod otlp_grpc;
 mod otlp_http;
 pub mod runtime;
@@ -216,7 +219,22 @@ pub async fn serve_with_shutdown(
             "the startup configuration was refused by the ingestion pipeline: {error}"
         ))
     })?;
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    serve_runtime(runtime, config, shutdown).await
+}
+
+/// Runs the core on `config.bind` until `shutdown` resolves, then drains it
+/// and returns its [`RunSummary`]. Also the seam the tests drive directly,
+/// so a test can hand the server a runtime built from a custom
+/// [`RuntimeConfig`] — e.g. a tightened `max_connections`.
+async fn serve_runtime(
+    runtime: Arc<CoreRuntime>,
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<RunSummary> {
+    let listener = BoundedListener::new(
+        tokio::net::TcpListener::bind(config.bind).await?,
+        runtime.max_connections(),
+    );
     let router = build_router(Arc::clone(&runtime), config);
     tracing::info!(bind = %listener.local_addr()?, "runtime-trail core listening");
     let drain_runtime = Arc::clone(&runtime);
@@ -591,6 +609,109 @@ mod tests {
             .expect("the server serves cleanly");
         assert_eq!(summary.kept, 1, "the export reached storage");
         assert_eq!(summary.dropped_on_drain, 0, "nothing was dropped");
+    }
+
+    /// Opens a raw connection to `bind`, retrying until the server accepts.
+    /// Sends no request: the socket is an in-flight connection to the
+    /// server — precisely what the accept cap accounts.
+    async fn open_connection(bind: SocketAddr) -> tokio::net::TcpStream {
+        let mut last_error = None;
+        for _ in 0..100 {
+            match tokio::net::TcpStream::connect(bind).await {
+                Ok(stream) => return stream,
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!("the server never accepted a connection: {last_error:?}");
+    }
+
+    /// Reads from `stream` until the answer contains "200 OK" or EOF.
+    async fn read_until_ok(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut response = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return response,
+                Ok(read) => {
+                    response.extend_from_slice(&buf[..read]);
+                    if String::from_utf8_lossy(&response).contains("200 OK") {
+                        return response;
+                    }
+                }
+                Err(error) => panic!("the read failed: {error}"),
+            }
+        }
+    }
+
+    /// The accept seam admits at most `max_connections` concurrent
+    /// connections (issue #13): with the cap at two, a third connection
+    /// must stay in the kernel backlog — unanswered — until one of the
+    /// two holders ends, and is then admitted and served.
+    #[tokio::test]
+    async fn connection_cap_bounds_concurrent_connections() {
+        use tokio::io::AsyncWriteExt;
+
+        let bind = free_bind();
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            max_connections: 2,
+            ..RuntimeConfig::default()
+        })
+        .expect("the capped configuration builds");
+        let server_task = tokio::spawn(serve_runtime(
+            runtime,
+            ServerConfig {
+                bind,
+                web_dist: None,
+            },
+            async move {
+                let _ = gate.await;
+            },
+        ));
+
+        // Two holders fill the cap; the third connection is backlogged.
+        let holder_a = open_connection(bind).await;
+        let holder_b = open_connection(bind).await;
+        let mut capped = open_connection(bind).await;
+
+        capped
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("the request writes");
+        let not_served =
+            tokio::time::timeout(Duration::from_millis(500), read_until_ok(&mut capped)).await;
+        assert!(
+            not_served.is_err(),
+            "a connection beyond the cap must not be served while the cap is held; it answered: {}",
+            not_served
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        );
+
+        // Free one holder: the backlogged connection is admitted, and its
+        // queued request answered.
+        drop(holder_a);
+        let served = tokio::time::timeout(Duration::from_secs(5), read_until_ok(&mut capped)).await;
+        let served = served.expect("the backlogged connection is admitted once a holder ends");
+        assert!(
+            utf8(&served).contains("200 OK"),
+            "the backlogged connection is served: {}",
+            utf8(&served)
+        );
+        drop(holder_b);
+        drop(capped);
+
+        // Drain and join the server cleanly.
+        trigger.send(()).expect("the server is still running");
+        let summary = server_task
+            .await
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
+        assert_eq!(summary.kept, 0, "no telemetry was exported");
     }
 
     /// The index page is honest about what is and is not served: ingestion

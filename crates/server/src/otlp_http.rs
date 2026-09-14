@@ -975,6 +975,7 @@ mod tests {
             queue_ceiling_bytes: 4096,
             inflight_body_ceiling_bytes: 1024 * 1024,
             body_read_timeout: Duration::from_secs(10),
+            max_connections: 256,
             clock: Box::new(crate::runtime::SystemWallClock),
         }
     }

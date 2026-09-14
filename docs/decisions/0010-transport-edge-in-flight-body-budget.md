@@ -100,6 +100,16 @@ indefinitely.**
    gate before its body is read, so it never enters a body-read timeout.
 5. **The bound holds for every bind address.** The budget is on the runtime
    graph, not the listener; `0.0.0.0` shares the same gate as loopback.
+6. **A connection cap at the accept seam.** `RuntimeConfig::max_connections`
+   (default **256**) bounds concurrently accepted sockets. Each accepted
+   connection holds an owned semaphore permit for exactly as long as its
+   socket lives, and a connection is accepted only once a permit is
+   available — so when the cap is exhausted `accept` pends and further
+   sockets queue in the kernel backlog, unserved, until a slot frees. The
+   cap therefore bounds every connection-shaped resource (file descriptors,
+   per-connection tasks, buffered request heads) no matter how many sockets
+   the OS admits, while the in-flight body budget (item 1) bounds the bytes
+   those sockets can buffer.
 
 ### Mechanism (per transport)
 
@@ -140,5 +150,10 @@ indefinitely.**
   one queue ceiling (64 MiB) and `body_read_timeout` to 10 s, both
   startup-configurable and both rows in
   [runtime-constraints.md](../architecture/runtime-constraints.md).
+- **The connection cap is an orthogonal sixth bound:** in-flight body bytes
+  are capped by charge (item 1); concurrently served sockets are capped by
+  `max_connections` — a scale the admission gates never saw. The default 256
+  keeps existing behavior for realistic SDK fan-out, and the kernel backlog
+  absorbs overflow without dropping the sockets.
 - The budget is shared between HTTP and gRPC — one aggregate for the whole
   transport edge, not two independently unbounded pools.
