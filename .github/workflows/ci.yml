@@ -49,7 +49,7 @@ jobs:
   # The whole local gate, exactly the checks `pnpm verify` runs — with the one
   # conditional flipped: locally the desktop checks skip when the webview
   # libraries are missing, here they are installed and always run. There is no
-  # "affected" selection anywhere: the workspace is twelve projects and the
+  # "affected" selection anywhere: the workspace is thirteen projects and the
   # honest gate is the whole tree.
   checks:
     runs-on: ubuntu-latest
