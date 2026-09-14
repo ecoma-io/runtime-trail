@@ -810,7 +810,9 @@ mod tests {
         LogFilters, MetricFilters, ScopeFilter, ServiceFilter, SeverityFilter, SpanFilters,
         TimeRangeFilter,
     };
-    use crate::result::{CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation};
+    use crate::result::{
+        CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation, TruncationPoint,
+    };
 
     /// A nanosecond admission reading.
     const fn at(nano: u64) -> AdmissionTime {
@@ -3528,5 +3530,116 @@ mod tests {
         );
         assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
         assert!(page.next_cursor.is_none());
+    }
+
+    /// Per-page budget re-admission: a continuation page is a NEW
+    /// execution with the caller-set budget — page 2 does not inherit
+    /// page 1's remaining allowance. Page 1 saturates its `max_results`
+    /// of two and mints a cursor; page 2 continues that same
+    /// fingerprint-valid cursor under its own budget, enforces its own
+    /// `max_results` of one, and carries its own page-2 facts: a fresh
+    /// `max_results` degradation and the snapshot boundary the
+    /// continuation names.
+    ///
+    /// Kills the no-op where a continuation inherits the first page's
+    /// remaining allowance instead of re-admitting the caller's budget
+    /// (a second page then over-returns, or under-enforces its own
+    /// limits).
+    #[test]
+    fn a_continuation_page_readmits_the_callers_budget() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        assert_eq!(
+            first.items.len(),
+            2,
+            "page 1 saturates its own max_results of two"
+        );
+        let [PartOutcome::Degraded { truncation }] = &first.execution.parts[..] else {
+            panic!("page 1 degrades under its own max_results");
+        };
+        assert_eq!(truncation.dimension, Dimension::Results);
+        let cursor = first.next_cursor.expect("a saturated page continues");
+
+        let second = records(&store, &query, budget_with(1, 1 << 40, 10_000), Some(&cursor))
+            .expect("the fingerprint-valid cursor continues");
+        assert_eq!(
+            second.items.len(),
+            1,
+            "page 2 re-admits the caller's budget: its own max_results \
+             of one bounds the page, not page 1's remaining allowance"
+        );
+        let [PartOutcome::Degraded { truncation }] = &second.execution.parts[..] else {
+            panic!("page 2 degrades under its own max_results");
+        };
+        assert_eq!(truncation.dimension, Dimension::Results);
+        assert_eq!(
+            truncation.omitted, 0,
+            "a results cut leaves nothing uncounted"
+        );
+        assert!(
+            matches!(truncation.position, TruncationPoint::Cursor(_)),
+            "page 2's truncation names its own continuation cursor"
+        );
+        assert!(
+            second.next_cursor.is_some(),
+            "page 2 continues under its own budget"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+            "page 2's coverage is its own page-2 fact: the boundary the \
+             first page minted, named again by the continuation"
+        );
+
+        // The full walk under per-page budgets: every page bounds itself
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|view| span_entity_of(view).expect("a span page"))
+                .collect::<Vec<_>>(),
+            vec![span_entity(3, 3)],
+            "page 2 returns its one entity under its own max_results"
+        );
+        // The full walk under per-page budgets: every page bounds itself
+        // and the chain stays lossless — five records, none repeated.
+        let mut entities = vec![
+            span_entity(1, 1),
+            span_entity(2, 2),
+            span_entity(3, 3),
+        ];
+        let mut cursor = second.next_cursor;
+        while let Some(next) = cursor {
+            let page = records(
+                &store,
+                &query,
+                budget_with(1, 1 << 40, 10_000),
+                Some(&next),
+            )
+            .expect("the query answers");
+            entities.extend(
+                page.items
+                    .iter()
+                    .map(|view| span_entity_of(view).expect("a span page")),
+            );
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            entities,
+            vec![
+                span_entity(1, 1),
+                span_entity(2, 2),
+                span_entity(3, 3),
+                span_entity(4, 4),
+                span_entity(5, 5),
+            ],
+            "per-page budgets page the same set to exhaustion without \
+             repeat or loss"
+        );
     }
 }
