@@ -4,9 +4,10 @@
 #
 #   - Every executable file under cases/ is a registered case and is run.
 #   - With ZERO registered cases this exits non-zero, loudly: an empty
-#     harness must not read as a passing one. (The foundation ships with
-#     zero cases on purpose — cases are registered by the phase that ships
-#     the capability they measure.)
+#     harness must not read as a passing one. (Phase 1 registered the
+#     memory-path cases — idle-rss, ingest-overload, retention-bound — per
+#     docs/benchmarks/README.md; a case is still only ever added by the
+#     phase that ships the capability it measures.)
 #   - Each case's output is captured verbatim under results/raw/<epoch>/
 #     beside a record naming the commit it measured and the machine that
 #     measured it. Raw runs are local artefacts (git-ignored); nothing here
@@ -38,9 +39,9 @@ done
 
 if [ "${#cases[@]}" -eq 0 ]; then
   echo "✗ no benchmark cases are registered under $cases_dir/." >&2
-  echo "  This is the foundation's intended state (docs/benchmarks/README.md:" >&2
-  echo "  cases are added by the phase that ships the capability they" >&2
-  echo "  measure) — but an empty harness must not read as a passing one," >&2
+  echo "  This harness must not pass vacuously (docs/benchmarks/README.md:" >&2
+  echo "  a case is added by the phase that ships the capability it" >&2
+  echo "  measures) — an empty harness must not read as a passing one," >&2
   echo "  so this run FAILS rather than pretending to have measured nothing." >&2
   echo "  Register a case, or accept that there is nothing to measure yet." >&2
   exit 1
