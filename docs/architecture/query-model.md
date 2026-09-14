@@ -34,13 +34,13 @@ continues only under the filters that minted it.
 Every query admits with a budget. A query without a budget is invalid — not
 "unbudgeted", invalid. The budget has five dimensions:
 
-| Dimension                | Meaning                                                                                   | On expiry (by the shape of the work in flight)                                                    |
-| ------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | traversal degrades truthfully; aggregation refuses                                                |
-| `max_results`            | Cap on entities returned                                                                  | degrade with a cursor for the rest                                                                |
-| `max_bytes`              | Cap on the canonical encoding of the answer's evidence (below)                            | degrade with a cursor for the rest; the omission is named by count and position, never enumerated |
-| `max_scan`               | Cap on scan work (below)                                                                  | traversal degrades with coverage (cursor where a total order exists); aggregation refuses         |
-| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | refuse                                                                                            |
+| Dimension                | Meaning                                                                                   | On expiry (by the shape of the work in flight)                                                                                                                                                                           |
+| ------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | traversal degrades truthfully; aggregation refuses                                                                                                                                                                       |
+| `max_results`            | Cap on entities returned                                                                  | degrade with a cursor for the rest                                                                                                                                                                                       |
+| `max_bytes`              | Cap on the canonical encoding of the answer's evidence (below)                            | degrade with a cursor where the page has a continuation to offer; a first page that included nothing names the last-examined entity instead (invariant 4); the omission is named by count and position, never enumerated |
+| `max_scan`               | Cap on scan work (below)                                                                  | traversal degrades with coverage (cursor where a total order exists); aggregation refuses                                                                                                                                |
+| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | refuse                                                                                                                                                                                                                   |
 
 **Every expiry follows the shape of the work in flight when the dimension
 expired** — traversal-shaped work degrades truthfully, aggregation-shaped
@@ -59,6 +59,13 @@ by choosing an encoding). The envelope's execution, coverage and limits
 parts are the answer's truth-telling and sit **outside** `max_bytes`; they
 are themselves bounded by a small fixed allowance, so honesty never crowds
 out data and data never crowds out honesty.
+
+A budget belongs to **one query execution**, and a continuation page is a
+new execution: the caller presents a fresh budget for the page, the engine
+binds no budget to a chain, and a page never inherits an earlier page's
+ceilings. Paging flows therefore pay per page and own their chain-level
+limits themselves — summing a paging flow's per-page budgets is the
+caller's arithmetic, never the engine's.
 
 ## Scan work is driver-symmetric
 
