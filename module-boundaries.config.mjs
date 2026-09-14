@@ -42,8 +42,6 @@
  *                                                       measure — the real pipeline, the real driver,
  *                                                       the real contract — and nothing else; they are
  *                                                       a measurement harness, never a product surface
- *   layer-app             →  api/driver/ingest/app  ✅  the composition roots wire everything; app may
- *                                                       compose app (desktop shells server's contract, not
  *   layer-app             →  api/storage/driver/ingest/model/app ✅ the composition roots wire
  *                                                       everything — naming a driver means speaking
  *                                                       the abstraction it implements and the model
