@@ -428,6 +428,71 @@ fn a_duplicate_keep_leaves_the_resident_record_standing() {
     assert_eq!(page.items.len(), 1);
 }
 
+///
+/// A keep that is both a duplicate AND oversized is a Duplicate first: the
+/// record it names is resident, so it reports nothing to the hook. (The
+/// regression: `refuse_early` answered Oversized before checking `contains`,
+/// and the kept-failed path then delivered `keep_refused` for it — a
+/// refusal that ends a STILL-RESIDENT identity.) An oversized AND-new keep
+/// keeps its existing behavior: Oversized, with the one hook delivery that
+/// ends its own identity.
+#[test]
+fn an_oversized_duplicate_reports_nothing_the_record_it_names_is_resident() {
+    let recorded = SharedRecordingHook::default();
+    let big = span([6; 16], [7; 8], &"x".repeat(2_000));
+    let ceiling = u64::try_from(big.accounted_size()).expect("fits") - 1;
+    let mut store = boxed(
+        MemoryConfig {
+            max_accounted_bytes: ceiling,
+            ..MemoryConfig::default()
+        },
+        Some(Box::new(recorded.clone())),
+    );
+
+    // Keep R: the small resident record that names the entity id.
+    let entity = big
+        .natural_identity()
+        .map(|(trace_id, span_id)| EntityId::Span { trace_id, span_id })
+        .expect("fixture ids are valid");
+    let _ = store.keep_span(admitted(entity, 100, span([6; 16], [7; 8], "original")));
+    let before = store.stats();
+
+    // The same entity id, mutated past the ceiling: Duplicate, no hook
+    // delivery, nothing rewritten — the resident record stands.
+    let outcome = store.keep_span(admitted(entity, 400, big));
+    assert_eq!(outcome, KeepOutcome::Duplicate);
+    let after = store.stats();
+    assert_eq!(after.resident_records, before.resident_records);
+    assert_eq!(after.accounted_bytes, before.accounted_bytes);
+    assert_eq!(after.duplicate_keeps, before.duplicate_keeps + 1);
+    assert_eq!(after.oversized_refusals, 0);
+    assert_eq!(after.refused_hook_deliveries, 0);
+    {
+        let hook = recorded.0.lock().expect("hook lock poisoned");
+        assert!(
+            hook.refused.is_empty() && hook.evicted.is_empty() && hook.streams_released.is_empty(),
+            "an oversized duplicate delivers nothing to the hook"
+        );
+    }
+
+    // The resident record is still the first one.
+    let page = store.scan_spans(None, 10);
+    assert_eq!(page.items.len(), 1);
+
+    // A genuinely oversized AND-new keep keeps its existing behavior:
+    // Oversized, with the one hook delivery that ends its own identity.
+    let stranger = span([8; 16], [9; 8], &"x".repeat(2_000));
+    let stranger_entity = stranger
+        .natural_identity()
+        .map(|(trace_id, span_id)| EntityId::Span { trace_id, span_id })
+        .expect("fixture ids are valid");
+    let outcome = store.keep_span(admitted(stranger_entity, 500, stranger));
+    assert_eq!(outcome, KeepOutcome::Oversized);
+    let after = store.stats();
+    assert_eq!(after.oversized_refusals, 1);
+    assert_eq!(after.refused_hook_deliveries, 1);
+}
+
 /// The anomaly pass-through: the composition root pushes the ledger's
 /// recorded conflicts through, and stats report the latest total — without
 /// the store ever naming the ledger.
