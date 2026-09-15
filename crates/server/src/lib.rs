@@ -45,6 +45,8 @@ use crate::runtime::{CoreRuntime, RunSummary, RuntimeConfig};
 
 mod investigation_http;
 mod listener;
+#[cfg(test)]
+mod otlp_e2e;
 mod otlp_grpc;
 mod otlp_http;
 pub mod runtime;

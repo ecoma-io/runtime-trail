@@ -49,6 +49,9 @@ tower = { version = "0.5", features = ["util"] }
 # exercise the exact OTLP shapes the ingestion crate means, not mirrored
 # structs. Dev-only: the served crate itself never builds fixtures.
 runtime-trail-telemetry-ingestion = { workspace = true, features = ["fixtures"] }
+opentelemetry = "0.32.0"
+opentelemetry_sdk = "0.32.1"
+opentelemetry-otlp = { version = "0.32.0", features = ["http-proto", "trace", "logs", "metrics"] }
 
 [lints]
 workspace = true
