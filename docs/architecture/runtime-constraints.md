@@ -159,6 +159,16 @@ the budget happens to be. Both transport edges and the queue share the
 retryable-transient 429 family; the wire shapes stay the contracted ones
 below.
 
+The gRPC reader bounds one frame to `payload_ceiling +
+GRPC_DECODING_SLACK_BYTES` — 8 KiB of deliberate codec slack above the
+nominal ceiling — so a payload past the ceiling is refused at the reader
+with the over-ceiling gRPC mapping (`INVALID_ARGUMENT`, naming the
+ceiling), never HTTP 413, which stays the HTTP transport's
+declared-length refusal. The slack means a byte-exact ceiling payload is
+never refused by reader leniency; the over-ceiling tests
+(`over_ceiling_payload…`, `a_frame_beyond_the_read_deadline…`) pin the
+honesty of that boundary.
+
 ### Ownership law
 
 Resource numbers live in the table above — one home, no scattered

@@ -61,7 +61,8 @@ indefinitely.**
 1. **An aggregate in-flight body budget**, shared by both transports, that
    counts request bodies being buffered at the transport edge (before
    admission) and refuses new buffering once the aggregate exceeds a named,
-   startup-configurable bound. The default is derived from the queue ceiling:
+   RuntimeConfig-configurable bound — the operator CLI surface for it is
+   deferred to Phase 5. The default is derived from the queue ceiling:
    **64 MiB aggregate in-flight body bytes** — one queue ceiling's worth, the
    same order as the "In-flight per queue" row in
    [runtime-constraints.md](../architecture/runtime-constraints.md). Naming it
@@ -132,10 +133,11 @@ indefinitely.**
 
 ## Consequences
 
-- **Bounded transport-edge memory by construction:** at most 64 MiB of request
-  bodies buffering at once (the named, startup-configurable budget), and each
-  body held for at most 10 s. Combined with the queue ceiling and retention
-  ceilings, every memory domain of an overloaded session is bounded.
+- **Bounded transport-edge memory by construction:** at most 64 MiB of
+  request bodies buffering at once (the named, RuntimeConfig-configurable
+  budget), and each body held for at most 10 s. Combined with the queue
+  ceiling and retention ceilings, every memory domain of an overloaded
+  session is bounded.
 - **Honest refusal ordering preserved:** the existing gates (draining 503 →
   content-type 415 → declared-over-ceiling 413 → bounded read) keep their
   precedence; the aggregate answers only where no earlier gate owns the
@@ -147,8 +149,7 @@ indefinitely.**
   sees no change; the 429/`RESOURCE_EXHAUSTED` and 408/`DEADLINE_EXCEEDED`
   answers are new refuse-shapes for the misbehaving cases the finding names.
 - **Numbers are named, not magic:** `inflight_body_ceiling_bytes` defaults to
-  one queue ceiling (64 MiB) and `body_read_timeout` to 10 s, both
-  startup-configurable and both rows in
+  RuntimeConfig-configurable and both rows in
   [runtime-constraints.md](../architecture/runtime-constraints.md).
 - **The connection cap is an orthogonal sixth bound:** in-flight body bytes
   are capped by charge (item 1); concurrently served sockets are capped by
