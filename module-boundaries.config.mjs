@@ -37,13 +37,11 @@
  *   layer-model           →  layer-model only       ❌  the telemetry model depends on nothing internal
  *   layer-storage         →  layer-model            ✅  the storage abstraction knows the model, no driver
  *   layer-storage-driver  →  storage, model         ✅  a driver implements the abstraction it belongs under
- *   layer-ingest          →  model, storage         ✅  ingestion writes through the abstraction
+ *   layer-ingest          →  model, storage         ✅  queue pumped into the store by layer-app (ADR 0003)
  *   layer-bench           →  model/storage/driver/ingest ✅ the benchmark probes compose exactly what they
  *                                                       measure — the real pipeline, the real driver,
  *                                                       the real contract — and nothing else; they are
  *                                                       a measurement harness, never a product surface
- *   layer-app             →  api/driver/ingest/app  ✅  the composition roots wire everything; app may
- *                                                       compose app (desktop shells server's contract, not
  *   layer-app             →  api/storage/driver/ingest/model/app ✅ the composition roots wire
  *                                                       everything — naming a driver means speaking
  *                                                       the abstraction it implements and the model
@@ -124,8 +122,10 @@ export const depConstraints = [
     onlyDependOnLibsWithTags: ["layer-storage", "layer-model"],
   },
 
-  // Ingestion parses spans/logs/metrics off the wire and writes them through
-  // the storage abstraction. It may not read: querying is not its job.
+  // Ingestion parses spans/logs/metrics off the wire and admits them to the
+  // queue; the admission queue is pumped into the store by layer-app's
+  // composition root (ADR 0003) — this layer never names a driver itself.
+  // It may not read: querying is not its job.
   {
     sourceTag: "layer-ingest",
     onlyDependOnLibsWithTags: ["layer-model", "layer-storage"],

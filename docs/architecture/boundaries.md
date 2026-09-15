@@ -7,8 +7,9 @@
 ## The one rule
 
 Everything a user or agent can reach — the Loom UI, the MCP server — talks to
-the **Investigation API** and to nothing else below it. Ingestion writes down;
-surfaces read through investigation; nothing reads sideways past a layer.
+the **Investigation API** and to nothing else below it. Admitted telemetry
+moves down into the store through the composition root's pump; surfaces read
+through investigation; nothing reads sideways past a layer.
 
 ## Projects and tags
 

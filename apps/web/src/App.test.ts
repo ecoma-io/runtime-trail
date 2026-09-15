@@ -8,6 +8,7 @@ describe("App", () => {
     const wrapper = mount(App);
 
     expect(wrapper.text()).toContain("Runtime Trail");
-    expect(wrapper.text()).toContain("no telemetry is ingested");
+    expect(wrapper.text()).toContain("telemetry ingestion is live");
+    expect(wrapper.text()).toContain("under construction");
   });
 });

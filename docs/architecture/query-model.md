@@ -34,13 +34,13 @@ continues only under the filters that minted it.
 Every query admits with a budget. A query without a budget is invalid — not
 "unbudgeted", invalid. The budget has five dimensions:
 
-| Dimension                | Meaning                                                                                   | On expiry (by the shape of the work in flight)                                                    |
-| ------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | traversal degrades truthfully; aggregation refuses                                                |
-| `max_results`            | Cap on entities returned                                                                  | degrade with a cursor for the rest                                                                |
-| `max_bytes`              | Cap on the canonical encoding of the answer's evidence (below)                            | degrade with a cursor for the rest; the omission is named by count and position, never enumerated |
-| `max_scan`               | Cap on scan work (below)                                                                  | traversal degrades with coverage (cursor where a total order exists); aggregation refuses         |
-| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | refuse                                                                                            |
+| Dimension                | Meaning                                                                                   | On expiry (by the shape of the work in flight)                                                                                                                                                                           |
+| ------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `deadline`               | Monotonic duration captured **at admission**; the engine works against the remaining time | traversal degrades truthfully; aggregation refuses                                                                                                                                                                       |
+| `max_results`            | Cap on entities returned                                                                  | degrade with a cursor for the rest                                                                                                                                                                                       |
+| `max_bytes`              | Cap on the canonical encoding of the answer's evidence (below)                            | degrade with a cursor where the page has a continuation to offer; a first page that included nothing names the last-examined entity instead (invariant 4); the omission is named by count and position, never enumerated |
+| `max_scan`               | Cap on scan work (below)                                                                  | traversal degrades with coverage (cursor where a total order exists); aggregation refuses                                                                                                                                |
+| `max_aggregation_memory` | Cap on memory an aggregation may hold                                                     | refuse                                                                                                                                                                                                                   |
 
 **Every expiry follows the shape of the work in flight when the dimension
 expired** — traversal-shaped work degrades truthfully, aggregation-shaped
@@ -59,6 +59,13 @@ by choosing an encoding). The envelope's execution, coverage and limits
 parts are the answer's truth-telling and sit **outside** `max_bytes`; they
 are themselves bounded by a small fixed allowance, so honesty never crowds
 out data and data never crowds out honesty.
+
+A budget belongs to **one query execution**, and a continuation page is a
+new execution: the caller presents a fresh budget for the page, the engine
+binds no budget to a chain, and a page never inherits an earlier page's
+ceilings. Paging flows therefore pay per page and own their chain-level
+limits themselves — summing a paging flow's per-page budgets is the
+caller's arithmetic, never the engine's.
 
 ## Scan work is driver-symmetric
 
@@ -81,9 +88,11 @@ batched walk may pull up to a bounded batch ahead of examination; records
 pulled but not examined at a stop consume scan allowance up to the
 remaining ceiling at the moment of the stop; the engine never charges
 fabricated units and never exceeds the ceiling. There is no driver-reported
-count and no coverage entry for driver in-exactness in the implemented
-records flow — coverage names the answer's own gaps and boundaries, not a
-driver's internal accounting.
+count — the engine charges what it walks, and coverage names the answer's
+own gaps and boundaries, not a driver's internal accounting. The one
+driver-exactness fact coverage carries is the stall guard: a driver that
+yields an empty page while claiming a successor cursor stops the walk, and
+the stop is named, never spun on (below).
 
 ## Deadlines
 
@@ -133,6 +142,15 @@ result set is fixed at that page's admission, and records admitted after it
 are outside every later page of the same continuation — a declared boundary
 (the snapshot point is part of coverage), not a silent skip. A caller
 wanting newer data issues a new query.
+
+A driver that yields an empty page while claiming a successor cursor is a
+stall, not progress: after three consecutive empty continuations the engine
+stops the walk, keeps the coverage it already presented, mints no further
+cursor, and names where it stopped — `PartOutcome::Stalled` as the part
+outcome and `CoverageEntry::DriverStall { after }` in coverage, naming the
+last examined record, or the driver's own successor-cursor anchor when
+nothing was examined. A conforming driver never produces a stall; the entry
+exists so a violated storage contract is named, never silently spun on.
 
 Pagination never discards the order for speed; there is no
 "fast approximate page N".

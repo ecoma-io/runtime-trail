@@ -28,11 +28,14 @@ const { resolvedTheme, toggleTheme } = useTheme();
       <Stack gap="lg" class="max-w-2xl">
         <Card title="Runtime Trail">
           <p class="text-sm leading-relaxed">
-            A local developer observability and investigation runtime. This is
-            the engineering foundation: the workspace, toolchain, architecture
-            boundaries and gates are in place —
-            <strong>no telemetry is ingested, queried, or rendered yet</strong>.
-            The roadmap starts at OpenTelemetry ingestion.
+            A local developer observability and investigation runtime. The
+            engineering foundation — workspace, toolchain, architecture
+            boundaries and gates — is in place, and
+            <strong>telemetry ingestion is live</strong>: the core admits
+            OTLP/HTTP and OTLP/gRPC exports into a bounded in-memory store under
+            backpressure. The investigation surfaces — query, correlation,
+            traces, logs and metrics — are <strong>under construction</strong>:
+            nothing is queried or rendered yet.
           </p>
         </Card>
 

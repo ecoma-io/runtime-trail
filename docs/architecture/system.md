@@ -21,15 +21,16 @@
  Telemetry Model (layer-model)           → nothing internal (leaf)
  Storage Abstraction (layer-storage)     → model
  Memory / SQLite (layer-storage-driver)  → storage, model   named only by layer-app
- OTLP Ingestion (layer-ingest)           → model, storage   writes through the abstraction
+ OTLP Ingestion (layer-ingest)           → model, storage   queue pumped into the store by layer-app (ADR 0003)
  Server / Desktop (layer-app)            → api, storage-driver, ingest, app
 ```
 
 The map above states the dependency directions; the law they obey is
 [boundaries.md](boundaries.md) (and its executable form,
 `module-boundaries.config.mjs`) — when this map and that law disagree, the
-law wins and this map is wrong. Reading direction is deliberate: ingestion
-writes _down_ through the abstraction; surfaces read _through_
+law wins and this map is wrong. Reading direction is deliberate: admitted
+records move _down_ into the store through the composition root's pump —
+only layer-app names the driver (ADR 0003); surfaces read _through_
 investigation; nothing reads sideways past a layer.
 
 Components, top to bottom:
@@ -90,8 +91,8 @@ grow along boundaries documented here — not by accretion.
 
 ### Lifecycle
 
-**Target state.** The smoke core's shutdown is a plain graceful exit; the
-drain semantics below land with the runtime that admits telemetry
+**Implemented.** The runtime that admits telemetry owns its shutdown: the
+drain semantics below are live in the server
 ([roadmap](../roadmap/phases.md)). The contract:
 
 The process shuts down honestly:
@@ -103,10 +104,13 @@ The process shuts down honestly:
   [drain deadline](runtime-constraints.md); past the deadline, remaining
   in-flight work is dropped **observably** (surfaced, not silent).
 - **Memory mode** loses undrained signals by mode contract — that is what
-  ephemeral means, and the UI says so honestly; **file-backed mode** persists
-  best-effort within the deadline.
-- Surfaces see a `draining` state for the duration; no new investigation
-  admits after drain completes.
+  ephemeral means, and the UI says so honestly. **File-backed mode**
+  persisting best-effort within the deadline is target state: it lands with
+  the file-backed store ([phases.md](../roadmap/phases.md)).
+- Telemetry emitters see the draining wire signal for the duration; no new
+  investigation admits after drain completes — the investigation admission
+  rule lands with the Investigation runtime
+  ([phases.md](../roadmap/phases.md)).
 
 ## Status
 
