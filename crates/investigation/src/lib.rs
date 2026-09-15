@@ -2,7 +2,7 @@
 //!
 //! The Loom UI (over HTTP, via the server) and the MCP server (in-process)
 //! are two equal clients of this crate and of nothing else in the core —
-//! [`layer-api`] depends on the query and correlation engines and the
+//! `layer-api` depends on the query and correlation engines and the
 //! telemetry model, and never on storage drivers, ingestion, or any
 //! presentation or distribution surface. The contract is
 //! `docs/architecture/investigation-model.md`; the dependency law is
@@ -11,13 +11,34 @@
 //!
 //! [`layer-api`]: ../../docs/architecture/boundaries.md
 //!
-//! # Bootstrap status
+//! # Status
 //!
-//! Scaffolding only; the API surface lands with Phase 2 —
-//! `docs/roadmap/phases.md`.
+//! The envelope is implemented (Phase 2, M3 — issue #12): every answer is
+//! one [`Investigation`] envelope with five parts — subject, execution,
+//! correlated, evidence, limits — and the seven invariants of
+//! `docs/architecture/investigation-model.md` are mechanically checkable
+//! through [`envelope::invariants`]. The committed flow — the trace
+//! investigation composing the query engine — is the [`flow`] module's
+//! deliverable; the correlation engine is scaffolding only, so no strategy
+//! is implemented and the envelope's `correlated` part is a typed-but-empty
+//! list, reported honestly, never fabricated.
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod correlated;
+pub mod envelope;
+pub mod evidence;
+pub mod execution;
+pub mod limits;
+pub mod subject;
+
+pub use correlated::Correlated;
+pub use envelope::{FIELD_PATHS, Investigation};
+pub use evidence::Evidence;
+pub use execution::Execution;
+pub use limits::Limits;
+pub use subject::Subject;
 
 #[cfg(test)]
 mod tests {
