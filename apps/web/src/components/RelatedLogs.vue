@@ -12,10 +12,15 @@ const emit = defineEmits<{
   "select-log": [spanId: string | null];
 }>();
 
+function toNano(val: string | number | bigint | null | undefined): bigint {
+  if (val == null) return -1n; // nulls sort first
+  return BigInt(val);
+}
+
 const sortedLogs = computed(() =>
   [...props.logs].sort((a, b) =>
     Number(
-      BigInt(a.log.timestamp_unix_nano) - BigInt(b.log.timestamp_unix_nano),
+      toNano(a.log.timestamp_unix_nano) - toNano(b.log.timestamp_unix_nano),
     ),
   ),
 );

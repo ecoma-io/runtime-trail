@@ -78,7 +78,7 @@ const hasSomeOutput = computed(
             <input
               id="trace-id"
               v-model="traceId"
-              class="rounded border bg-background px-2 py-1 font-mono text-sm"
+              class="w-[36ch] rounded border bg-background px-2 py-1 font-mono text-sm"
               placeholder="0000…0000 (32 hex)"
               maxlength="32"
               spellcheck="false"
@@ -91,7 +91,7 @@ const hasSomeOutput = computed(
             <input
               id="span-id"
               v-model="spanId"
-              class="rounded border bg-background px-2 py-1 font-mono text-sm"
+              class="w-[20ch] rounded border bg-background px-2 py-1 font-mono text-sm"
               placeholder="0000…0000 (16 hex)"
               maxlength="16"
               spellcheck="false"
