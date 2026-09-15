@@ -180,14 +180,18 @@ The name is the product's own word for "an answer with its honesty attached"
 
 ## Status
 
-**Contracts pinned (M0); the Query Engine's records flow implemented
-(Phase 2, in progress).** The envelope, the three-engine composition and
-the committed capabilities are the contract Phase 1–2 implement. Of the
-three crates, `query` is implemented: the budgeted records flow — ordered,
-snapshot-bounded, cursor-chained pages under the five-dimension budget —
-exists and runs in the Query Engine crate (its contract and status are
-[query-model.md](query-model.md)'s to own). `investigation` and
-`correlation` exist as declared boundaries with scaffolding only; the
-crates' structure and dependency directions are real and enforced from this
-commit on, and [boundaries.md](boundaries.md) is the mechanical form of
-that law.
+**Envelope shipped (M3, issue #12).** The `Investigation` envelope lives in
+`crates/investigation` (`layer-api`): the five parts — subject,
+execution, correlated, evidence, limits — with the invariants this
+document pins as mechanical, pure-function checks in that crate, tested
+there. One flow is implemented end to end: `investigate_trace` composes
+the Query Engine's budgeted `records` flow (through the storage contract
+the query crate re-exports as the facade `runtime_trail_query::
+TelemetryStore`) into the trace waterfall, related logs and surrounding
+metrics as named envelope parts, slicing the caller's budget per page and
+reporting every engine refusal, degradation and stall it meets. The
+correlation crate exists as a declared boundary with typed-but-empty
+state; correlation results surface when its engines land. Wire shapes of
+the unstarted surfaces (developer UI over HTTP, MCP) belong to their
+phases in [../roadmap/phases.md](../roadmap/phases.md), and this document
+owns none of them yet.
