@@ -345,12 +345,14 @@ fn accounted_u64(record: &(impl Accounted + ?Sized)) -> u64 {
     u64::try_from(record.accounted_size()).unwrap_or(u64::MAX)
 }
 
-/// The refusals every keep runs before anything is inserted: the record's
-/// own accounted size against the byte ceiling (no amount of eviction
-/// could keep it), then the duplicate check (the resident record stands).
-/// The identity-over-ceiling refusal and the series-cap refusal are the
-/// metric-point keep's alone; they run after these, also before any
-/// insert.
+/// The refusals every keep runs before anything is inserted: the duplicate
+/// check first — the record a duplicate names is resident, so the resident
+/// record stands and the keep reports nothing (a refusal that inserted
+/// nothing would report through the hook and end a still-resident
+/// identity) — then the record's own accounted size against the byte
+/// ceiling (no amount of eviction could keep it). The identity-over-ceiling
+/// refusal and the series-cap refusal are the metric-point keep's alone;
+/// they run after these, also before any insert.
 fn refuse_early<R: Accounted>(
     shelf: &Shelf<R>,
     entity: EntityId,
@@ -358,13 +360,13 @@ fn refuse_early<R: Accounted>(
     max_accounted_bytes: u64,
     counters: &mut Counters,
 ) -> Result<(), KeepOutcome> {
-    if size > max_accounted_bytes {
-        counters.oversized_refusals += 1;
-        return Err(KeepOutcome::Oversized);
-    }
     if shelf.contains(entity) {
         counters.duplicate_keeps += 1;
         return Err(KeepOutcome::Duplicate);
+    }
+    if size > max_accounted_bytes {
+        counters.oversized_refusals += 1;
+        return Err(KeepOutcome::Oversized);
     }
     Ok(())
 }

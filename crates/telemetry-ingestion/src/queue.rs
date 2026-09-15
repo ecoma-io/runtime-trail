@@ -116,13 +116,16 @@ impl Accounted for StoredRecord {
 /// The output port of admission: where admitted records are handed off.
 ///
 /// The only implementation today is [`BoundedQueue`] — the accounted-byte
-/// bounded hand-off the backpressure architecture requires. Wave 3 wires
-/// storage behind the *consumer* side of that queue (a bounded pump under
-/// the drain deadline, in `crates/server`); `crates/storage`'s real ingest
-/// trait had not landed when this crate did, so admission depends on this
-/// port instead of on any storage shape — the dependency law
-/// (`layer-ingest → model, storage`) is honoured by construction, and the
-/// port stays unchanged when storage arrives.
+/// bounded hand-off the backpressure architecture requires. The consumer
+/// side of that queue is the composition root's pump (layer-app, i.e. the
+/// server runtime): it writes what admission queued through into the
+/// store under the drain deadline, and only the composition root names a
+/// driver at all (ADR 0003). This crate's role stops at the bounded
+/// admission queue and the shared admission ledger it hands the
+/// composition root through [`LedgerReleaser`](crate::LedgerReleaser)
+/// (ADR 0008): admission depends on this port, no storage shape enters
+/// this crate, and the dependency law (`layer-ingest → model, storage`)
+/// is honoured by construction.
 pub trait RecordSink: Send + Sync + 'static {
     /// The accounted-byte ceiling this sink enforces on what it holds.
     ///
