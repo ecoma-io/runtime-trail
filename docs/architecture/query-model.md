@@ -88,9 +88,11 @@ batched walk may pull up to a bounded batch ahead of examination; records
 pulled but not examined at a stop consume scan allowance up to the
 remaining ceiling at the moment of the stop; the engine never charges
 fabricated units and never exceeds the ceiling. There is no driver-reported
-count and no coverage entry for driver in-exactness in the implemented
-records flow — coverage names the answer's own gaps and boundaries, not a
-driver's internal accounting.
+count — the engine charges what it walks, and coverage names the answer's
+own gaps and boundaries, not a driver's internal accounting. The one
+driver-exactness fact coverage carries is the stall guard: a driver that
+yields an empty page while claiming a successor cursor stops the walk, and
+the stop is named, never spun on (below).
 
 ## Deadlines
 
@@ -140,6 +142,15 @@ result set is fixed at that page's admission, and records admitted after it
 are outside every later page of the same continuation — a declared boundary
 (the snapshot point is part of coverage), not a silent skip. A caller
 wanting newer data issues a new query.
+
+A driver that yields an empty page while claiming a successor cursor is a
+stall, not progress: after three consecutive empty continuations the engine
+stops the walk, keeps the coverage it already presented, mints no further
+cursor, and names where it stopped — `PartOutcome::Stalled` as the part
+outcome and `CoverageEntry::DriverStall { after }` in coverage, naming the
+last examined record, or the driver's own successor-cursor anchor when
+nothing was examined. A conforming driver never produces a stall; the entry
+exists so a violated storage contract is named, never silently spun on.
 
 Pagination never discards the order for speed; there is no
 "fast approximate page N".
