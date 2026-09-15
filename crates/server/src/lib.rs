@@ -12,14 +12,16 @@
 //!
 //! # Bootstrap status
 //!
-//! The core now *serves telemetry*: OTLP ingestion over both transports —
-//! `POST /v1/traces|metrics|logs` (protobuf) and the three OTLP/gRPC
-//! services — admitted through one pipeline into a real (memory) store
-//! under bounded retention. It does *not* yet serve the Investigation API
-//! or the UI: no query surface, no correlation, no MCP. A client that asks
-//! for telemetry in gets it; a client that asks to investigate gets
-//! nothing, because nothing is served yet — `docs/roadmap/phases.md` owns
-//! when that lands.
+//! The core now *serves telemetry and investigations*: OTLP ingestion over
+//! both transports — `POST /v1/traces|metrics|logs` (protobuf) and the
+//! three OTLP/gRPC services — admitted through one pipeline into a real
+//! (memory) store under bounded retention, and the Investigation API's
+//! trace endpoint (`POST /v1/investigations/traces`, JSON) composing the
+//! query engine into one envelope (ADR 0011). It does *not* yet serve the
+//! UI or an MCP surface: no correlation strategies, no agent protocol.
+//! A client that asks for telemetry in gets it; a client that asks to
+//! investigate a resident trace gets one envelope — `docs/roadmap/phases.md`
+//! owns what lands next.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -36,10 +38,12 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tower_http::services::ServeDir;
 
+use crate::investigation_http::INVESTIGATION_TRACES_PATH;
 use crate::listener::BoundedListener;
 use crate::otlp_grpc::{LOGS_SERVICE_PREFIX, METRICS_SERVICE_PREFIX, TRACE_SERVICE_PREFIX};
 use crate::runtime::{CoreRuntime, RunSummary, RuntimeConfig};
 
+mod investigation_http;
 mod listener;
 mod otlp_grpc;
 mod otlp_http;
@@ -130,10 +134,21 @@ pub fn build_router(runtime: Arc<CoreRuntime>, config: ServerConfig) -> Router {
             otlp_http::inflight_body_guard,
         ))
         .layer(DefaultBodyLimit::max(payload_ceiling));
+    let investigation: Router<Arc<CoreRuntime>> = Router::new()
+        .route(
+            INVESTIGATION_TRACES_PATH,
+            post(investigation_http::investigate_trace_http),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&runtime),
+            otlp_http::inflight_body_guard,
+        ))
+        .layer(DefaultBodyLimit::max(payload_ceiling));
     let router: Router<Arc<CoreRuntime>> = Router::new()
         .route("/healthz", get(health))
         .route("/version", get(version))
         .merge(otlp_http)
+        .merge(investigation)
         .nest_service(
             TRACE_SERVICE_PREFIX,
             otlp_grpc::TraceServiceServer::new(Arc::clone(&runtime)),
@@ -173,9 +188,9 @@ async fn version(State(runtime): State<Arc<CoreRuntime>>) -> Json<VersionInfo> {
 async fn builtin_index() -> Html<String> {
     Html(format!(
         "<!doctype html><title>{PRODUCT}</title>\
-         <h1>{PRODUCT} {VERSION}</h1>\
          <p>Native core is running. Telemetry is ingested over OTLP \
-         (HTTP and gRPC); the Investigation API is not served yet. Start \
+         (HTTP and gRPC); the Investigation API is served over \
+         <code>POST /v1/investigations/traces</code>. Start \
          the server with <code>--web-dist &lt;path&gt;</code> to serve a \
          UI build.</p>"
     ))
@@ -801,9 +816,9 @@ mod tests {
     }
 
     /// The index page is honest about what is and is not served: ingestion
-    /// yes, investigation not yet.
+    /// yes, and the Investigation API is served over its trace endpoint.
     #[tokio::test]
-    async fn the_index_does_not_claim_the_investigation_api() {
+    async fn the_index_claims_the_investigation_api() {
         let runtime = test_support::runtime();
         let response = build_router(Arc::clone(&runtime), ServerConfig::default())
             .oneshot(
@@ -825,8 +840,12 @@ mod tests {
             "ingestion is served and the page says so: {page}"
         );
         assert!(
-            !page.to_lowercase().contains("investigation api is served"),
-            "the page never claims the Investigation API: {page}"
+            page.to_lowercase().contains("investigation api is served"),
+            "the page claims the Investigation API: {page}"
+        );
+        assert!(
+            page.contains("/v1/investigations/traces"),
+            "the page names the trace endpoint: {page}"
         );
         runtime.shutdown();
     }

@@ -349,7 +349,7 @@ fn content_type_gate(headers: &axum::http::HeaderMap) -> Option<Response> {
 /// Whether the request declares a content length over `ceiling_bytes` —
 /// the one over-cap refusal that can be made before any body byte is
 /// buffered. An undeclared length is decided by the bounded read.
-fn declared_over_ceiling(headers: &axum::http::HeaderMap, ceiling_bytes: usize) -> bool {
+pub(crate) fn declared_over_ceiling(headers: &axum::http::HeaderMap, ceiling_bytes: usize) -> bool {
     let ceiling = u64::try_from(ceiling_bytes).unwrap_or(u64::MAX);
     headers
         .get(header::CONTENT_LENGTH)
@@ -397,7 +397,7 @@ fn body_read_timeout_response(timeout: Duration) -> Response {
 /// caller tells a length-limit error from a broken connection).
 ///
 /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
-async fn read_body(
+pub(crate) async fn read_body(
     body: axum::body::Body,
     ceiling_bytes: usize,
     timeout: Duration,
@@ -408,33 +408,38 @@ async fn read_body(
     }
 }
 
-/// The aggregate in-flight body-budget gate for the OTLP/HTTP routes
+/// The aggregate in-flight body-budget gate for the body-buffering routes
 /// ([ADR 0010]).
 ///
 /// Applied as `middleware::from_fn` in `build_router`, this runs for every
-/// request but only acts on the three OTLP/HTTP export endpoints: it charges
-/// the request's declared body length (≤ the payload ceiling) to the shared
-/// transport-edge budget before the body is read, and releases it when the
-/// handler is done. A request that would push the aggregate past its budget is
-/// refused **429 + `Retry-After`** before a body byte is buffered — the honest
-/// retryable answer for transient transport-edge overload, sibling to queue
-/// saturation.
+/// request but only acts on the three OTLP/HTTP export endpoints and the
+/// Investigation API's trace endpoint (the only routes that buffer a
+/// request body): it charges the request's declared body length (≤ the
+/// payload ceiling) to the shared transport-edge budget before the body is
+/// read, and releases it when the handler is done. A request that would
+/// push the aggregate past its budget is refused **429 + `Retry-After`**
+/// before a body byte is buffered — the honest retryable answer for
+/// transient transport-edge overload, sibling to queue saturation.
 ///
-/// Requests the earlier honest gates own are passed through without charging:
-/// a draining runtime (the handler answers 503 before reading) and a declared
-/// over-ceiling body (the handler answers 413 before reading). Non-OTLP
-/// surfaces (health, version, the UI) never buffer a request body and are
-/// passed through.
+/// Requests the earlier honest gates own are passed through without
+/// charging: a draining runtime (the handler answers 503 before reading)
+/// and a declared over-ceiling body (the handlers answer 413 before
+/// reading). Non-buffering surfaces (health, version, the UI) never buffer
+/// a request body and are passed through. The Investigation endpoint's
+/// content-type is not gated here: it speaks JSON, not protobuf, and its
+/// handler answers 415-equivalents itself.
 pub(crate) async fn inflight_body_guard(
     State(runtime): State<Arc<CoreRuntime>>,
     request: Request,
     next: Next,
 ) -> Response {
-    // The three OTLP/HTTP export endpoints are the only routes that buffer a
-    // request body. Everything else — health, version, the UI, the gRPC
-    // services (which acquire on the same budget at their own seam) — passes
-    // through untouched.
-    if request.method() != Method::POST || !is_otlp_http_export(request.uri().path()) {
+    // The body-buffering routes: the three OTLP/HTTP export endpoints and
+    // the Investigation API's trace endpoint. Everything else — health,
+    // version, the UI, the gRPC services (which acquire on the same budget
+    // at their own seam) — passes through untouched.
+    let path = request.uri().path();
+    let investigating = path == crate::investigation_http::INVESTIGATION_TRACES_PATH;
+    if request.method() != Method::POST || !(is_otlp_http_export(path) || investigating) {
         return next.run(request).await;
     }
     let ceiling_bytes = runtime.payload_ceiling_bytes();
@@ -447,12 +452,15 @@ pub(crate) async fn inflight_body_guard(
     if runtime.is_draining() {
         return next.run(request).await;
     }
-    if let Some(refusal) = content_type_gate(request.headers()) {
-        return refusal;
+    if !investigating {
+        if let Some(refusal) = content_type_gate(request.headers()) {
+            return refusal;
+        }
     }
     if declared_over_ceiling(request.headers(), ceiling_bytes) {
         return next.run(request).await;
     }
+
     let charge = declared_length_bounded(request.headers(), ceiling_bytes);
     let Some(_guard) = runtime.inflight_body_budget().try_acquire(charge) else {
         return inflight_over_budget_response(runtime.inflight_body_budget().ceiling_bytes());

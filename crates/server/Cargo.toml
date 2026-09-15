@@ -31,9 +31,12 @@ tonic = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The Investigation endpoint's JSON surface: the request subject is
+# parsed and the whole envelope rendered with serde_json in the served
+# crate itself (not a dev-only concern).
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 # One real-socket test drives the gRPC surface with tonic's own client
 # stack (Endpoint/Channel over TCP, `Grpc::unary`/`streaming` and a
 # hand-written client codec): the wire proof the in-process tower calls
