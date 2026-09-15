@@ -1,9 +1,11 @@
 # 0011 — The Investigation API composes the engines into named flows
 
-- **Status:** Proposed
-- **Status note:** promoted to Accepted by the M3 implementation PR after
-  `pnpm arch` + `pnpm arch:canary` pass with no storage edge added to
-  `crates/investigation` (verification gate in decision 4).
+- **Status:** Accepted
+- **Status note:** promoted from Proposed by the M3 implementation
+  (PR #21, issue #12): `pnpm arch` and `pnpm arch:canary` pass with no
+  storage edge added to `crates/investigation` (verification gate in
+  decision 4), the envelope types, the trace flow composing the query
+  engine, and the query-crate facade are all shipped in that PR.
 - **Date:** 2026-09-15
 - **Part of:** Phase 2 — Investigation runtime (M3, issue #12)
 
