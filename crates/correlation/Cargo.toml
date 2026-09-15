@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 runtime-trail-telemetry-model = { workspace = true }
+runtime-trail-storage = { workspace = true }
 
 [lints]
 workspace = true

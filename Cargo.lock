@@ -2752,6 +2752,7 @@ dependencies = [
 name = "runtime-trail-correlation"
 version = "0.0.0"
 dependencies = [
+ "runtime-trail-storage",
  "runtime-trail-telemetry-model",
 ]
 
