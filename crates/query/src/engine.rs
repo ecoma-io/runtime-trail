@@ -79,6 +79,17 @@ const QUERY_VERSION: u8 = 2;
 /// minted cursor carries.
 const SCAN_BATCH: usize = 64;
 
+/// Consecutive empty driver pages with a successor cursor that end the
+/// walk. A contract-violating driver that yields an empty page while
+/// claiming a successor cursor would spin the engine forever — the scan
+/// budget charges only examined items, so no dimension ceiling stops
+/// it. One empty continuation is a legal boundary blip a conforming
+/// driver may produce at a batch edge; after this many in a row the
+/// engine stops paging, mints no further cursor, and names the stall
+/// in coverage ([`CoverageEntry::DriverStall`],
+/// [`PartOutcome::Stalled`]).
+const EMPTY_PAGE_STALL_LIMIT: usize = 3;
+
 /// The signal kind a records query asks for: the model's vocabulary, never
 /// the storage layer's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,7 +625,7 @@ impl Walk<'_> {
                 TruncationPoint::Cursor(bytes) => Some(bytes.clone()),
                 TruncationPoint::LastExamined(_) => None,
             },
-            PartOutcome::Complete | PartOutcome::Refused(_) => None,
+            PartOutcome::Complete | PartOutcome::Refused(_) | PartOutcome::Stalled => None,
         };
         Page {
             items: self.items,
@@ -632,11 +643,43 @@ impl Walk<'_> {
     /// snapshot bound, or a budget dimension expires. A stop mid-batch
     /// settles the batch tail it abandons; a complete end — the kind's
     /// end, where every pulled record was examined — settles nothing.
+    ///
+    /// The one kind of stop no budget dimension can produce is a stalled
+    /// driver: a page that is empty yet claims a successor cursor
+    /// charges nothing (the scan ceiling counts examined items only),
+    /// so it would spin the walk forever. The engine bounds it here —
+    /// [`EMPTY_PAGE_STALL_LIMIT`] consecutive empty continuations end
+    /// the walk with what was collected, no further cursor, and the
+    /// stall named in coverage.
     fn run(mut self) -> Page<RecordView> {
+        let mut empty_pages = 0_usize;
         while self.stopped.is_none() {
             let (batch, batch_cursor) = self.pull();
             self.frontier = batch_cursor.or(batch.last().map(|yielded| yielded.key));
             let total = batch.len();
+            if total == 0 {
+                if let Some(cursor) = batch_cursor {
+                    empty_pages += 1;
+                    if empty_pages >= EMPTY_PAGE_STALL_LIMIT {
+                        // The driver claims a successor it never yields:
+                        // stop paging, mint no further cursor, and name
+                        // the stall — the last record the walk examined,
+                        // or the driver's own cursor anchor when nothing
+                        // was (the `after` vocabulary of UncountedTail).
+                        let after = self
+                            .last_examined
+                            .map_or_else(|| cursor.entity(), |key| key.entity());
+                        self.coverage.push(CoverageEntry::DriverStall { after });
+                        self.stopped = Some(PartOutcome::Stalled);
+                        break;
+                    }
+                    self.after = Some(cursor);
+                } else {
+                    self.finish_counting_or_complete();
+                }
+                continue;
+            }
+            empty_pages = 0;
             for (index, yielded) in batch.into_iter().enumerate() {
                 let unexamined_after = u64::try_from(total - index - 1).unwrap_or(u64::MAX);
                 self.examine(yielded, unexamined_after);
@@ -791,6 +834,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::ops::Bound;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use runtime_trail_storage::{
@@ -810,7 +854,9 @@ mod tests {
         LogFilters, MetricFilters, ScopeFilter, ServiceFilter, SeverityFilter, SpanFilters,
         TimeRangeFilter,
     };
-    use crate::result::{CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation};
+    use crate::result::{
+        CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation, TruncationPoint,
+    };
 
     /// A nanosecond admission reading.
     const fn at(nano: u64) -> AdmissionTime {
@@ -3527,6 +3573,341 @@ mod tests {
              record participates through its fallback key"
         );
         assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// Per-page budget re-admission: a continuation page is a NEW
+    /// execution with the caller-set budget — page 2 does not inherit
+    /// page 1's remaining allowance. Page 1 saturates its `max_results`
+    /// of two and mints a cursor; page 2 continues that same
+    /// fingerprint-valid cursor under its own budget, enforces its own
+    /// `max_results` of one, and carries its own page-2 facts: a fresh
+    /// `max_results` degradation and the snapshot boundary the
+    /// continuation names.
+    ///
+    /// Kills the no-op where a continuation inherits the first page's
+    /// remaining allowance instead of re-admitting the caller's budget
+    /// (a second page then over-returns, or under-enforces its own
+    /// limits).
+    #[test]
+    fn a_continuation_page_readmits_the_callers_budget() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        assert_eq!(
+            first.items.len(),
+            2,
+            "page 1 saturates its own max_results of two"
+        );
+        let [PartOutcome::Degraded { truncation }] = &first.execution.parts[..] else {
+            panic!("page 1 degrades under its own max_results");
+        };
+        assert_eq!(truncation.dimension, Dimension::Results);
+        let cursor = first.next_cursor.expect("a saturated page continues");
+
+        let second = records(
+            &store,
+            &query,
+            budget_with(1, 1 << 40, 10_000),
+            Some(&cursor),
+        )
+        .expect("the fingerprint-valid cursor continues");
+        assert_eq!(
+            second.items.len(),
+            1,
+            "page 2 re-admits the caller's budget: its own max_results \
+             of one bounds the page, not page 1's remaining allowance"
+        );
+        let [PartOutcome::Degraded { truncation }] = &second.execution.parts[..] else {
+            panic!("page 2 degrades under its own max_results");
+        };
+        assert_eq!(truncation.dimension, Dimension::Results);
+        assert_eq!(
+            truncation.omitted, 0,
+            "a results cut leaves nothing uncounted"
+        );
+        assert!(
+            matches!(truncation.position, TruncationPoint::Cursor(_)),
+            "page 2's truncation names its own continuation cursor"
+        );
+        assert!(
+            second.next_cursor.is_some(),
+            "page 2 continues under its own budget"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: AdmissionKey::new(at(500), span_entity(5, 5)),
+            }],
+            "page 2's coverage is its own page-2 fact: the boundary the \
+             first page minted, named again by the continuation"
+        );
+
+        // The full walk under per-page budgets: every page bounds itself
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|view| span_entity_of(view).expect("a span page"))
+                .collect::<Vec<_>>(),
+            vec![span_entity(3, 3)],
+            "page 2 returns its one entity under its own max_results"
+        );
+        // The full walk under per-page budgets: every page bounds itself
+        // and the chain stays lossless — five records, none repeated.
+        let mut entities = vec![span_entity(1, 1), span_entity(2, 2), span_entity(3, 3)];
+        let mut cursor = second.next_cursor;
+        while let Some(next) = cursor {
+            let page = records(&store, &query, budget_with(1, 1 << 40, 10_000), Some(&next))
+                .expect("the query answers");
+            entities.extend(
+                page.items
+                    .iter()
+                    .map(|view| span_entity_of(view).expect("a span page")),
+            );
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            entities,
+            vec![
+                span_entity(1, 1),
+                span_entity(2, 2),
+                span_entity(3, 3),
+                span_entity(4, 4),
+                span_entity(5, 5),
+            ],
+            "per-page budgets page the same set to exhaustion without \
+             repeat or loss"
+        );
+    }
+
+    /// How a TEST-ONLY, contract-violating span scan misbehaves.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StallPolicy {
+        /// Every span scan yields an empty page with a successor cursor.
+        Always,
+        /// The first span scan serves real records; every later scan
+        /// stalls (a walk stopped mid-set).
+        AfterFirst,
+        /// The first span scan stalls; every later scan serves real
+        /// records (a one-page boundary blip).
+        FirstOnly,
+    }
+
+    /// A TEST-ONLY, contract-violating store: its span scan yields empty
+    /// pages while claiming a successor cursor, per [`StallPolicy`]. A
+    /// conforming driver can never do this — an empty page carries no
+    /// cursor — so the engine's suite needs a deliberate violator to
+    /// prove the guard. Defined in test code, never in lib code: the
+    /// engine's seam is the [`TelemetryStore`] trait, and only a
+    /// nonconforming impl can exercise the stall.
+    struct StallingStore {
+        inner: FixtureStore,
+        /// Span scans served so far (interior mutability: scans are
+        /// `&self`, and the store must stay `Sync`).
+        served: AtomicUsize,
+        /// The successor cursor every stalled page claims.
+        stall_cursor: AdmissionKey,
+        /// How the span scan misbehaves.
+        policy: StallPolicy,
+    }
+
+    impl StallingStore {
+        fn new(inner: FixtureStore, policy: StallPolicy) -> Self {
+            Self {
+                inner,
+                served: AtomicUsize::new(0),
+                stall_cursor: AdmissionKey::new(at(101 * 100), span_entity(101, 101)),
+                policy,
+            }
+        }
+
+        /// With a chosen successor cursor for stalled pages (the blip
+        /// test resumes real scans from it).
+        fn with_cursor(mut self, stall_cursor: AdmissionKey) -> Self {
+            self.stall_cursor = stall_cursor;
+            self
+        }
+    }
+
+    impl TelemetryStore for StallingStore {
+        fn keep_span(&mut self, admitted: Admitted<Arc<Span>>) -> KeepOutcome {
+            self.inner.keep_span(admitted)
+        }
+
+        fn keep_log_record(&mut self, admitted: Admitted<Arc<LogRecord>>) -> KeepOutcome {
+            self.inner.keep_log_record(admitted)
+        }
+
+        fn keep_metric_point(
+            &mut self,
+            admitted: Admitted<Arc<MetricPoint>>,
+            stream: Arc<StreamIdentity>,
+        ) -> KeepOutcome {
+            self.inner.keep_metric_point(admitted, stream)
+        }
+
+        fn span(&self, entity: EntityId) -> Option<Arc<Span>> {
+            self.inner.span(entity)
+        }
+
+        fn log_record(&self, entity: EntityId) -> Option<Arc<LogRecord>> {
+            self.inner.log_record(entity)
+        }
+
+        fn metric_point(&self, entity: EntityId) -> Option<PointView> {
+            self.inner.metric_point(entity)
+        }
+
+        fn scan_spans(&self, after: Option<AdmissionKey>, limit: usize) -> ScanPage<Arc<Span>> {
+            let served = self.served.load(Ordering::Relaxed);
+            self.served.store(served + 1, Ordering::Relaxed);
+            let stalls = match self.policy {
+                StallPolicy::Always => true,
+                StallPolicy::AfterFirst => served >= 1,
+                StallPolicy::FirstOnly => served == 0,
+            };
+            if stalls {
+                return ScanPage {
+                    items: Vec::new(),
+                    cursor: Some(self.stall_cursor),
+                };
+            }
+            self.inner.scan_spans(after, limit)
+        }
+
+        fn scan_log_records(
+            &self,
+            after: Option<AdmissionKey>,
+            limit: usize,
+        ) -> ScanPage<Arc<LogRecord>> {
+            self.inner.scan_log_records(after, limit)
+        }
+
+        fn scan_metric_points(
+            &self,
+            after: Option<AdmissionKey>,
+            limit: usize,
+        ) -> ScanPage<PointView> {
+            self.inner.scan_metric_points(after, limit)
+        }
+
+        fn enforce_retention(&mut self, now: AdmissionTime) -> u64 {
+            self.inner.enforce_retention(now)
+        }
+
+        fn observe_admission_anomalies(&mut self, total: u64) {
+            self.inner.observe_admission_anomalies(total);
+        }
+
+        fn stats(&self) -> StoreStats {
+            self.inner.stats()
+        }
+
+        fn mode_name(&self) -> &'static str {
+            "test-stalling"
+        }
+    }
+
+    /// The empty-continuation guard: a TEST-ONLY driver that yields an
+    /// empty page while claiming a successor cursor must not spin the
+    /// engine. The walk stops paging after `EMPTY_PAGE_STALL_LIMIT`
+    /// consecutive empty continuations, presents what was collected,
+    /// mints no further cursor, and names the stall honestly in
+    /// coverage — `DriverStall` at the last examined record and a
+    /// `Stalled` part outcome.
+    #[test]
+    fn a_driver_stall_ends_the_walk_with_honest_coverage() {
+        let store = StallingStore::new(span_store(100), StallPolicy::AfterFirst);
+        let page = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+
+        assert_eq!(
+            page.items.len(),
+            64,
+            "the one real batch is collected before the stall"
+        );
+        assert!(
+            page.next_cursor.is_none(),
+            "a stalled walk mints no further cursor"
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Stalled]);
+        assert_eq!(
+            page.execution.coverage.entries,
+            vec![CoverageEntry::DriverStall {
+                after: span_entity(64, 64),
+            }],
+            "the stall names the last record the walk examined"
+        );
+    }
+
+    /// A stall from the very first pull — nothing examined yet — still
+    /// names the stall: the driver's own successor-cursor anchor is the
+    /// position, and the page is empty with a `Stalled` outcome.
+    #[test]
+    fn a_driver_stall_before_any_examination_names_its_cursor_anchor() {
+        let store = StallingStore::new(span_store(5), StallPolicy::Always);
+        let page = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.execution.parts, vec![PartOutcome::Stalled]);
+        assert_eq!(
+            page.execution.coverage.entries,
+            vec![CoverageEntry::DriverStall {
+                after: span_entity(101, 101),
+            }],
+            "with nothing examined, the stall names the driver's cursor \
+             anchor"
+        );
+    }
+
+    /// The guard counts *consecutive* empty continuations: a lone empty
+    /// page with a successor cursor (a boundary blip) resumes the walk
+    /// from that cursor, completes normally, and names no stall.
+    #[test]
+    fn one_empty_continuation_is_absorbed_without_stalling() {
+        // The blip claims "more records after (0, span 0)" — before the
+        // first real record — so the resumed walk still yields the whole
+        // set: a blip that points past data would be the driver's own
+        // data loss, which the engine cannot see either way.
+        let store = StallingStore::new(span_store(100), StallPolicy::FirstOnly)
+            .with_cursor(AdmissionKey::new(at(0), span_entity(0, 0)));
+        let page = records(
+            &store,
+            &RecordsQuery::new(SignalKind::Spans),
+            open_budget(),
+            None,
+        )
+        .expect("the query answers");
+
+        assert_eq!(
+            page.items.len(),
+            100,
+            "the whole set is collected after the absorbed blip"
+        );
+        assert_eq!(page.execution.parts, vec![PartOutcome::Complete]);
+        assert!(
+            page.execution
+                .coverage
+                .entries
+                .iter()
+                .all(|entry| !matches!(entry, CoverageEntry::DriverStall { .. })),
+            "a one-page blip is not a stall"
+        );
         assert!(page.next_cursor.is_none());
     }
 }

@@ -13,7 +13,13 @@
 //!
 //! # Status
 //!
-//! In progress - the machinery lands with Phase 2's M2 milestone (issue #6).
+//! Implemented. This crate is the records-flow engine: the budgeted,
+//! deterministic, cursor-bound reads over the storage contract that
+//! Phase 2's M2 shipped and the adversarial review hardened. The
+//! contract is owned by
+//! [query-model.md](../../docs/architecture/query-model.md); the
+//! envelope the API layer composes from the engine's pages lives in
+//! [investigation-model.md](../../docs/architecture/investigation-model.md).
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
