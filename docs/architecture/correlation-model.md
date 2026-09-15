@@ -172,6 +172,13 @@ reports the truncated traversal truthfully through the
 
 ## Status
 
-**Contracts pinned (M0).** The taxonomy, evidence rules and invariants above
-are the contract the Phase 2 Correlation Engine implements. The engine crate
-remains scaffolding until then per [the roadmap](../roadmap/phases.md).
+**Contracts pinned (M0), engine committed (issue #28).** The taxonomy,
+evidence rules and invariants above are the contract the Phase 2
+Correlation Engine implements. The engine crate now ships the committed
+strategies — span identity, trace identity, temporal co-activity — wired
+into the Investigation API's trace flow under the caller's budget. The
+temporal strategy runs only under an explicit window the caller supplies
+through the Investigation; without one the runtime picks no window and
+the identity strategies run alone, the skip named in the coverage. The
+remaining taxonomy (parent/child, resource context, exemplar attachment,
+inferred) stays unstarted per [the roadmap](../roadmap/phases.md).

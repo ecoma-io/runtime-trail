@@ -27,8 +27,8 @@ pub struct Investigation {
     pub subject: Subject,
     /// What the work cost and covered: run facts, never a summary.
     pub execution: Execution,
-    /// The relations between the subject and resident signals. Typed and
-    /// empty in M3: no correlation strategy is implemented yet.
+    /// The relations between the subject and resident signals, produced by
+    /// the committed correlation strategies.
     pub correlated: Correlated,
     /// The record views the answer is grounded in, each with its entity id.
     pub evidence: Evidence,
@@ -102,6 +102,7 @@ pub const FIELD_PATHS: &[&str] = &[
     "limits.chain.total_entities",
     "limits.chain.total_pages",
     "limits.chain.identity_examinations",
+    "limits.chain.correlation_scan",
     "limits.chain.stopped",
     "limits.strategy_versions[].name",
     "limits.strategy_versions[].version",
@@ -595,7 +596,7 @@ mod tests {
         let evidence = Evidence::new(vec![span_named("root", 1_000)], vec![], vec![]);
         let limits = Limits::new(
             budget(),
-            ChainLimits::new(10_000, 16, 1, 1, 0, None),
+            ChainLimits::new(10_000, 16, 1, 1, 0, 0, None),
             vec![],
             EvictionState::new(1, 0),
         );

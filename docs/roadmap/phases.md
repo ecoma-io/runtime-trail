@@ -47,9 +47,14 @@ waterfall/span tree, log list, logs↔trace navigation).
 
 **Landed so far** (2026-09-13): the Query Engine's budgeted records flow —
 ordered, snapshot-bounded, cursor-chained pages over the ingested signals
-under the five-dimension budget (issue #6). The Investigation API,
-correlation and the investigation surfaces are later milestones of the
-phase.
+under the five-dimension budget (issue #6). The Investigation API and the
+correlation engine's committed strategies (span identity, trace identity,
+temporal co-activity — the last only under an explicit caller window, the
+runtime picks no window by default) are wired end to end (issues #12,
+#28): one `POST /v1/investigations/traces` flow composes waterfall spans,
+related logs, surrounding metrics and the correlated relations under one
+caller budget. The investigation surfaces (Loom UI) and MCP are later
+milestones of the phase.
 
 **Acceptance sketch:** from one ingested trace, a developer reaches its logs
 and surrounding metrics in a handful of interactions; the same answers are

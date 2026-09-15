@@ -190,8 +190,14 @@ the query crate re-exports as the facade `runtime_trail_query::
 TelemetryStore`) into the trace waterfall, related logs and surrounding
 metrics as named envelope parts, slicing the caller's budget per page and
 reporting every engine refusal, degradation and stall it meets. The
-correlation crate exists as a declared boundary with typed-but-empty
-state; correlation results surface when its engines land. Wire shapes of
-the unstarted surfaces (developer UI over HTTP, MCP) belong to their
-phases in [../roadmap/phases.md](../roadmap/phases.md), and this document
-owns none of them yet.
+correlation crate's committed strategies — span identity, trace identity,
+temporal co-activity — run inside the trace flow (issue #28), populating
+the envelope's `correlated` part under the caller's budget with relations
+narrowed to evidence-resident endpoints, and accounting the engine's
+truth (suppressions, absent traces, degradation, skipped strategies) in
+the coverage and limits parts. The temporal strategy runs only under an
+explicit caller window; without one the runtime picks no window and the
+identity strategies run alone, the skip named in the coverage. Wire
+shapes of the unstarted surfaces (developer UI over HTTP, MCP) belong to
+their phases in [../roadmap/phases.md](../roadmap/phases.md), and this
+document owns none of them yet.

@@ -14,6 +14,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use runtime_trail_investigation::correlated::RelationType;
 use runtime_trail_investigation::envelope::invariants;
 use runtime_trail_investigation::execution::{
     CoverageEntry, Dimension, FlowCoverageEntry, Magnitude, Outcome, PartName, TimeWindow,
@@ -496,12 +497,16 @@ fn trace_store() -> FixtureStore {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // one cohesive end-to-end composition test
 fn a_complete_trace_investigation_composes_all_parts() {
     let store = trace_store();
     let root = span_entity(TRACE, 1);
 
-    let envelope = investigate_trace(&store, TraceInvestigationRequest::new(root, open_budget()))
-        .expect("the fixture trace investigates");
+    let envelope = investigate_trace(
+        &store,
+        TraceInvestigationRequest::new(root, open_budget(), Some(TimeWindow { from: 10, to: 40 })),
+    )
+    .expect("the fixture trace investigates");
 
     // Subject: requested and effective agree; the requested span IS the
     // trace's parentless root.
@@ -571,9 +576,108 @@ fn a_complete_trace_investigation_composes_all_parts() {
         envelope.limits.eviction.resident_records,
         store.stats().resident_records
     );
+    // Correlated: the committed strategies produce relations — the
+    // related logs attach to their exact span, and the subject's spans
+    // relate to the in-window points. Every relation endpoint is
+    // evidence-resident (invariant 3 holds mechanically).
+    assert_eq!(
+        envelope.correlated.relations.len(),
+        8,
+        "two span identities (one per related log) plus six co-activity pairs (3 spans x 2 in-window points)"
+    );
+    let span_identities = envelope
+        .correlated
+        .relations
+        .iter()
+        .filter(|relation| relation.relation_type == RelationType::SpanIdentity)
+        .count();
+    let co_activities = envelope
+        .correlated
+        .relations
+        .iter()
+        .filter(|relation| relation.relation_type == RelationType::TemporalCoActivity)
+        .count();
+    assert_eq!(
+        span_identities, 2,
+        "the related logs attach to their exact span"
+    );
+    assert_eq!(
+        co_activities, 6,
+        "each subject span relates to each in-window point"
+    );
+    for relation in &envelope.correlated.relations {
+        assert!(
+            envelope
+                .evidence
+                .entity_of(&relation.from.kind, &relation.from.entity),
+            "a relation endpoint must be an evidence view"
+        );
+        assert!(
+            envelope
+                .evidence
+                .entity_of(&relation.to.kind, &relation.to.entity),
+            "a relation endpoint must be an evidence view"
+        );
+    }
+
+    // The correlation truth is stated: the three committed strategies'
+    // versions in run order, the engine's scan spend across the resident
+    // families (3 spans + 3 logs + 3 points), the two exact attachments
+    // suppressing their trace-identity siblings, and no degradation.
+    let strategy_names: Vec<&str> = envelope
+        .limits
+        .strategy_versions
+        .iter()
+        .map(|version| version.name.as_str())
+        .collect();
+    assert_eq!(
+        strategy_names,
+        ["span_identity", "trace_identity", "temporal_co_activity"]
+    );
     assert!(
-        envelope.correlated.relations.is_empty(),
-        "correlation is typed-but-empty in M3"
+        envelope
+            .limits
+            .strategy_versions
+            .iter()
+            .all(|version| version.version == "1.0.0")
+    );
+    assert_eq!(envelope.limits.chain.correlation_scan, 9);
+    let suppressions: Vec<&FlowCoverageEntry> = envelope
+        .execution
+        .flow_coverage
+        .iter()
+        .filter(|entry| matches!(entry, FlowCoverageEntry::SuppressedEvidence { .. }))
+        .collect();
+    assert_eq!(suppressions.len(), 2, "the two related logs attach exactly");
+    for entry in suppressions {
+        assert!(
+            matches!(
+                entry,
+                FlowCoverageEntry::SuppressedEvidence { suppressed: 2, .. }
+            ),
+            "each exact attachment suppresses its two trace-identity siblings"
+        );
+    }
+    assert!(
+        !envelope
+            .execution
+            .flow_coverage
+            .iter()
+            .any(|entry| matches!(entry, FlowCoverageEntry::AbsentTraceSpans { .. }))
+    );
+    assert!(
+        !envelope
+            .execution
+            .flow_coverage
+            .iter()
+            .any(|entry| matches!(entry, FlowCoverageEntry::RelationShrinkage { .. }))
+    );
+    assert!(
+        !envelope
+            .execution
+            .flow_coverage
+            .iter()
+            .any(|entry| matches!(entry, FlowCoverageEntry::CorrelationDegradation { .. }))
     );
 
     // Every invariant holds on the complete envelope.
@@ -582,6 +686,66 @@ fn a_complete_trace_investigation_composes_all_parts() {
     assert!(invariants::run_facts_are_consistent(&envelope));
     assert!(invariants::metric_window_is_stated(&envelope));
     assert!(invariants::no_partial_content_as_complete(&envelope));
+}
+
+#[test]
+fn without_a_correlation_window_the_temporal_strategy_is_skipped() {
+    let store = trace_store();
+    let root = span_entity(TRACE, 1);
+
+    let envelope = investigate_trace(
+        &store,
+        TraceInvestigationRequest::new(root, open_budget(), None),
+    )
+    .expect("the fixture trace investigates");
+
+    // Without a caller-supplied window the runtime picks no window
+    // (correlation-model.md): the identity strategies run, the temporal
+    // strategy is skipped and the skip is a named coverage fact.
+    let types: Vec<RelationType> = envelope
+        .correlated
+        .relations
+        .iter()
+        .map(|relation| relation.relation_type)
+        .collect();
+    assert_eq!(
+        types,
+        vec![RelationType::SpanIdentity, RelationType::SpanIdentity]
+    );
+    assert!(
+        !envelope
+            .correlated
+            .relations
+            .iter()
+            .any(|relation| relation.relation_type == RelationType::TemporalCoActivity),
+        "no temporal relations without a caller window"
+    );
+    let skips: Vec<&FlowCoverageEntry> = envelope
+        .execution
+        .flow_coverage
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                FlowCoverageEntry::TemporalStrategySkipped {
+                    reason: "no_correlation_window"
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        skips.len(),
+        1,
+        "the skipped temporal strategy is named exactly once"
+    );
+    let strategy_names: Vec<&str> = envelope
+        .limits
+        .strategy_versions
+        .iter()
+        .map(|version| version.name.as_str())
+        .collect();
+    assert_eq!(strategy_names, ["span_identity", "trace_identity"]);
+    assert!(invariants::violations(&envelope).is_empty());
 }
 
 #[test]
@@ -608,7 +772,7 @@ fn a_results_degrade_surfaces_its_truncation_and_the_continuation_completes() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(span_entity(TRACE, 1), capped),
+        TraceInvestigationRequest::new(span_entity(TRACE, 1), capped, None),
     )
     .expect("the fixture trace investigates");
 
@@ -666,7 +830,7 @@ fn a_refused_scan_budget_lands_in_the_execution_part() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(span_entity(TRACE, 1), refused),
+        TraceInvestigationRequest::new(span_entity(TRACE, 1), refused, None),
     )
     .expect("the refusal is an answer shape, not a failure");
 
@@ -706,7 +870,7 @@ fn a_stalled_driver_lands_as_a_named_stall() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget()),
+        TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget(), None),
     )
     .expect("the stall is an answer shape");
 
@@ -755,7 +919,7 @@ fn budget_is_re_admitted_fresh_on_every_continuation_page() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(span_entity(TRACE, 1), capped),
+        TraceInvestigationRequest::new(span_entity(TRACE, 1), capped, None),
     )
     .expect("the fixture trace investigates");
 
@@ -807,7 +971,7 @@ fn a_chain_total_pages_stop_is_reported_not_swallowed() {
 
     let envelope = investigate_trace_bounded(
         &store,
-        &TraceInvestigationRequest::new(span_entity(TRACE, 1), capped),
+        &TraceInvestigationRequest::new(span_entity(TRACE, 1), capped, None),
         chain,
     )
     .expect("the fixture trace investigates");
@@ -847,7 +1011,7 @@ fn a_chain_total_entities_stop_is_reported_not_swallowed() {
 
     let envelope = investigate_trace_bounded(
         &store,
-        &TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget()),
+        &TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget(), None),
         chain,
     )
     .expect("the fixture trace investigates");
@@ -870,7 +1034,7 @@ fn a_chain_total_entities_stop_is_reported_not_swallowed() {
 #[test]
 fn deterministic_runs_agree_on_content_and_facts() {
     let store = trace_store();
-    let request = TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget());
+    let request = TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget(), None);
 
     let first = investigate_trace(&store, request).expect("first run");
     let second = investigate_trace(&store, request).expect("second run");
@@ -896,7 +1060,7 @@ fn identity_recovery_holes_are_counted_and_named() {
 
     let envelope = investigate_trace_bounded(
         &store,
-        &TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget()),
+        &TraceInvestigationRequest::new(span_entity(TRACE, 1), open_budget(), None),
         chain,
     )
     .expect("the fixture trace investigates");
@@ -934,7 +1098,7 @@ fn a_degenerate_root_investigates_the_span_alone() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(entity, open_budget()),
+        TraceInvestigationRequest::new(entity, open_budget(), None),
     )
     .expect("the degenerate span investigates");
 
@@ -964,7 +1128,7 @@ fn an_unresolvable_subject_fails_outright() {
 
     let error = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(unknown, open_budget()),
+        TraceInvestigationRequest::new(unknown, open_budget(), None),
     )
     .expect_err("a never-admitted span cannot be the subject");
     assert_eq!(error, FlowError::SubjectUnresolved { requested: unknown });
