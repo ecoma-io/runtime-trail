@@ -53,8 +53,10 @@ temporal co-activity — the last only under an explicit caller window, the
 runtime picks no window by default) are wired end to end (issues #12,
 #28): one `POST /v1/investigations/traces` flow composes waterfall spans,
 related logs, surrounding metrics and the correlated relations under one
-caller budget. The investigation surfaces (Loom UI) and MCP are later
-milestones of the phase.
+caller budget. The first Loom UI investigation surfaces — trace
+waterfall/span tree, related logs, logs ↔ trace navigation, surrounding
+metrics window, and correlated relations — are wired over HTTP against
+the Investigation API (issue #30). MCP is a later milestone of the phase.
 
 **Acceptance sketch:** from one ingested trace, a developer reaches its logs
 and surrounding metrics in a handful of interactions; the same answers are
