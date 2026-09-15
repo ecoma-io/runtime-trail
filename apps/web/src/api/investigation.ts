@@ -41,7 +41,7 @@ export interface SpanView {
     parent_span_id?: string | null;
     name: string;
     start_time_unix_nano: UnixNanoString;
-    end_time_unix_nano: UnixNanoString;
+    end_time_unix_nano: UnixNanoString | null;
   };
 }
 
@@ -51,8 +51,8 @@ export type ModelScalar = string | number | boolean | null;
 export interface LogView {
   entity?: EntityId | null;
   log: {
-    timestamp_unix_nano: UnixNanoString;
-    observed_timestamp_unix_nano: UnixNanoString;
+    timestamp_unix_nano: UnixNanoString | null;
+    observed_timestamp_unix_nano: UnixNanoString | null;
     body?: ModelScalar;
     trace_id?: string | null;
     span_id?: string | null;
@@ -253,8 +253,15 @@ export async function investigateTrace(
 }
 
 /** Duration in milliseconds between two unix-nano timestamps (BigInt-safe). */
-export function nanoSpanMs(from: UnixNanoString, to: UnixNanoString): number {
-  return Number((BigInt(to) - BigInt(from)) / 1_000_000n);
+export function nanoSpanMs(
+  from: UnixNanoString,
+  to: UnixNanoString | null,
+): number {
+  // The runtime renders an unfinished span's end_time_unix_nano as null
+  // (crates/server/src/investigation_http.rs verbatim Option<u64>); its own
+  // waterfall_extent treats null end as start (envelope.rs unwrap_or(start)),
+  // so a null end is a still-open span with zero elapsed duration.
+  return Number((BigInt(to ?? from) - BigInt(from)) / 1_000_000n);
 }
 
 /** A unix-nano timestamp as a millisecond clock reading (BigInt-safe). */

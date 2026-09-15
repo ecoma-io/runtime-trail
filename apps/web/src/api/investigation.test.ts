@@ -195,6 +195,41 @@ describe("investigateTrace", () => {
       }),
     ).rejects.toThrow("unknown entity");
   });
+  it("parses an unfinished span's null end_time_unix_nano without crashing", async () => {
+    const body = JSON.parse(fixtureEnvelope) as {
+      evidence: { spans: { span: { end_time_unix_nano: string | null } }[] };
+    };
+    body.evidence.spans[0]!.span.end_time_unix_nano = null;
+    // JSON null (issue #32). The reviver must keep it null, typed so the
+    // waterfall's `end ?? start` semantics apply.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: () => JSON.stringify(body),
+      }),
+    );
+
+    const envelope = await investigateTrace({
+      root_span: {
+        span: {
+          trace_id: "11111111111111111111111111111111",
+          span_id: "2222222222222222",
+        },
+      },
+    });
+
+    expect(envelope.evidence.spans[0]!.span.end_time_unix_nano).toBeNull();
+    // A still-open span has zero elapsed duration, mirroring the runtime's
+    // waterfall_extent (unwrap_or(start)) — the UI must not crash on it.
+    expect(
+      nanoSpanMs(
+        envelope.evidence.spans[0]!.span.start_time_unix_nano,
+        envelope.evidence.spans[0]!.span.end_time_unix_nano,
+      ),
+    ).toBe(0);
+  });
 
   it("converts a unix-nano timestamp to milliseconds", () => {
     expect(nanoToMs("1755200000000000000")).toBe(1755200000000);

@@ -75,7 +75,9 @@ const totalDurationNs = computed<bigint>(() => {
   if (props.spans.length === 0) return 1n;
   let maxEnd = BigInt(0);
   for (const v of props.spans) {
-    const end = BigInt(v.span.end_time_unix_nano);
+    const end = BigInt(
+      v.span.end_time_unix_nano ?? v.span.start_time_unix_nano,
+    );
     if (end > maxEnd) maxEnd = end;
   }
   const d = maxEnd - traceStartNs.value;
@@ -93,7 +95,7 @@ function barOffsetPct(span: SpanView): number {
 
 function barWidthPct(span: SpanView): number {
   const durNs =
-    BigInt(span.span.end_time_unix_nano) -
+    BigInt(span.span.end_time_unix_nano ?? span.span.start_time_unix_nano) -
     BigInt(span.span.start_time_unix_nano);
   return Math.max(Number((durNs * 100n) / totalDurationNs.value), 0.5);
 }
