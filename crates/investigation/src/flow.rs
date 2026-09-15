@@ -41,6 +41,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use runtime_trail_correlation::bounds::{CorrelationBounds, Strategy};
 use runtime_trail_query::budget::QueryBudget;
 use runtime_trail_query::engine::{
     RecordView, RecordsQuery, SignalKind as EngineSignalKind, records,
@@ -55,12 +56,13 @@ use runtime_trail_telemetry_model::{
     EntityId, LogRecord, MetricPoint, Span, SpanId, StreamIdentity, TraceId,
 };
 
-use crate::correlated::Correlated;
+use crate::correlated::{Correlated, Relation};
 use crate::envelope::Investigation;
 use crate::evidence::{Evidence, LogEvidence, PointEvidence, SpanEvidence};
 use crate::execution::{
-    CoverageEntry, Dimension, Execution, FlowCoverageEntry, Magnitude, OpaqueCursor, Outcome,
-    PartName, Refusal, RunFacts, RunGroup, TimeWindow, Truncation, TruncationPoint,
+    CorrelationStop, CoverageEntry, Dimension, Execution, FlowCoverageEntry, Magnitude,
+    OpaqueCursor, Outcome, PartName, Refusal, RunFacts, RunGroup, TimeWindow, Truncation,
+    TruncationPoint,
 };
 use crate::limits::{BudgetLimits, ChainBasis, ChainLimits, EvictionState, Limits};
 use crate::subject::{EffectiveRoot, EffectiveSubject, RequestedSubject, ResolutionNote, Subject};
@@ -121,8 +123,9 @@ impl InvestigationBudget {
     }
 }
 
-/// A trace investigation request: the root span to investigate and the
-/// budget the caller admits for the whole flow.
+/// A trace investigation request: the root span to investigate, the
+/// budget the caller admits for the whole flow, and an optional
+/// correlation window (defaults to the waterfall extent when absent).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraceInvestigationRequest {
     /// The subject the caller asks about: the root span's entity id. The
@@ -131,13 +134,25 @@ pub struct TraceInvestigationRequest {
     pub root_span: EntityId,
     /// The caller's budget for the whole investigation.
     pub budget: InvestigationBudget,
+    /// An optional correlation window: the half-open time range the
+    /// temporal co-activity strategy scans inside. `None` defaults to the
+    /// waterfall's extent (the asked window).
+    pub correlation_window: Option<TimeWindow>,
 }
 
 impl TraceInvestigationRequest {
     /// Builds a trace investigation request.
     #[must_use]
-    pub const fn new(root_span: EntityId, budget: InvestigationBudget) -> Self {
-        Self { root_span, budget }
+    pub const fn new(
+        root_span: EntityId,
+        budget: InvestigationBudget,
+        correlation_window: Option<TimeWindow>,
+    ) -> Self {
+        Self {
+            root_span,
+            budget,
+            correlation_window,
+        }
     }
 }
 
@@ -280,6 +295,7 @@ pub fn investigate_trace(
 /// # Errors
 ///
 /// Same as [`investigate_trace`].
+#[allow(clippy::too_many_lines)] // one phase-composing flow function
 pub fn investigate_trace_bounded(
     store: &dyn TelemetryStore,
     request: &TraceInvestigationRequest,
@@ -380,14 +396,72 @@ pub fn investigate_trace_bounded(
             count: point_holes,
         });
     }
-    let execution = Execution::new(vec![spans_group, logs_group, points_group], flow_coverage);
+    // Correlated: run the committed strategies within the store, narrow
+    // the relations to evidence-resident endpoints (invariant 3), and
+    // account the engine's truth in the flow coverage and limits.
+    let correlation_window = Some(Into::into(
+        request.correlation_window.unwrap_or(asked_window),
+    ));
+    let bounds = CorrelationBounds {
+        strategies: vec![
+            Strategy::SpanIdentity,
+            Strategy::TraceIdentity,
+            Strategy::TemporalCoActivity,
+        ],
+        window: correlation_window,
+        max_relations: 10_000,
+        max_hops: 2,
+        max_scan: budget.max_scan,
+        subject_trace: relates_to,
+    };
+    let outcome = runtime_trail_correlation::correlate(store, &bounds);
+    let mut relations: Vec<Relation> = outcome
+        .relations
+        .into_iter()
+        .map(|relation| {
+            Relation::new(
+                relation.relation_type,
+                relation.from.into(),
+                relation.to.into(),
+                relation.facts,
+                relation.strategy,
+                relation.window,
+            )
+        })
+        .collect();
+    let before_narrow = relations.len();
+    relations.retain(|relation| {
+        evidence.entity_of(&relation.from.kind, &relation.from.entity)
+            && evidence.entity_of(&relation.to.kind, &relation.to.entity)
+    });
+    let shrunk = (before_narrow - relations.len()) as u64;
+    let truth = outcome.truth;
 
-    // Correlated: the correlation strategies are scaffolding in M3 (ADR
-    // 0011, decision 3); the part is typed but reports no relations.
-    let correlated = Correlated::new(Vec::new());
+    // Flow coverage: the engine's truth — suppressions, absent traces,
+    // any relation shrinkage, and where the run degraded.
+    for suppression in &truth.suppressions {
+        flow_coverage.push(FlowCoverageEntry::SuppressedEvidence {
+            log: suppression.log,
+            span: suppression.span,
+            suppressed: suppression.suppressed,
+        });
+    }
+    for absent in &truth.absent_traces {
+        flow_coverage.push(FlowCoverageEntry::AbsentTraceSpans { log: absent.log });
+    }
+    if shrunk > 0 {
+        flow_coverage.push(FlowCoverageEntry::RelationShrinkage { count: shrunk });
+    }
+    if let Some(at) = truth.stopped_at {
+        flow_coverage.push(FlowCoverageEntry::CorrelationDegradation {
+            at: CorrelationStop::from(at),
+        });
+    }
+
+    let correlated = Correlated::new(relations);
 
     // Limits: the caller's budget mirrored, the chain's stated spend and
-    // stop, the strategy versions (none yet), the eviction state.
+    // stop, the strategy versions in effect, the eviction state.
     let limits = Limits::new(
         BudgetLimits::new(
             budget.deadline,
@@ -402,11 +476,14 @@ pub fn investigate_trace_bounded(
             walk.entities,
             walk.pages,
             walk.examinations,
+            truth.scan_spent,
             walk.stopped,
         ),
-        Vec::new(),
+        truth.strategy_versions,
         EvictionState::new(stats.resident_records, stats.total_evictions()),
     );
+
+    let execution = Execution::new(vec![spans_group, logs_group, points_group], flow_coverage);
 
     Ok(Investigation::new(
         Subject::new(requested, effective),

@@ -3,9 +3,9 @@
 //! Limits are the machine-checkable statement of what bounded the answer:
 //! the caller's budget ceilings, what the FLOW actually spent (page and
 //! entity totals, and an honest `stopped` marker when the flow's own chain
-//! limits stopped it), the correlation strategy versions in effect (none
-//! in M3 — reported, never invented), and the store's eviction state at
-//! flow admission.
+//! limits stopped it), the correlation strategy versions in effect (the
+//! committed strategies, reported in run order), the correlation engine's
+//! scan spend, and the store's eviction state at flow admission.
 
 use std::time::Duration;
 
@@ -54,6 +54,10 @@ pub struct ChainLimits {
     /// Residency positions the flow examined naming record identities
     /// (entity-id recovery walks), across all parts.
     pub identity_examinations: u64,
+    /// Residency positions the correlation engine examined across its
+    /// scan-work allowance, all strategies. The correlated part's spend,
+    /// stated beside the identity-recovery spend.
+    pub correlation_scan: u64,
     /// The basis on which the flow stopped, when it stopped on its own
     /// chain limits rather than completing. Everything before the stop is
     /// reported honestly; nothing after is claimed.
@@ -79,7 +83,8 @@ pub struct Limits {
     /// The flow's own chain-level limits and spend.
     pub chain: ChainLimits,
     /// The correlation strategy versions the answer's correlated part was
-    /// produced under. Empty in M3 (no strategy implemented) — reported.
+    /// produced under, in run order — the committed strategies' versions,
+    /// reported never invented.
     pub strategy_versions: Vec<StrategyVersion>,
     /// The store's eviction state at flow admission.
     pub eviction: EvictionState,
@@ -104,7 +109,6 @@ impl BudgetLimits {
         }
     }
 }
-
 impl ChainLimits {
     /// The flow's chain-level ceilings and spend.
     #[must_use]
@@ -114,6 +118,7 @@ impl ChainLimits {
         total_entities: u64,
         total_pages: u64,
         identity_examinations: u64,
+        correlation_scan: u64,
         stopped: Option<ChainBasis>,
     ) -> Self {
         Self {
@@ -122,6 +127,7 @@ impl ChainLimits {
             total_entities,
             total_pages,
             identity_examinations,
+            correlation_scan,
             stopped,
         }
     }

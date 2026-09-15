@@ -22,9 +22,11 @@
 //! [`flow`] module: given a root span and a caller budget, it composes the
 //! engine's pages into one envelope, decomposing the budget into fresh
 //! per-page engine budgets and reporting the chain-level limits it owns.
-//! The correlation engine is scaffolding only, so no strategy is
-//! implemented and the envelope's `correlated` part is a typed-but-empty
-//! list, reported honestly, never fabricated.
+//! The correlation engine's committed strategies — span identity, trace
+//! identity, temporal co-activity — are wired into the flow (issue #28):
+//! the envelope's `correlated` part is populated from the engine's run
+//! under the caller's budget, narrowed to evidence-resident endpoints.
+//!
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

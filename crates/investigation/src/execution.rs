@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use runtime_trail_correlation::bounds::StoppedAt;
 use runtime_trail_telemetry_model::{AdmissionTime, EntityId};
 
 /// Which budget dimension a run fact refers to. The five dimensions mirror
@@ -192,6 +193,40 @@ pub struct TimeWindow {
     pub to: u64,
 }
 
+/// Where the correlation engine's walk stopped, when it degraded rather
+/// than finishing the resident read. The envelope's own mirror of the
+/// engine's stop verdict — the execution part never leaks engine types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorrelationStop {
+    /// The run was bounded to zero hop depth.
+    MaxDepth {
+        /// The depth the run was bounded to.
+        depth: u8,
+    },
+    /// The scan-work allowance ran out.
+    ScanExhausted {
+        /// The resident positions examined before the allowance ran out.
+        examined: u64,
+    },
+    /// The relation ceiling cut the answer.
+    MaxRelations {
+        /// The ceiling the relations were cut at.
+        count: u64,
+    },
+}
+
+impl From<StoppedAt> for CorrelationStop {
+    /// The engine's stop verdict, mirrored verbatim into the envelope's
+    /// vocabulary.
+    fn from(stopped: StoppedAt) -> Self {
+        match stopped {
+            StoppedAt::MaxDepth { depth } => Self::MaxDepth { depth },
+            StoppedAt::ScanExhausted { examined } => Self::ScanExhausted { examined },
+            StoppedAt::MaxRelations { count } => Self::MaxRelations { count },
+        }
+    }
+}
+
 /// A flow-level coverage fact: something the FLOW had to account for that
 /// is not an engine walk fact. Kept distinct from [`CoverageEntry`] so the
 /// engine's voice and the flow's voice never blur.
@@ -220,6 +255,40 @@ pub enum FlowCoverageEntry {
         part: PartName,
         /// How many records were lost.
         count: u64,
+    },
+    /// A correlated relation the engine accounted and the flow held: a log
+    /// record attached to its exact span, whose trace-identity relations
+    /// were suppressed in that relation's favor. Accounting is scoped to
+    /// the log record and complete regardless of any run bound.
+    SuppressedEvidence {
+        /// The log record whose trace-identity relations were suppressed.
+        log: EntityId,
+        /// The exact span the log attached to.
+        span: EntityId,
+        /// The suppressed relations, counted.
+        suppressed: u64,
+    },
+    /// Completeness coverage: a log record whose trace has no resident
+    /// span, so no identity relation can name one of its members. Named,
+    /// never invented into a relation.
+    AbsentTraceSpans {
+        /// The log record whose trace has no resident span.
+        log: EntityId,
+    },
+    /// Correlated relations the flow dropped because an endpoint left the
+    /// evidence — the store reported it resident at scan time, but the
+    /// evidence part does not carry it. Named rather than hidden; the
+    /// envelope never emits a dangling signal ref (invariant 3).
+    RelationShrinkage {
+        /// How many relations were dropped.
+        count: u64,
+    },
+    /// Where the correlated part degraded, when the engine stopped before
+    /// finishing the resident read: the answer holds what it holds, and
+    /// the stop is stated.
+    CorrelationDegradation {
+        /// The stop the engine reported, mirrored.
+        at: CorrelationStop,
     },
 }
 

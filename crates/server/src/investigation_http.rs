@@ -11,10 +11,11 @@
 //!
 //! The answer is the investigation envelope rendered as JSON: subject
 //! (requested and effective, separately), execution (run facts per part,
-//! never fabricated), the correlated part (typed-but-empty in M3),
-//! evidence (waterfall spans, related logs and surrounding points with
-//! their entity ids), and limits (the admitted budget, the flow's chain
-//! spend and stops, and the store's eviction state at admission).
+//! never fabricated), the correlated part (relations from the committed
+//! correlation strategies), evidence (waterfall spans, related logs and
+//! surrounding points with their entity ids), and limits (the admitted
+//! budget, the flow's chain spend and stops, and the store's eviction
+//! state at admission).
 //!
 //! Budgets are not carried on the wire in M3 — the wire shapes of later
 //! phases stay unclaimed; the adapter admits the server-side default
@@ -49,8 +50,8 @@ use runtime_trail_investigation::evidence::{
     Evidence, LogEvidence, PointEvidence, SignalKind, SignalRef, SpanEvidence,
 };
 use runtime_trail_investigation::execution::{
-    CoverageEntry, Dimension, FlowCoverageEntry, Magnitude, Outcome, PartName, Refusal, RunFacts,
-    RunGroup, TimeWindow, Truncation, TruncationPoint,
+    CorrelationStop, CoverageEntry, Dimension, FlowCoverageEntry, Magnitude, Outcome, PartName,
+    Refusal, RunFacts, RunGroup, TimeWindow, Truncation, TruncationPoint,
 };
 use runtime_trail_investigation::limits::ChainBasis;
 use runtime_trail_investigation::subject::{EffectiveRoot, ResolutionNote};
@@ -159,7 +160,7 @@ pub(crate) async fn investigate_trace_http(
     let store = runtime.lock_store();
     match investigate_trace_bounded(
         &**store,
-        &TraceInvestigationRequest::new(root_span, budget),
+        &TraceInvestigationRequest::new(root_span, budget, None),
         chain,
     ) {
         Ok(envelope) => Json(render_investigation(&envelope)).into_response(),
@@ -446,6 +447,31 @@ fn render_flow_coverage(entry: &FlowCoverageEntry) -> JsonValue {
             "part": render_part(part),
             "count": count,
         }),
+        FlowCoverageEntry::SuppressedEvidence {
+            log,
+            span,
+            suppressed,
+        } => json!({
+            "kind": "suppressed_evidence",
+            "log": render_entity(log),
+            "span": render_entity(span),
+            "suppressed": suppressed,
+        }),
+        FlowCoverageEntry::AbsentTraceSpans { log } => json!({
+            "kind": "absent_trace_spans",
+            "log": render_entity(log),
+        }),
+        FlowCoverageEntry::RelationShrinkage { count } => {
+            json!({ "kind": "relation_shrinkage", "count": count })
+        }
+        FlowCoverageEntry::CorrelationDegradation { at } => {
+            let (kind, value): (&str, u64) = match at {
+                CorrelationStop::MaxDepth { depth } => ("max_depth", u64::from(*depth)),
+                CorrelationStop::ScanExhausted { examined } => ("scan_exhausted", *examined),
+                CorrelationStop::MaxRelations { count } => ("max_relations", *count),
+            };
+            json!({ "kind": "correlation_degradation", "at": { "kind": kind, "value": value } })
+        }
     }
 }
 
@@ -471,12 +497,12 @@ fn render_correlated(
 
 fn render_relation(relation: &Relation) -> JsonValue {
     json!({
-        "type": render_relation_type(&relation.relation_type),
+        "type": render_relation_type(relation.relation_type),
         "from": render_signal_ref(&relation.from),
         "to": render_signal_ref(&relation.to),
         "facts": relation.facts.iter().map(render_fact).collect::<Vec<_>>(),
         "strategy": render_strategy(&relation.strategy),
-        "window": relation.window.as_ref().map(render_window),
+        "window": relation.window.as_ref().map(|window| render_window(&TimeWindow::from(*window))),
     })
 }
 
@@ -494,9 +520,8 @@ fn render_signal_kind(kind: &SignalKind) -> &'static str {
         SignalKind::MetricPoints => "metric_points",
     }
 }
-
 fn render_relation_type(
-    relation_type: &runtime_trail_investigation::correlated::RelationType,
+    relation_type: runtime_trail_investigation::correlated::RelationType,
 ) -> &'static str {
     match relation_type {
         runtime_trail_investigation::correlated::RelationType::SpanIdentity => "span_identity",
