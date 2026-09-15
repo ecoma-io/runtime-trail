@@ -31,3 +31,17 @@ pub mod filters;
 pub mod order;
 pub mod result;
 pub mod spend;
+
+// The storage contract, re-exported as the facade (ADR 0011, decision 4):
+// this crate is the only reader of the storage contract among the core
+// crates, so layer-api names the store trait as
+// `runtime_trail_query::TelemetryStore` — and the storage-owned types the
+// trait's signature mentions — and never declares a storage edge of its
+// own. `Admitted` is the model's wrapper (ADR 0006) and comes from the
+// model root. The re-export is the contract surface; the trait itself
+// stays owned by `runtime-trail-storage` (ADR 0003: only layer-app names
+// concrete drivers, and the engine and its callers program against this
+// facade).
+pub use runtime_trail_storage::{
+    AdmissionKey, KeepOutcome, PointView, ScanItem, ScanPage, StoreStats, TelemetryStore,
+};
