@@ -238,15 +238,39 @@ async fn serve_runtime(
     let router = build_router(Arc::clone(&runtime), config);
     tracing::info!(bind = %listener.local_addr()?, "runtime-trail core listening");
     let drain_runtime = Arc::clone(&runtime);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            // Draining starts the moment the stop is requested, not when
-            // the last socket closes: new telemetry must meet the closing
-            // answer immediately, and the pump gets its full deadline.
-            drain_runtime.begin_drain();
-        })
-        .await?;
+    // The drain deadline is anchored at the stop's ARRIVAL, not at serve
+    // start: an in-flight connection cannot extend the shutdown past the
+    // contract (runtime-constraints.md, "Drain deadline" ≤ 5 s) — when the
+    // deadline expires the serve loop is dropped and whatever is still in
+    // flight is cut, observably.
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                // Draining starts the moment the stop is requested, not
+                // when the last socket closes: new telemetry must meet the
+                // closing answer immediately, and the pump gets its full
+                // deadline.
+                drain_runtime.begin_drain();
+                let _ = drained_tx.send(());
+            })
+            .await
+    };
+    tokio::pin!(graceful);
+    tokio::select! {
+        biased;
+        result = &mut graceful => result?,
+        () = async {
+            let _ = drained_rx.await;
+            tokio::time::sleep(DRAIN_DEADLINE).await;
+        } => {
+            tracing::warn!(
+                deadline_secs = DRAIN_DEADLINE.as_secs(),
+                "drain deadline reached: in-flight connections are cut at process exit"
+            );
+        }
+    }
     Ok(runtime.shutdown())
 }
 
@@ -712,6 +736,68 @@ mod tests {
             .expect("the server task joins")
             .expect("the server serves cleanly");
         assert_eq!(summary.kept, 0, "no telemetry was exported");
+    }
+
+    /// Shutdown is bounded by the drain deadline (issue #14): an in-flight
+    /// request whose body still drips in when the stop arrives cannot
+    /// extend the shutdown past the contract's 5 s — the server task joins
+    /// within the deadline plus slack, then cuts what is still in flight.
+    #[tokio::test]
+    async fn shutdown_is_bounded_by_the_drain_deadline() {
+        use tokio::io::AsyncWriteExt;
+
+        let bind = free_bind();
+        let (trigger, gate) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_shutdown(
+            ServerConfig {
+                bind,
+                web_dist: None,
+            },
+            async move {
+                let _ = gate.await;
+            },
+        ));
+
+        let mut stream = open_connection(bind).await;
+        // A body under the payload ceiling, drip-fed one byte at a time: a
+        // slow-drip client that would eventually hit the 10 s body read
+        // timeout (408), but is still in flight when the drain deadline —
+        // anchored at the stop's arrival — expires first.
+        let request = "POST /v1/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-protobuf\r\nContent-Length: 1024\r\n\r\n";
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request head writes");
+        for _ in 0..2 {
+            stream.write_all(b"x").await.expect("the drip writes");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        trigger.send(()).expect("the server is still running");
+
+        // Keep dripping while the server drains; writes after the deadline
+        // cuts the connection fail and are ignored — the drip only exists
+        // to keep the request in flight past the deadline.
+        let joined = tokio::time::timeout(Duration::from_secs(8), async {
+            let drip = async {
+                for _ in 0..14 {
+                    let _ = stream.write_all(b"x").await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            };
+            tokio::pin!(drip);
+            tokio::select! {
+                biased;
+                joined = server => joined,
+                () = drip => unreachable!("the drip outlives the join race"),
+            }
+        })
+        .await;
+        let _summary = joined
+            .expect(
+                "shutdown is not bounded by the drain deadline: the server still held the in-flight body after 8 s",
+            )
+            .expect("the server task joins")
+            .expect("the server serves cleanly");
     }
 
     /// The index page is honest about what is and is not served: ingestion
