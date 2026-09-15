@@ -668,7 +668,7 @@ impl CoreRuntime {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_store(&self) -> MutexGuard<'_, Box<dyn TelemetryStore>> {
+    pub(crate) fn lock_store(&self) -> MutexGuard<'_, Box<dyn TelemetryStore>> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
