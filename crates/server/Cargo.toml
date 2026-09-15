@@ -14,7 +14,7 @@ runtime-trail-storage = { workspace = true }
 runtime-trail-storage-memory = { workspace = true }
 runtime-trail-telemetry-ingestion = { workspace = true }
 runtime-trail-telemetry-model = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["http2"] } # gRPC-over-HTTP2 needs the server's HTTP/2 support (not in axum's default features)
 # The gRPC passthrough codec hands the OTLP frame's payload to the pipeline
 # as borrowed transport bytes (zero-copy); `bytes::Bytes` is the type the
 # whole admission path (queue, store) accounts with.
