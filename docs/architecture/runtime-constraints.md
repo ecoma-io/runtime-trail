@@ -61,6 +61,7 @@ above).
 | In-flight per queue                         | ≤ 64 MiB accounted                                  | the bounded ingestion→store hand-off queue ([backpressure](#the-backpressure-architecture)); overflow = reject the producer — the one transient, retryable signal                                                                                                   |
 | In-flight request body (transport edge)     | ≤ 64 MiB                                            | aggregate bytes being buffered at the OTLP transports before admission ([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)); overflow = reject the producer (429 / gRPC `RESOURCE_EXHAUSTED`) — transient, retryable, alongside queue saturation |
 | Request body read timeout                   | ≤ 10 s                                              | one OTLP body arriving over either transport; a stuck/drip client is refused (408 / gRPC `DEADLINE_EXCEEDED`) so no single body holds its buffered bytes indefinitely                                                                                               |
+| Concurrent connections                      | ≤ 256                                               | concurrently accepted sockets at the transport edge, enforced at the accept seam ([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)); when the cap is exhausted further sockets queue in the kernel backlog, unserved, until a slot frees       |
 | Memory-mode retention ceilings              | 2,000,000 records · 256 MiB accounted · 24 h window | eviction per the [retention law](storage-model.md); first ceiling hit wins                                                                                                                                                                                          |
 | File-mode retention ceilings                | 5,000,000 records · 1 GiB accounted · 7 d window    | same law, durable                                                                                                                                                                                                                                                   |
 | Drain deadline                              | ≤ 5 s                                               | SIGTERM: bounds shutdown **latency**, not completeness — in-flight drains best-effort; whatever misses is dropped observably                                                                                                                                        |
@@ -157,6 +158,16 @@ before the budget is charged, so the wire answer never depends on how hot
 the budget happens to be. Both transport edges and the queue share the
 retryable-transient 429 family; the wire shapes stay the contracted ones
 below.
+
+The gRPC reader bounds one frame to `payload_ceiling +
+GRPC_DECODING_SLACK_BYTES` — 8 KiB of deliberate codec slack above the
+nominal ceiling — so a payload past the ceiling is refused at the reader
+with the over-ceiling gRPC mapping (`INVALID_ARGUMENT`, naming the
+ceiling), never HTTP 413, which stays the HTTP transport's
+declared-length refusal. The slack means a byte-exact ceiling payload is
+never refused by reader leniency; the over-ceiling tests
+(`over_ceiling_payload…`, `a_frame_beyond_the_read_deadline…`) pin the
+honesty of that boundary.
 
 ### Ownership law
 

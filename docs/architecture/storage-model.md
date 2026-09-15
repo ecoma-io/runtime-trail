@@ -104,9 +104,10 @@ never truncated and never silently clipped.
 
 **The store owns no clock.** Window expiry is evaluated against the
 composition root's reading of time (`enforce_retention(now)`); the
-composition root therefore owns the retention timer and must call it
-periodically — at a granularity well inside the shortest configured
-window — so an idle session still expires records. Ceilings on records
+composition root therefore owns the retention timer and runs it on the
+window's own cadence — one pass every half-window, clamped to at least
+one second and at most one minute — well inside the shortest configured
+window, so an idle session still expires records. Ceilings on records
 and bytes bound memory while idle regardless; the timer exists so the
 _window_ stays truthful, not to prevent unbounded growth.
 

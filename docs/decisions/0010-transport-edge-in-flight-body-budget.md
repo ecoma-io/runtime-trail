@@ -61,7 +61,8 @@ indefinitely.**
 1. **An aggregate in-flight body budget**, shared by both transports, that
    counts request bodies being buffered at the transport edge (before
    admission) and refuses new buffering once the aggregate exceeds a named,
-   startup-configurable bound. The default is derived from the queue ceiling:
+   RuntimeConfig-configurable bound — the operator CLI surface for it is
+   deferred to Phase 5. The default is derived from the queue ceiling:
    **64 MiB aggregate in-flight body bytes** — one queue ceiling's worth, the
    same order as the "In-flight per queue" row in
    [runtime-constraints.md](../architecture/runtime-constraints.md). Naming it
@@ -100,6 +101,16 @@ indefinitely.**
    gate before its body is read, so it never enters a body-read timeout.
 5. **The bound holds for every bind address.** The budget is on the runtime
    graph, not the listener; `0.0.0.0` shares the same gate as loopback.
+6. **A connection cap at the accept seam.** `RuntimeConfig::max_connections`
+   (default **256**) bounds concurrently accepted sockets. Each accepted
+   connection holds an owned semaphore permit for exactly as long as its
+   socket lives, and a connection is accepted only once a permit is
+   available — so when the cap is exhausted `accept` pends and further
+   sockets queue in the kernel backlog, unserved, until a slot frees. The
+   cap therefore bounds every connection-shaped resource (file descriptors,
+   per-connection tasks, buffered request heads) no matter how many sockets
+   the OS admits, while the in-flight body budget (item 1) bounds the bytes
+   those sockets can buffer.
 
 ### Mechanism (per transport)
 
@@ -122,10 +133,11 @@ indefinitely.**
 
 ## Consequences
 
-- **Bounded transport-edge memory by construction:** at most 64 MiB of request
-  bodies buffering at once (the named, startup-configurable budget), and each
-  body held for at most 10 s. Combined with the queue ceiling and retention
-  ceilings, every memory domain of an overloaded session is bounded.
+- **Bounded transport-edge memory by construction:** at most 64 MiB of
+  request bodies buffering at once (the named, RuntimeConfig-configurable
+  budget), and each body held for at most 10 s. Combined with the queue
+  ceiling and retention ceilings, every memory domain of an overloaded
+  session is bounded.
 - **Honest refusal ordering preserved:** the existing gates (draining 503 →
   content-type 415 → declared-over-ceiling 413 → bounded read) keep their
   precedence; the aggregate answers only where no earlier gate owns the
@@ -137,8 +149,12 @@ indefinitely.**
   sees no change; the 429/`RESOURCE_EXHAUSTED` and 408/`DEADLINE_EXCEEDED`
   answers are new refuse-shapes for the misbehaving cases the finding names.
 - **Numbers are named, not magic:** `inflight_body_ceiling_bytes` defaults to
-  one queue ceiling (64 MiB) and `body_read_timeout` to 10 s, both
-  startup-configurable and both rows in
+  RuntimeConfig-configurable and both rows in
   [runtime-constraints.md](../architecture/runtime-constraints.md).
+- **The connection cap is an orthogonal sixth bound:** in-flight body bytes
+  are capped by charge (item 1); concurrently served sockets are capped by
+  `max_connections` — a scale the admission gates never saw. The default 256
+  keeps existing behavior for realistic SDK fan-out, and the kernel backlog
+  absorbs overflow without dropping the sockets.
 - The budget is shared between HTTP and gRPC — one aggregate for the whole
   transport edge, not two independently unbounded pools.

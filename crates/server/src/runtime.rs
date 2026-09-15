@@ -65,14 +65,15 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// arriving mid-poll is picked up on the next iteration.
 const PUMP_IDLE_POLL: Duration = Duration::from_millis(200);
 
-/// How often the composition root runs the retention law against the
-/// store.
+/// The retention timer's slowest legal cadence: the upper clamp for
+/// [`retention_tick_period`] (issue #17).
 ///
 /// The store owns no clock (`docs/architecture/storage-model.md`,
 /// "The store owns no clock"): the composition root owns the timer and
 /// must call it periodically "at a granularity well inside the shortest
-/// configured window". The default window is 24 h, so 60 s is well inside
-/// it by two orders of magnitude while costing one no-op pass a minute.
+/// configured window". For the default 24 h window, 60 s — half of it
+/// clamped down — is well inside by two orders of magnitude while
+/// costing one no-op pass a minute; no window needs a slower cadence.
 const RETENTION_TICK_PERIOD: Duration = Duration::from_secs(60);
 
 /// Where the runtime's time comes from.
@@ -180,6 +181,14 @@ pub struct RuntimeConfig {
     /// body that has not arrived in full within this bound is refused so a
     /// single slow-drip client cannot hold its buffered bytes indefinitely.
     pub body_read_timeout: Duration,
+    /// The maximum number of concurrently accepted connections, enforced at
+    /// the accept seam ([ADR 0010](../docs/decisions/0010-transport-edge-in-flight-body-budget.md)):
+    /// each accepted connection holds an owned semaphore permit for exactly
+    /// as long as its socket lives, and when the cap is exhausted `accept`
+    /// pends so the kernel backlog bounds pending sockets. Default 256 — the
+    /// "Concurrent connections" row of
+    /// `docs/architecture/runtime-constraints.md`.
+    pub max_connections: usize,
     /// Where admission times come from. Production:
     /// [`SystemWallClock`].
     pub clock: Box<dyn WallClock>,
@@ -196,6 +205,7 @@ impl Default for RuntimeConfig {
             queue_ceiling_bytes: QUEUE_CEILING_BYTES,
             inflight_body_ceiling_bytes: QUEUE_CEILING_BYTES,
             body_read_timeout: BODY_READ_TIMEOUT,
+            max_connections: 256,
             clock: Box::new(SystemWallClock),
         }
     }
@@ -404,6 +414,8 @@ pub struct CoreRuntime {
     /// [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
     transport_guard: Arc<InflightBodyBudget>,
     body_read_timeout: Duration,
+    max_connections: usize,
+    retention_tick: Duration,
     workers: Mutex<Option<Workers>>,
 }
 
@@ -445,6 +457,7 @@ impl CoreRuntime {
             releaser: pipeline.ledger_releaser(),
             refused_forwards: Arc::clone(&refused_forwards),
         };
+        let retention_tick = retention_tick_period(config.store.admission_window);
         let store: Box<dyn TelemetryStore> =
             Box::new(InMemoryStore::new(config.store, Some(Box::new(hook))));
         let runtime = Arc::new(Self {
@@ -459,6 +472,8 @@ impl CoreRuntime {
             grpc_decoding_ceiling_bytes,
             transport_guard: Arc::new(InflightBodyBudget::new(config.inflight_body_ceiling_bytes)),
             body_read_timeout: config.body_read_timeout,
+            max_connections: config.max_connections,
+            retention_tick,
             workers: Mutex::new(None),
         });
         runtime.spawn_workers();
@@ -550,6 +565,13 @@ impl CoreRuntime {
     #[must_use]
     pub(crate) fn body_read_timeout(&self) -> Duration {
         self.body_read_timeout
+    }
+
+    /// The maximum number of concurrently accepted connections, enforced at
+    /// the accept seam ([ADR 0010](../../docs/decisions/0010-transport-edge-in-flight-body-budget.md)).
+    #[must_use]
+    pub(crate) fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     /// The admission clock's next reading: the `admitted_at` every
@@ -794,14 +816,23 @@ pub fn retention_tick(store: &mut dyn TelemetryStore, now: AdmissionTime) -> u64
     evicted
 }
 
-/// The retention timer: one tick per [`RETENTION_TICK_PERIOD`], until the
-/// runtime stops.
+/// The retention timer's cadence: half the admission window, clamped to
+/// at least one second and at most [`RETENTION_TICK_PERIOD`] — a short
+/// window (tests, demos) ticks promptly, a long one keeps the
+/// one-pass-a-minute cadence. Half the window is "well inside the
+/// shortest configured window" for every legal window (issue #17).
+fn retention_tick_period(window: Duration) -> Duration {
+    (window / 2).clamp(Duration::from_secs(1), RETENTION_TICK_PERIOD)
+}
+
+/// The retention timer: one pass per the window-derived cadence
+/// ([`retention_tick_period`]), until the runtime stops.
 fn retention_loop(runtime: &CoreRuntime, stop: &(Mutex<bool>, Condvar)) {
     let (flag, signal) = stop;
     let mut stopping = flag.lock().unwrap_or_else(PoisonError::into_inner);
     while !*stopping {
         let (guard, _timed_out) = signal
-            .wait_timeout(stopping, RETENTION_TICK_PERIOD)
+            .wait_timeout(stopping, runtime.retention_tick)
             .unwrap_or_else(PoisonError::into_inner);
         stopping = guard;
         if *stopping {
@@ -1096,6 +1127,49 @@ mod tests {
             1
         );
         assert_eq!(store.stats().resident_records, 0);
+    }
+
+    /// Issue #17: the retention timer ticks on the admission window's own
+    /// cadence (half the window, clamped to the 60 s ceiling) — a short
+    /// window gets a prompt pass instead of waiting out the default
+    /// period, which would strand records outside the window until the
+    /// next minute boundary.
+    #[test]
+    fn the_retention_timer_follows_the_admission_window() {
+        let runtime = CoreRuntime::build(RuntimeConfig {
+            store: MemoryConfig {
+                admission_window: Duration::from_secs(2),
+                ..MemoryConfig::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("a short admission window is buildable");
+        let at = AdmissionTime::from_unix_nano(1_000);
+        runtime
+            .pipeline()
+            .ingest_spans(at, &one_span_export(fx::T1, fx::S1))
+            .expect("the one-span export is admitted");
+        wait_for_pump(&runtime, |summary| summary.kept == 1);
+
+        // Half of a 2 s window is a 1 s tick: the record leaves the store
+        // well inside the poll budget. With the old fixed 60 s cadence it
+        // would still be resident when the budget runs out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runtime.store_stats().resident_records > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retention timer ignored the 2 s admission window (fixed 60 s tick?)"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The drain deadline starts already spent so the shutdown's pump
+        // join does not wait out the full drain deadline on an empty queue.
+        runtime.begin_drain_deadline(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("a past instant on any running system"),
+        );
+        runtime.shutdown();
     }
 
     /// The drain path: shutdown refuses new telemetry, drains what it can

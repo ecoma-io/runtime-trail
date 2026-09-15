@@ -18,11 +18,12 @@
 //! bytes, so an empty export is `OK` with an empty `partial_success` —
 //! never an internal error.
 //!
-//! Two answers are protocol gates, not admission signals: a request whose
+//! Two refusals sit at the edge: a draining runtime answers every export
+//! with `UNAVAILABLE` before any protocol gate — so a probe never
+//! misreads drain as a media-type problem — and a request whose
 //! content-type does not begin with `application/grpc` is refused with
 //! HTTP 415 before the body is read (the gRPC-over-HTTP2 spec's rule,
-//! quoted at [`is_grpc_content_type`]), and a draining runtime refuses an
-//! export before its frame is buffered — still `UNAVAILABLE`.
+//! quoted at [`is_grpc_content_type`]).
 //!
 //! The wire behaviour of every refusal is the backpressure architecture's
 //! contract (runtime-constraints.md; the signal table in the ingestion
@@ -451,17 +452,20 @@ impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
-        if !is_grpc_content_type(req.headers()) {
-            return Box::pin(std::future::ready(Ok(unsupported_media_type(
-                req.uri().path(),
-            ))));
-        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
                     if runtime.is_draining() {
                         return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
+                    // The closing signal outranks the protocol gate: a
+                    // draining runtime answers UNAVAILABLE even to a
+                    // request the content-type check would refuse with
+                    // 415, so a probe never misreads drain as a media-type
+                    // problem. (Issue #15.)
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(req.uri().path()));
                     }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportTraceServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
@@ -480,7 +484,12 @@ impl Service<http::Request<axum::body::Body>> for TraceServiceServer {
                     )
                     .await)
                 }
-                path => Ok(unimplemented_response(path)),
+                path => {
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(path));
+                    }
+                    Ok(unimplemented_response(path))
+                }
             }
         })
     }
@@ -508,17 +517,17 @@ impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
-        if !is_grpc_content_type(req.headers()) {
-            return Box::pin(std::future::ready(Ok(unsupported_media_type(
-                req.uri().path(),
-            ))));
-        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
                     if runtime.is_draining() {
                         return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
+                    // The closing signal outranks the protocol gate (the
+                    // same ordering as the trace service; issue #15).
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(req.uri().path()));
                     }
                     let mut grpc =
                         Grpc::new(PassthroughCodec::<ExportMetricsServiceResponse>::new())
@@ -538,7 +547,12 @@ impl Service<http::Request<axum::body::Body>> for MetricsServiceServer {
                     )
                     .await)
                 }
-                path => Ok(unimplemented_response(path)),
+                path => {
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(path));
+                    }
+                    Ok(unimplemented_response(path))
+                }
             }
         })
     }
@@ -566,17 +580,17 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
     }
 
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
-        if !is_grpc_content_type(req.headers()) {
-            return Box::pin(std::future::ready(Ok(unsupported_media_type(
-                req.uri().path(),
-            ))));
-        }
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             match req.uri().path() {
                 EXPORT_METHOD => {
                     if runtime.is_draining() {
                         return Ok(signal_to_status(AdmissionSignal::Draining).into_http());
+                    }
+                    // The closing signal outranks the protocol gate (the
+                    // same ordering as the trace service; issue #15).
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(req.uri().path()));
                     }
                     let mut grpc = Grpc::new(PassthroughCodec::<ExportLogsServiceResponse>::new())
                         .max_decoding_message_size(runtime.grpc_decoding_ceiling_bytes());
@@ -595,7 +609,12 @@ impl Service<http::Request<axum::body::Body>> for LogsServiceServer {
                     )
                     .await)
                 }
-                path => Ok(unimplemented_response(path)),
+                path => {
+                    if !is_grpc_content_type(req.headers()) {
+                        return Ok(unsupported_media_type(path));
+                    }
+                    Ok(unimplemented_response(path))
+                }
             }
         })
     }
@@ -849,6 +868,7 @@ mod tests {
             queue_ceiling_bytes: 4096,
             inflight_body_ceiling_bytes: 1024 * 1024,
             body_read_timeout: Duration::from_secs(10),
+            max_connections: 256,
             clock: Box::new(crate::runtime::SystemWallClock),
         }
     }
@@ -954,6 +974,40 @@ mod tests {
         )
         .await;
         assert_eq!(answer.code, Some(14), "UNAVAILABLE");
+        assert!(
+            answer.message.contains("draining"),
+            "the closing signal says so: {:?}",
+            answer.message
+        );
+        runtime.shutdown();
+    }
+
+    /// Issue #15: a draining runtime answers `UNAVAILABLE` even to a
+    /// request that would otherwise be refused by the gRPC content-type
+    /// gate — the closing signal outranks the protocol gate, so a probe
+    /// never misreads drain as a media-type problem.
+    #[tokio::test]
+    async fn draining_runtime_answers_unavailable_before_the_content_type_gate() {
+        let runtime = test_support::runtime();
+        runtime.begin_drain();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(TRACE_EXPORT)
+            .header("content-type", "application/json")
+            .body(Body::from(br#"{"resourceSpans":[]}"#.to_vec()))
+            .expect("a static request builds");
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("the router answers every request");
+        let answer = answer(response).await;
+        assert_eq!(
+            answer.code,
+            Some(14),
+            "UNAVAILABLE even past the content-type gate"
+        );
         assert!(
             answer.message.contains("draining"),
             "the closing signal says so: {:?}",
