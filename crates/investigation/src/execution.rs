@@ -290,6 +290,14 @@ pub enum FlowCoverageEntry {
         /// The stop the engine reported, mirrored.
         at: CorrelationStop,
     },
+    /// A committed strategy that did not run, named with the reason: the
+    /// temporal co-activity strategy requires the caller's explicit
+    /// window, and the runtime picks no window by default. The skip is a
+    /// coverage fact, never a silent absence.
+    TemporalStrategySkipped {
+        /// Why the strategy did not run.
+        reason: &'static str,
+    },
 }
 
 /// The envelope's execution part.

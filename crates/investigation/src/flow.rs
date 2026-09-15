@@ -123,9 +123,10 @@ impl InvestigationBudget {
     }
 }
 
-/// A trace investigation request: the root span to investigate, the
-/// budget the caller admits for the whole flow, and an optional
-/// correlation window (defaults to the waterfall extent when absent).
+/// A trace investigation request: the root span to investigate and the
+/// budget the caller admits for the whole flow. An optional correlation
+/// window enables the temporal co-activity strategy; without one the
+/// runtime picks no window and the identity strategies run alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraceInvestigationRequest {
     /// The subject the caller asks about: the root span's entity id. The
@@ -135,8 +136,10 @@ pub struct TraceInvestigationRequest {
     /// The caller's budget for the whole investigation.
     pub budget: InvestigationBudget,
     /// An optional correlation window: the half-open time range the
-    /// temporal co-activity strategy scans inside. `None` defaults to the
-    /// waterfall's extent (the asked window).
+    /// temporal co-activity strategy scans inside. `Some(window)` enables
+    /// temporal co-activity within `window`; `None` skips the temporal
+    /// strategy — the runtime picks no window by default — and the
+    /// identity strategies run alone.
     pub correlation_window: Option<TimeWindow>,
 }
 
@@ -399,16 +402,28 @@ pub fn investigate_trace_bounded(
     // Correlated: run the committed strategies within the store, narrow
     // the relations to evidence-resident endpoints (invariant 3), and
     // account the engine's truth in the flow coverage and limits.
-    let correlation_window = Some(Into::into(
-        request.correlation_window.unwrap_or(asked_window),
-    ));
+    //
+    // The temporal strategy needs the caller's explicit window; without
+    // one the runtime picks no window (correlation-model.md), runs the
+    // identity strategies only, and names the skip in the coverage.
+    let (strategies, window) = if let Some(asked) = request.correlation_window {
+        (
+            vec![
+                Strategy::SpanIdentity,
+                Strategy::TraceIdentity,
+                Strategy::TemporalCoActivity,
+            ],
+            Some(Into::into(asked)),
+        )
+    } else {
+        flow_coverage.push(FlowCoverageEntry::TemporalStrategySkipped {
+            reason: "no_correlation_window",
+        });
+        (vec![Strategy::SpanIdentity, Strategy::TraceIdentity], None)
+    };
     let bounds = CorrelationBounds {
-        strategies: vec![
-            Strategy::SpanIdentity,
-            Strategy::TraceIdentity,
-            Strategy::TemporalCoActivity,
-        ],
-        window: correlation_window,
+        strategies,
+        window,
         max_relations: 10_000,
         max_hops: 2,
         max_scan: budget.max_scan,

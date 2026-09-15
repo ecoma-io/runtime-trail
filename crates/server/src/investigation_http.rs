@@ -472,6 +472,9 @@ fn render_flow_coverage(entry: &FlowCoverageEntry) -> JsonValue {
             };
             json!({ "kind": "correlation_degradation", "at": { "kind": kind, "value": value } })
         }
+        FlowCoverageEntry::TemporalStrategySkipped { reason } => {
+            json!({ "kind": "temporal_strategy_skipped", "reason": reason })
+        }
     }
 }
 

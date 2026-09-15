@@ -504,7 +504,7 @@ fn a_complete_trace_investigation_composes_all_parts() {
 
     let envelope = investigate_trace(
         &store,
-        TraceInvestigationRequest::new(root, open_budget(), None),
+        TraceInvestigationRequest::new(root, open_budget(), Some(TimeWindow { from: 10, to: 40 })),
     )
     .expect("the fixture trace investigates");
 
@@ -686,6 +686,66 @@ fn a_complete_trace_investigation_composes_all_parts() {
     assert!(invariants::run_facts_are_consistent(&envelope));
     assert!(invariants::metric_window_is_stated(&envelope));
     assert!(invariants::no_partial_content_as_complete(&envelope));
+}
+
+#[test]
+fn without_a_correlation_window_the_temporal_strategy_is_skipped() {
+    let store = trace_store();
+    let root = span_entity(TRACE, 1);
+
+    let envelope = investigate_trace(
+        &store,
+        TraceInvestigationRequest::new(root, open_budget(), None),
+    )
+    .expect("the fixture trace investigates");
+
+    // Without a caller-supplied window the runtime picks no window
+    // (correlation-model.md): the identity strategies run, the temporal
+    // strategy is skipped and the skip is a named coverage fact.
+    let types: Vec<RelationType> = envelope
+        .correlated
+        .relations
+        .iter()
+        .map(|relation| relation.relation_type)
+        .collect();
+    assert_eq!(
+        types,
+        vec![RelationType::SpanIdentity, RelationType::SpanIdentity]
+    );
+    assert!(
+        !envelope
+            .correlated
+            .relations
+            .iter()
+            .any(|relation| relation.relation_type == RelationType::TemporalCoActivity),
+        "no temporal relations without a caller window"
+    );
+    let skips: Vec<&FlowCoverageEntry> = envelope
+        .execution
+        .flow_coverage
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                FlowCoverageEntry::TemporalStrategySkipped {
+                    reason: "no_correlation_window"
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        skips.len(),
+        1,
+        "the skipped temporal strategy is named exactly once"
+    );
+    let strategy_names: Vec<&str> = envelope
+        .limits
+        .strategy_versions
+        .iter()
+        .map(|version| version.name.as_str())
+        .collect();
+    assert_eq!(strategy_names, ["span_identity", "trace_identity"]);
+    assert!(invariants::violations(&envelope).is_empty());
 }
 
 #[test]
