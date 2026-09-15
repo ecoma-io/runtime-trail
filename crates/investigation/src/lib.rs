@@ -18,9 +18,12 @@
 //! correlated, evidence, limits — and the seven invariants of
 //! `docs/architecture/investigation-model.md` are mechanically checkable
 //! through [`envelope::invariants`]. The committed flow — the trace
-//! investigation composing the query engine — is the [`flow`] module's
-//! deliverable; the correlation engine is scaffolding only, so no strategy
-//! is implemented and the envelope's `correlated` part is a typed-but-empty
+//! investigation composing the query engine — is implemented in the
+//! [`flow`] module: given a root span and a caller budget, it composes the
+//! engine's pages into one envelope, decomposing the budget into fresh
+//! per-page engine budgets and reporting the chain-level limits it owns.
+//! The correlation engine is scaffolding only, so no strategy is
+//! implemented and the envelope's `correlated` part is a typed-but-empty
 //! list, reported honestly, never fabricated.
 
 /// This crate's version, as declared in its manifest.
@@ -30,6 +33,7 @@ pub mod correlated;
 pub mod envelope;
 pub mod evidence;
 pub mod execution;
+pub mod flow;
 pub mod limits;
 pub mod subject;
 
@@ -37,6 +41,10 @@ pub use correlated::Correlated;
 pub use envelope::{FIELD_PATHS, Investigation};
 pub use evidence::Evidence;
 pub use execution::Execution;
+pub use flow::{
+    ChainBudget, FlowError, InvestigationBudget, TraceInvestigationRequest, investigate_trace,
+    investigate_trace_bounded,
+};
 pub use limits::Limits;
 pub use subject::Subject;
 

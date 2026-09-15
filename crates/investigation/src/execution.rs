@@ -184,7 +184,7 @@ pub struct RunGroup {
 
 /// A half-open time window `[from, to)` over `time_unix_nano`, the metric
 /// surface's clock.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeWindow {
     /// Window start, inclusive.
     pub from: u64,
