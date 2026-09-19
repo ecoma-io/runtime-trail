@@ -628,6 +628,14 @@ fn surrounding_metrics(
 /// the pages are exhausted or the chain stops. Every page is mirrored into
 /// a run fact — outcome, coverage, next cursor — exactly as the engine
 /// reported it.
+///
+/// A continuation that hands back the very cursor it was presented advanced
+/// nothing: the engine's cursors are strictly monotonic, so no conforming
+/// driver can produce this (issue #58's wedge — a byte wall re-presenting
+/// its own anchor). Only a contract-violating driver can, and re-presenting
+/// it would repeat the identical page forever. The no-progress guard ends
+/// the part on that page — mirrored like any other run — instead of
+/// burning the chain.
 fn walk_pages(
     store: &dyn TelemetryStore,
     query: &RecordsQuery,
@@ -656,10 +664,18 @@ fn walk_pages(
         runs.push(mirror_page(&page)?);
         let page_cursor = page.next_cursor;
         items.extend(page.items);
-        match page_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+        let Some(next) = page_cursor else {
+            break;
+        };
+        // No-progress guard: the page was handed the very cursor it mints
+        // back — it advanced nothing, and re-presenting it would loop on
+        // the identical page until a chain ceiling stops the walk. The
+        // page is already mirrored (a real engine run, never swallowed);
+        // the part simply ends here and the chain moves on.
+        if cursor.as_deref() == Some(next.as_slice()) {
+            break;
         }
+        cursor = Some(next);
     }
     Ok((items, RunGroup { part, runs }))
 }

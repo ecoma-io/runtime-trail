@@ -281,11 +281,13 @@ fn evidence_of(record: &RecordView) -> u64 {
 }
 
 /// The state of the counting walk a byte-ceiling wall starts: how many
-/// records so far would not fit within what the ceiling has left, and the
-/// last record the walk counted.
+/// records the walk deliberately did not deliver once the include phase
+/// was over, and the last one it counted. The anchor is the full
+/// admission key of that record: a continuation resumes strictly past
+/// it, so the counted remainder is never re-presented.
 struct Counting {
     omitted: u64,
-    last: EntityId,
+    last: AdmissionKey,
 }
 
 /// One record the driver yielded, normalized across the three kinds: its
@@ -452,6 +454,23 @@ impl Walk<'_> {
         }
     }
 
+    /// The degrade a byte-ceiling stop names when the walk counted its
+    /// remainder: a cursor anchored at the last *counted* record — the
+    /// full admission key, never the last included record (which would
+    /// re-present the counted remainder) and never an echo of the
+    /// presented cursor (which would repeat the identical page forever).
+    /// The continuation resumes strictly past every record this page
+    /// deliberately did not deliver.
+    fn counting_degrade(&self, omitted: u64, last_counted: AdmissionKey) -> PartOutcome {
+        PartOutcome::Degraded {
+            truncation: Truncation {
+                dimension: Dimension::Bytes,
+                position: TruncationPoint::Cursor(self.cursor_bytes(last_counted)),
+                omitted,
+            },
+        }
+    }
+
     /// The walk stops at a record whose scan charge was refused: the
     /// record was never examined. Inside a counting walk the cut leaves
     /// the omission uncounted and coverage names the uncounted rest;
@@ -464,7 +483,7 @@ impl Walk<'_> {
     fn stop_before_examining(&mut self, refusal: BudgetRefusal) {
         if let Some(counting) = self.counting.take() {
             self.coverage.push(CoverageEntry::UncountedTail {
-                after: counting.last,
+                after: counting.last.entity(),
                 dimension: refusal.dimension,
             });
             // The omission stays byte-dimensional — the byte ceiling is what
@@ -474,11 +493,7 @@ impl Walk<'_> {
             // the rest the walk never reached, so the reported count is a
             // confirmed fragment, never a partial number dressed up as
             // complete.
-            self.stopped = Some(self.include_anchored_degrade(
-                Dimension::Bytes,
-                counting.omitted,
-                counting.last,
-            ));
+            self.stopped = Some(self.counting_degrade(counting.omitted, counting.last));
             return;
         }
         let position = if let Some(anchor) = self.last_examined {
@@ -502,11 +517,7 @@ impl Walk<'_> {
     fn finish_counting_or_complete(&mut self) {
         match self.counting.take() {
             Some(counting) => {
-                self.stopped = Some(self.include_anchored_degrade(
-                    Dimension::Bytes,
-                    counting.omitted,
-                    counting.last,
-                ));
+                self.stopped = Some(self.counting_degrade(counting.omitted, counting.last));
             }
             None => self.stopped = Some(PartOutcome::Complete),
         }
@@ -524,7 +535,7 @@ impl Walk<'_> {
 
     /// Processes one yielded record: the snapshot bound, the scan charge
     /// (after which the record is examined), the eviction gap's first
-    /// resident successor, then either the counting walk's fit check or
+    /// resident successor, then either the counting walk's count or
     /// the results and bytes gates and the include itself. Sets `stopped`
     /// when the walk must stop. `unexamined_after` is the number of
     /// records the current batch still holds behind this one — at a stop
@@ -568,13 +579,13 @@ impl Walk<'_> {
             return;
         }
         if let Some(counting) = &mut self.counting {
-            // The include phase is over: the walk counts the truth — how
-            // many records' evidence would not fit. Counted records are
-            // examined, never returned and never byte-charged.
-            if self.session.ledger().remaining_bytes() < evidence_of(&yielded.record) {
-                counting.omitted += 1;
-                counting.last = yielded.key.entity();
-            }
+            // The include phase is over: every matching record the walk
+            // examines is deliberately not delivered — counted in full,
+            // whether or not the remaining ceiling would have fit it.
+            // Counted records are examined, never returned and never
+            // byte-charged; the continuation anchors past them all.
+            counting.omitted += 1;
+            counting.last = yielded.key;
             return;
         }
         // Results: charged only for records the page returns — read what
@@ -605,7 +616,7 @@ impl Walk<'_> {
             // does not fit.
             self.counting = Some(Counting {
                 omitted: 1,
-                last: yielded.key.entity(),
+                last: yielded.key,
             });
             return;
         }
@@ -1881,14 +1892,15 @@ mod tests {
 
     /// The byte ceiling, counted truly: the page stops including at the
     /// first record whose evidence does not fit, walks the remainder, and
-    /// reports exactly how many records would not fit — anchored at the
-    /// last included record.
+    /// reports exactly how many records the walk deliberately did not
+    /// deliver — anchored at the last counted record.
     ///
     /// Kills both lies: reporting zero (or a guess) for the omission, and
-    /// anchoring the cursor at the wall record (which would skip it
-    /// forever).
+    /// anchoring the cursor at the last included record — which would
+    /// re-present the counted remainder and wedge the continuation on the
+    /// same wall forever.
     #[test]
-    fn a_byte_ceiling_names_the_true_omission_count_and_anchors_behind_it() {
+    fn a_byte_ceiling_names_the_true_omission_count_and_advances_past_it() {
         let mut store = FixtureStore::empty();
         let mut sizes = Vec::new();
         for index in 1_u8..=5 {
@@ -1922,8 +1934,10 @@ mod tests {
         let truncation = degraded_of(&page);
         assert_eq!(truncation.dimension, Dimension::Bytes);
         assert_eq!(
-            truncation.omitted, 2,
-            "records three and five do not fit; four does"
+            truncation.omitted, 3,
+            "records three and five do not fit; four would, but the \
+             include phase is over — all three are deliberately not \
+             delivered"
         );
         let entities: Vec<EntityId> = page
             .items
@@ -1935,10 +1949,11 @@ mod tests {
         let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
         assert_eq!(
             payload.position(),
-            200_u64,
-            "the cursor anchors at the last included record"
+            500_u64,
+            "the cursor anchors at the last counted record — past e3, e4 \
+             and e5 — so the continuation resumes with what follows"
         );
-        assert_eq!(payload.last_entity(), span_entity(2, 2));
+        assert_eq!(payload.last_entity(), span_entity(5, 5));
         assert!(
             page.execution.coverage.entries.is_empty(),
             "a counted omission needs no coverage entry"
@@ -2070,7 +2085,13 @@ mod tests {
         assert_eq!(entities, vec![span_entity(1, 1), span_entity(2, 2)]);
         let cursor = page.next_cursor.as_deref().expect("the page continues");
         let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
-        assert_eq!(payload.last_entity(), span_entity(2, 2));
+        assert_eq!(
+            payload.position(),
+            300_u64,
+            "the cursor anchors at the last counted record, not the last \
+             included one"
+        );
+        assert_eq!(payload.last_entity(), span_entity(3, 3));
     }
 
     /// A byte-ceiling counting walk cut by the scan ceiling on a
@@ -2424,11 +2445,12 @@ mod tests {
         assert!(page.next_cursor.is_none());
     }
 
-    /// MINOR-1's pinned path: a byte-ceiling continuation where nothing fits
-    /// includes no record, so its only anchor is the presented cursor — and
-    /// the echo is byte-identical, not a re-mint.
+    /// A byte-ceiling continuation where nothing fits returns no record
+    /// and counts the whole remainder: the cursor anchors at the last
+    /// counted record — a re-mint that advances, never an echo of the
+    /// presented cursor (which would repeat the identical page forever).
     #[test]
-    fn a_byte_ceiling_continuation_that_returns_nothing_echoes_its_cursor() {
+    fn a_byte_ceiling_continuation_that_returns_nothing_advances_past_the_counted_tail() {
         let store = five_spans();
         let query = RecordsQuery::new(SignalKind::Spans);
         let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
@@ -2443,11 +2465,23 @@ mod tests {
         let truncation = degraded_of(&second);
         assert_eq!(truncation.dimension, Dimension::Bytes);
         assert_eq!(truncation.omitted, 3, "e3, e4 and e5 all miss the ceiling");
-        assert_eq!(
-            second.next_cursor.as_deref(),
-            Some(cursor.as_slice()),
-            "the presented cursor is echoed byte for byte"
+        let continued = second
+            .next_cursor
+            .as_deref()
+            .expect("the counted tail continues");
+        let payload = CursorPayload::decode(continued).expect("the engine's own cursor");
+        assert_ne!(
+            continued,
+            cursor.as_slice(),
+            "the continuation re-mints its anchor at the last counted \
+             record — never an echo of the presented cursor"
         );
+        assert_eq!(
+            payload.position(),
+            500_u64,
+            "anchored at e5, the last counted record"
+        );
+        assert_eq!(payload.last_entity(), span_entity(5, 5));
     }
 
     /// A metric point's evidence is its point's accounted size only: the
@@ -3252,8 +3286,9 @@ mod tests {
         let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
         assert_eq!(
             payload.last_entity(),
-            span_entity(3, 3),
-            "the cursor anchors at the last included record"
+            span_entity(5, 5),
+            "the cursor anchors at the last counted record (e5); the \
+             include phase ended at e3"
         );
         assert!(
             page.execution.coverage.entries.is_empty(),
@@ -3338,9 +3373,10 @@ mod tests {
         let payload = CursorPayload::decode(cursor).expect("the engine's own cursor");
         assert_eq!(
             payload.last_entity(),
-            span_entity(1, 1),
-            "the cursor anchors at the last included record — e1, the only \
-             record that fit"
+            span_entity(4, 4),
+            "the cursor anchors at the last counted record — e4, the last \
+             matching record behind the wall; anchoring at e1 instead would \
+             re-present the counted tail (e2 and e4) on every continuation"
         );
     }
 
