@@ -21,6 +21,17 @@ pub enum Strategy {
     /// the exact span is resident (then those relations are suppressed in
     /// its favor).
     TraceIdentity,
+    /// Relates a span to the span its `parent_span_id` names, when that
+    /// span is resident. Derived from the span's own parent field, it adds
+    /// no fact the model did not already carry — which is exactly why it
+    /// is structural.
+    ParentChild,
+    /// Relates records that share one resource identity. The evidence is
+    /// the shared resource's own attributes, never fabricated.
+    ResourceContext,
+    /// Relates a metric data point to the span an exemplar's trace context
+    /// names, when that span is resident.
+    ExemplarAttachment,
     /// Relates the subject's resident spans to the data points co-active in
     /// a caller-supplied window.
     TemporalCoActivity,
@@ -34,7 +45,10 @@ impl Strategy {
         match self {
             Self::SpanIdentity => "span_identity",
             Self::TraceIdentity => "trace_identity",
+            Self::ParentChild => "parent_child",
+            Self::ResourceContext => "resource_context",
             Self::TemporalCoActivity => "temporal_co_activity",
+            Self::ExemplarAttachment => "exemplar_attachment",
         }
     }
 
@@ -42,7 +56,12 @@ impl Strategy {
     #[must_use]
     pub const fn version(self) -> &'static str {
         match self {
-            Self::SpanIdentity | Self::TraceIdentity | Self::TemporalCoActivity => "1.0.0",
+            Self::SpanIdentity
+            | Self::TraceIdentity
+            | Self::ParentChild
+            | Self::ResourceContext
+            | Self::ExemplarAttachment
+            | Self::TemporalCoActivity => "1.0.0",
         }
     }
 
@@ -52,9 +71,43 @@ impl Strategy {
         match self {
             Self::SpanIdentity => RelationType::SpanIdentity,
             Self::TraceIdentity => RelationType::TraceIdentity,
+            Self::ParentChild => RelationType::ParentChild,
+            Self::ResourceContext => RelationType::ResourceContext,
             Self::TemporalCoActivity => RelationType::TemporalCoActivity,
+            Self::ExemplarAttachment => RelationType::ExemplarAttachment,
         }
     }
+}
+
+/// The version of the whole committed strategy set: one token the
+/// Investigation flow can pin per investigation, so a later run states
+/// exactly which strategy set its correlated part was produced under. It
+/// advances only when the committed set itself changes.
+pub const STRATEGY_SET_VERSION: &str = "1.0.0";
+
+/// Every committed strategy, in taxonomy order. The machine-readable set:
+/// coverage is proven by enumerating it, so a strategy cannot be committed
+/// and forgotten. `Inferred` is deliberately absent — no strategy emits it.
+pub const COMMITTED_STRATEGIES: &[Strategy] = &[
+    Strategy::SpanIdentity,
+    Strategy::TraceIdentity,
+    Strategy::ParentChild,
+    Strategy::ResourceContext,
+    Strategy::ExemplarAttachment,
+    Strategy::TemporalCoActivity,
+];
+
+/// The strategy versions of the committed set, in the same taxonomy order
+/// — the vector the limits statement reports for a run whose bounds ask
+/// for the whole set.
+#[must_use]
+pub fn committed_versions() -> Vec<StrategyVersion> {
+    COMMITTED_STRATEGIES
+        .iter()
+        .map(|strategy| {
+            StrategyVersion::new(strategy.name().to_owned(), strategy.version().to_owned())
+        })
+        .collect()
 }
 
 /// The bounds a correlation run is produced under.

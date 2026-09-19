@@ -18,6 +18,14 @@
 //!   A log whose trace has no resident span gets no relation, and the
 //!   absence is accounted as completeness coverage — the trace is named by
 //!   the log but absent from the resident set.
+//! * **ParentChild** — a span is related to the span its `parent_span_id`
+//!   names, when that span is resident. Derived from the span's own parent
+//!   field; a parent absent from the resident set grounds nothing.
+//! * **ResourceContext** — records that share one resource identity are
+//!   related every which way, evidenced by the shared resource's own
+//!   attributes.
+//! * **ExemplarAttachment** — a metric data point is related to the span
+//!   an exemplar's trace context names, when that span is resident.
 //! * **TemporalCoActivity** — the subject's resident spans and the data
 //!   points co-active in the caller-supplied window are related. A record
 //!   participates iff it falls inside the window; two in-window records are
@@ -34,11 +42,13 @@
 //! the full one.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use runtime_trail_storage::TelemetryStore;
 use runtime_trail_telemetry_model::{
-    AssignedId, EntityId, LogRecord, MetricPoint, Span, SpanId, TraceId, Value,
+    AssignedId, EntityId, LogRecord, MetricPoint, Resource, Span, SpanId, StreamIdentity, TraceId,
+    Value,
 };
 
 use crate::bounds::{
@@ -115,6 +125,15 @@ pub fn correlate(store: &dyn TelemetryStore, bounds: &CorrelationBounds) -> Corr
                     &mut suppressions,
                     &mut absent_traces,
                 );
+            }
+            Strategy::ParentChild => {
+                parent_child(&spans, &mut relations);
+            }
+            Strategy::ResourceContext => {
+                resource_context(&spans, &logs, &points, &mut relations);
+            }
+            Strategy::ExemplarAttachment => {
+                exemplar_attachment(&points, &spans, &mut relations);
             }
             Strategy::TemporalCoActivity => {
                 temporal_co_activity(&members, &points, bounds.window, &mut relations);
@@ -276,7 +295,7 @@ fn trace_identity(
 /// in-window data points, recording the window on every relation.
 fn temporal_co_activity(
     members: &[&(EntityId, Arc<Span>)],
-    points: &[(EntityId, Arc<MetricPoint>)],
+    points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
     window: Option<Window>,
     relations: &mut Vec<Relation<SignalRef>>,
 ) {
@@ -298,8 +317,14 @@ fn temporal_co_activity(
         if end <= window.from || start >= window.to {
             continue;
         }
-        for (point_entity, point) in points {
+        for (point_entity, point, _) in points {
+            // A point outside the window never grounds a relation, even
+            // when it is near a span: the window is the strategy's whole
+            // domain, so the filter is applied while generating.
             let time = point.time_unix_nano();
+            if time < window.from || time >= window.to {
+                continue;
+            }
             // Co-active when the pair overlaps or the gap between their
             // time values is at most the window's length.
             let gap = if (start..end).contains(&time) {
@@ -332,6 +357,190 @@ fn temporal_co_activity(
             ));
         }
     }
+}
+
+/// `ParentChild`: relates a span to the span its `parent_span_id` names,
+/// when that span is resident. The relation is derived from the span's
+/// own parent field, and the evidence is that field cited verbatim. The
+/// zero parent (the absent-parent marker emitters send), a parent outside
+/// the resident set, and a span naming itself are never grounded — the
+/// absent-endpoint and self-loop guards are applied while generating,
+/// never by dropping a formed relation.
+fn parent_child(spans: &[(EntityId, Arc<Span>)], relations: &mut Vec<Relation<SignalRef>>) {
+    let version = StrategyVersion::new(
+        Strategy::ParentChild.name().to_owned(),
+        Strategy::ParentChild.version().to_owned(),
+    );
+    for (child_entity, child) in spans {
+        let Some(parent_span_id) = child.parent_span_id else {
+            continue; // a root span has no parent field to derive from
+        };
+        if !parent_span_id.is_valid() {
+            continue; // the zero parent is the absent-parent marker
+        }
+        let Some((trace, _)) = child.natural_identity() else {
+            continue; // no natural identity, no resolvable parent
+        };
+        let Some(parent_entity) = resident_span_named(spans, trace, parent_span_id) else {
+            continue; // the named parent is not resident
+        };
+        if *child_entity == parent_entity {
+            continue; // the no-self-loop guard
+        }
+        relations.push(Relation::new(
+            RelationType::ParentChild,
+            SignalRef::new(SignalKind::Spans, *child_entity),
+            SignalRef::new(SignalKind::Spans, parent_entity),
+            vec![EvidenceFact::new(
+                "parent_span_id".to_owned(),
+                Value::Bytes(parent_span_id.as_bytes().to_vec()),
+            )],
+            version.clone(),
+            None,
+        ));
+    }
+}
+
+/// `ResourceContext`: relates records that share one resource identity —
+/// every unordered pair within a group of two or more, citing the shared
+/// resource's own attributes as the evidence. A singleton group grounds
+/// no relation; the identity that relates a pair is the attribute map
+/// itself, so the evidence is the map's contents, never fabricated.
+fn resource_context(
+    spans: &[(EntityId, Arc<Span>)],
+    logs: &[(EntityId, Arc<LogRecord>)],
+    points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
+    relations: &mut Vec<Relation<SignalRef>>,
+) {
+    let version = StrategyVersion::new(
+        Strategy::ResourceContext.name().to_owned(),
+        Strategy::ResourceContext.version().to_owned(),
+    );
+    // Group the resident records by resource identity — the ordered
+    // attribute map — so groups and members run deterministically: groups
+    // in map order, members in scan order.
+    let mut groups: BTreeMap<Resource, Vec<SignalRef>> = BTreeMap::new();
+    for (entity, span) in spans {
+        groups
+            .entry((*span.resource).clone())
+            .or_default()
+            .push(SignalRef::new(SignalKind::Spans, *entity));
+    }
+    for (entity, log) in logs {
+        groups
+            .entry((*log.resource).clone())
+            .or_default()
+            .push(SignalRef::new(SignalKind::LogRecords, *entity));
+    }
+    for (entity, _, stream) in points {
+        groups
+            .entry(stream.resource.clone())
+            .or_default()
+            .push(SignalRef::new(SignalKind::MetricPoints, *entity));
+    }
+    for (resource, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        // Any → any: each member relates to every later member — one
+        // relation per unordered pair; the inverse direction is the same
+        // relation seen backwards and adds no facts.
+        for (index, from) in members.iter().enumerate() {
+            for to in &members[index + 1..] {
+                relations.push(Relation::new(
+                    RelationType::ResourceContext,
+                    from.clone(),
+                    to.clone(),
+                    resource_facts(&resource),
+                    version.clone(),
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+/// The evidence a resource-context relation stands on: the shared
+/// resource's own attributes, each cited verbatim as `(key, value)`. An
+/// empty shared identity — a resource with no attributes — is still the
+/// identity that relates the pair, cited as one empty attribute list so
+/// no relation ships without its evidence.
+fn resource_facts(resource: &Resource) -> Vec<EvidenceFact> {
+    let mut facts: Vec<EvidenceFact> = resource
+        .identity()
+        .iter()
+        .map(|(key, value)| EvidenceFact::new(key.clone(), value.clone()))
+        .collect();
+    if facts.is_empty() {
+        facts.push(EvidenceFact::new(
+            "resource".to_owned(),
+            Value::kv_list(Vec::new()).expect("an empty list cannot duplicate keys"),
+        ));
+    }
+    facts
+}
+
+/// `ExemplarAttachment`: relates a metric data point to the span an
+/// exemplar's trace context names, when that span is resident. The
+/// exemplar's two ids are the evidence, cited verbatim; an exemplar that
+/// carries only one id — or names a span outside the resident set — is
+/// never grounded, so nothing is fabricated and no relation to an absent
+/// record is formed.
+fn exemplar_attachment(
+    points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
+    spans: &[(EntityId, Arc<Span>)],
+    relations: &mut Vec<Relation<SignalRef>>,
+) {
+    let version = StrategyVersion::new(
+        Strategy::ExemplarAttachment.name().to_owned(),
+        Strategy::ExemplarAttachment.version().to_owned(),
+    );
+    for (point_entity, point, _) in points {
+        for exemplar in point.exemplars() {
+            let Some((trace, span_id)) = exemplar.correlation_pair() else {
+                continue; // both ids are needed to name a span
+            };
+            let Some(span_entity) = resident_span_named(spans, trace, span_id) else {
+                continue; // the exemplar's span is not resident
+            };
+            relations.push(Relation::new(
+                RelationType::ExemplarAttachment,
+                SignalRef::new(SignalKind::MetricPoints, *point_entity),
+                SignalRef::new(SignalKind::Spans, span_entity),
+                vec![
+                    EvidenceFact::new(
+                        "exemplar.trace_id".to_owned(),
+                        Value::Bytes(trace.as_bytes().to_vec()),
+                    ),
+                    EvidenceFact::new(
+                        "exemplar.span_id".to_owned(),
+                        Value::Bytes(span_id.as_bytes().to_vec()),
+                    ),
+                ],
+                version.clone(),
+                None,
+            ));
+        }
+    }
+}
+
+/// The resident span whose natural identity is `(trace, span_id)`, in
+/// scan order.
+fn resident_span_named(
+    spans: &[(EntityId, Arc<Span>)],
+    trace: TraceId,
+    span_id: SpanId,
+) -> Option<EntityId> {
+    spans
+        .iter()
+        .find(|(_, candidate)| {
+            candidate
+                .natural_identity()
+                .is_some_and(|(candidate_trace, candidate_span)| {
+                    candidate_trace == trace && candidate_span == span_id
+                })
+        })
+        .map(|(entity, _)| *entity)
 }
 
 /// The resident span named by `(trace, span_id)`, if any.
@@ -451,14 +660,16 @@ fn scan_logs(
 }
 
 /// Scans the resident metric points, counting every examined position into
-/// the work allowance; selects only the points inside the run's window,
-/// when the run grounds one.
+/// the work allowance, and returns them with their streams. The window
+/// filter is the temporal strategy's own, applied while generating — the
+/// other strategies (resource context, exemplar attachment) see every
+/// resident point.
 fn scan_points(
     store: &dyn TelemetryStore,
     bounds: &CorrelationBounds,
     spent: &mut u64,
     stopped_at: &mut Option<StoppedAt>,
-) -> Vec<(EntityId, Arc<MetricPoint>)> {
+) -> Vec<(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)> {
     let mut resident = Vec::new();
     let mut after = None;
     loop {
@@ -476,14 +687,11 @@ fn scan_points(
                 return resident;
             }
             *spent += 1;
-            let point = Arc::clone(&item.record.point);
-            let in_window = bounds.window.is_some_and(|window| {
-                let time = point.time_unix_nano();
-                time >= window.from && time < window.to
-            });
-            if in_window {
-                resident.push((item.key.entity(), point));
-            }
+            resident.push((
+                item.key.entity(),
+                Arc::clone(&item.record.point),
+                Arc::clone(&item.record.stream),
+            ));
         }
         match page.cursor {
             Some(cursor) => after = Some(cursor),
