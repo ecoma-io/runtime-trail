@@ -77,43 +77,40 @@ Both are presentation and packaging around one core. See
 ## Architecture at a glance
 
 ```text
-                        ┌──────────────────┐
-                        │     Loom UI      │
-                        └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │ Investigation API│
-                        └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │   Query Engine   │
-                        └────────┬─────────┘
-                                 │
-                 ┌───────────────▼────────────────┐
-                 │       Correlation Engine       │
-                 └───────────────┬────────────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │ Telemetry Model  │
-                        └────────┬─────────┘
-                                 │
-                  ┌──────────────▼──────────────┐
-                  │    Storage Abstraction      │
-                  └──────────┬───────────┬──────┘
-                             │           │
-                          Memory      SQLite
-                             ▲           ▲
-                             └─────┬─────┘
-                                   │
-                          ┌────────▼────────┐
-                          │ OTLP Ingestion  │
-                          └─────────────────┘
+                    ┌──────────────────────┐
+                    │  Developer UI (Loom) │
+                    └───────────┬──────────┘
+                                │
+                    ┌───────────▼──────────┐
+                    │  Investigation API   │
+                    └────┬───────────┬─────┘
+                         │           │
+              ┌──────────▼───┐   ┌───▼───────────┐
+              │ Query Engine │   │ Correlation   │
+              └──────────┬───┘   └───┬───────────┘
+                         │           │
+              ┌──────────▼───────────▼──────┐
+              │        Telemetry Model      │
+              └──────────┬──────────────────┘
+                         │
+             ┌───────────▼──────────────────┐
+             │       Storage Abstraction    │
+             └──────┬───────────────┬───────┘
+                    │               │
+                 Memory           SQLite
+                                  (planned)
+                    ▲               ▲
+                    └───────┬───────┘
+                            │
+                 ┌──────────▼──────────┐
+                 │    OTLP Ingestion   │
+                 └─────────────────────┘
 
-                         ┌─────────────────┐
-                         │   MCP Server    │
-                         └────────┬────────┘
-                                  │
-                                  └──► Investigation API
+                 ┌─────────────────────┐
+                 │      MCP Server     │  (planned)
+                 └──────────┬──────────┘
+                            │
+                            └──► Investigation API
 ```
 
 The rules behind the arrows — what may depend on what, and which edges are
@@ -122,16 +119,18 @@ and enforced mechanically by [Archkeep](https://github.com/ecoma-io/archkeep).
 
 ## Current status
 
-**Phase 1 (telemetry ingestion) is in progress.** The engineering foundation
-of Phase 0 is in place — toolchain, architecture contracts (mechanically
-enforced, with canary fixtures proving the enforcement bites), agent workflow,
-CI, documentation, governance — and the core now **ingests OpenTelemetry**: one
-binary binds loopback by default, serves OTLP/HTTP and OTLP/gRPC traces, logs
-and metrics into a bounded in-memory queue and store under backpressure, and
-answers `/healthz` and `/version`. What does **not** yet exist: query,
-correlation, investigation UI, MCP, and file-backed persistence. The web and
-desktop apps remain bootstrap shells around a status page, not the product UI.
-Delivery status is tracked in [docs/roadmap/README.md](docs/roadmap/README.md).
+**Phase 1 (telemetry ingestion) is done; Phase 2 (investigation runtime) is
+in progress.** The core ingests OpenTelemetry traces, logs and metrics over
+OTLP/HTTP and OTLP/gRPC into a bounded in-memory queue and store under
+backpressure, and those signals are **queryable** through the Investigation
+API — one compose flow returns the subject trace, related logs, surrounding
+metrics and correlated relations — with the first Loom investigation
+surfaces wired over it (issue #28, issue #30). What does **not** yet exist:
+MCP tools, file-backed persistence, and hardened distribution (the Docker
+image and desktop app remain smoke-level wrappers). The 1.0 gate is
+machine-checkable in
+[docs/roadmap/1.0-checklist.md](docs/roadmap/1.0-checklist.md); delivery
+status is tracked in [docs/roadmap/README.md](docs/roadmap/README.md).
 
 ## Documentation
 
