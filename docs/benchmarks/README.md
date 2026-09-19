@@ -109,6 +109,22 @@ commit and machine in its header; the table quotes that one named run.
 | `workload-rss` | settled `VmRSS` 8,188 KiB (HWM 9,232 KiB) under 250 spans, 50 logs, 16 points                 | < 100 MiB typical session       |
 | `query-budget` | `VmRSS` 35,164 → 35,200 KiB across the storm (+36 KiB); 20/20 truthful, 0 fabricated-complete | bounded: refuse-don't-grow      |
 
+CI runner variance (query-budget): the case's noise margin is measurement
+tolerance, not the budget — the budget is "bounded: refuse-don't-grow" and
+carries no KiB number ([runtime-constraints.md](../architecture/runtime-constraints.md)).
+Two margin-exceeding runs on the **identical tree** (no code delta, both
+green on rerun / in earlier queue runs), GitHub Actions `ubuntu-latest`:
+
+| run                                                                               | context                                         | `VmRSS` growth across the storm |
+| --------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------- |
+| [35467768518](https://github.com/ecoma-io/runtime-trail/actions/runs/35467768518) | release PR #7, 2026-09-19T20:33Z                | 6,444 KiB                       |
+| [35468332667](https://github.com/ecoma-io/runtime-trail/actions/runs/35468332667) | merge-group input `a3c3d7de`, 2026-09-19T20:45Z | 5,428 KiB                       |
+
+Both exceeded the then-5 MiB margin by 308–1,324 KiB; the margin is 8 MiB
+since 2026-09-19 ([issue #74](https://github.com/ecoma-io/runtime-trail/issues/74))
+so allocator/runner noise on shared runners does not flake the gate. The
+local named run above measures +36 KiB on the same tree.
+
 ## What CI does with benchmarks
 
 CI runs the harness on every pull request and merge in the `bench` job
