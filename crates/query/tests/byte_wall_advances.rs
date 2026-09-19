@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use runtime_trail_query::budget::QueryBudget;
 use runtime_trail_query::cursor::CursorPayload;
-use runtime_trail_query::engine::{records, RecordView, RecordsQuery, SignalKind};
+use runtime_trail_query::engine::{RecordView, RecordsQuery, SignalKind, records};
 use runtime_trail_query::result::{Dimension, Page, PartOutcome, Truncation};
 use runtime_trail_query::{
     AdmissionKey, KeepOutcome, PointView, ScanItem, ScanPage, StoreStats, TelemetryStore,
