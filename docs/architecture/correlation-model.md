@@ -126,8 +126,12 @@ two relations, each produced and evidenced on its own — never a synthesised
   bound is reached, the Correlation Engine **degrades truthfully** — it
   returns the relations found, names the depth or count at which it stopped,
   and reports it through coverage — rather than refusing the whole read or
-  growing unbounded. (`max_relations` is a traversal bound, so the outcome
-  is degradation; refusing is for aggregation-shaped work —
+  growing unbounded. The relation ceiling engages **during generation**:
+  every push site checks `max_relations`, keeps the first `max_relations`
+  relations formed in deterministic scan order, and never materializes the
+  relations past it — memory stays O(max_relations), not O(full growth).
+  (`max_relations` is a traversal bound, so the outcome is degradation;
+  refusing is for aggregation-shaped work —
   [query-model.md](query-model.md).)
 
 ## Budgeting correlation
@@ -163,7 +167,10 @@ reports the truncated traversal truthfully through the
 4. No relation has `from == to`, a non-resident endpoint, or a second-order
    shape.
 5. `Inferred` has zero instances; no strategy emits it.
-6. Relations appear in a response only under its `max_relations`; traversal
+6. Relations appear in a response only under its `max_relations`; the
+   ceiling is applied while generating — the kept set is the first
+   `max_relations` relations formed in deterministic scan order, and the
+   stop is reported through `stopped_at` and coverage — and traversal
    depth never exceeds `max_hops`.
 7. Eviction of any endpoint removes every relation that touched it, and the
    removal is visible in the response's coverage.

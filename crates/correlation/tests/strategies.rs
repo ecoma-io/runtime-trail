@@ -1284,7 +1284,7 @@ fn every_relation_cites_resident_endpoints_and_no_self_loop() {
 }
 
 #[test]
-fn max_relations_caps_the_answer_as_a_stable_prefix_and_reports_the_count() {
+fn max_relations_caps_the_answer_at_the_generation_ceiling_and_reports_the_count() {
     let store = temporal_store();
     let mut bounds = temporal_bounds();
     bounds.max_relations = 3;
@@ -1295,13 +1295,14 @@ fn max_relations_caps_the_answer_as_a_stable_prefix_and_reports_the_count() {
         outcome.truth.stopped_at,
         Some(StoppedAt::MaxRelations { count: 3 })
     );
-    // A capped answer is the full answer's stable prefix.
+    // A capped answer is the first relations formed in deterministic
+    // generation order. This fixture's spans and points scan in the same
+    // order the relations are finally returned in, so the capped answer
+    // coincides with the full answer's first relations.
     let full = run(&store, &temporal_bounds());
-    assert_eq!(
-        outcome.relations,
-        full.relations[..3],
-        "the cap never picks a different subset"
-    );
+    assert_eq!(outcome.relations, full.relations[..3]);
+    // Capping is deterministic: a second run keeps the same relations.
+    assert_eq!(run(&store, &bounds), outcome);
 }
 
 #[test]
@@ -1319,6 +1320,65 @@ fn suppression_accounting_never_waits_on_the_relation_budget() {
     // The suppression was still accounted completely.
     assert_eq!(outcome.truth.suppressions.len(), 1);
     assert_eq!(outcome.truth.suppressions[0].suppressed, 2);
+}
+
+#[test]
+fn trace_identity_cross_product_respects_the_generation_ceiling() {
+    // A log naming the subject trace relates to every resident span of
+    // that trace: N logs x M spans is the cross-product the ceiling must
+    // engage while generating, never after materializing the full set.
+    // Spans are admitted in reverse entity order so the scan order
+    // diverges from the final relation order — the kept set must follow
+    // the generation order the ceiling saw, not a sorted prefix.
+    let mut store = FixtureStore::empty();
+    for span_byte in (1..=200u8).rev() {
+        store.admit_span(
+            u64::from(201 - u16::from(span_byte)),
+            span_entity(TRACE, span_byte),
+            fixture_span(TRACE, span_byte, "subject", 10),
+        );
+    }
+    for serial in 1..=2_000u64 {
+        store.admit_log(
+            10_000 + serial,
+            assigned(serial),
+            fixture_log(Some(TRACE), None, "noisy"),
+        );
+    }
+    let mut bounds = default_bounds();
+    bounds.strategies = vec![Strategy::TraceIdentity];
+    bounds.max_scan = 10_000;
+    bounds.max_relations = 300;
+
+    let outcome = run(&store, &bounds);
+
+    // 2,000 x 200 = 400,000 relations would form without a ceiling; the
+    // answer keeps exactly the first `max_relations` and names the stop.
+    assert_eq!(outcome.relations.len(), 300);
+    assert_eq!(
+        outcome.truth.stopped_at,
+        Some(StoppedAt::MaxRelations { count: 300 })
+    );
+    for relation in &outcome.relations {
+        assert_eq!(relation.relation_type, RelationType::TraceIdentity);
+    }
+    // The kept set is the first 300 formed in scan order: the first log
+    // related to all 200 spans, the second log to the 100 spans scanned
+    // first (200 down to 101) — the ceiling never cuts a sorted prefix.
+    let second_log = assigned(2);
+    let kept = |span_byte: u8| {
+        outcome.relations.iter().any(|relation| {
+            relation.from.entity == second_log
+                && relation.to.entity == span_entity(TRACE, span_byte)
+        })
+    };
+    assert!(kept(200), "the first-formed spans survive the ceiling");
+    assert!(
+        !kept(1),
+        "relations formed past the ceiling are never materialized"
+    );
+    // Deterministic: a second run over the same store caps identically.
+    assert_eq!(run(&store, &bounds), outcome);
 }
 
 #[test]
