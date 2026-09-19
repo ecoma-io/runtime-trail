@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Case: startup (Phase 6) — the cold-start target, gated.
+#
+# Measures the served runtime's cold start: spawn the real server binary,
+# time until /healthz first answers 200 (wall_ms), settle, read the
+# server's VmRSS/VmHWM from /proc/<pid>/status, drain with SIGTERM, and
+# assert the normative target — startup to serving < 1 s
+# (docs/architecture/runtime-constraints.md). The target lives only in
+# that file; the number is re-stated here in the failure message, and the
+# measured record goes to stdout (captured verbatim by run-all.sh) with
+# the target it was checked against, so a failed case's record explains
+# itself.
+set -euo pipefail
+cd "$(dirname "$0")/../../.."
+# shellcheck source=scripts/bench/served-common.sh
+source scripts/bench/served-common.sh
+
+target_ms=1000 # 1 s — runtime-constraints.md, "startup to serving"
+
+served_check_port
+served_build
+
+pid=""
+cleanup() {
+  [ -n "$pid" ] && { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; } || true
+}
+trap cleanup EXIT
+
+start=$(date +%s%N)
+"$server_bin" --bind "127.0.0.1:$served_port" >/dev/null 2>&1 &
+pid=$!
+
+code=000
+first=0
+for _ in $(seq 1 500); do
+  code="$(curl -s -o /dev/null -m 1 -w '%{http_code}' "http://127.0.0.1:$served_port/healthz" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then
+    first=$(date +%s%N)
+    break
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "✗ startup: the server exited before /healthz answered (last code $code)." >&2
+    exit 1
+  fi
+  sleep 0.02
+done
+if [ "$code" != "200" ]; then
+  echo "✗ startup: no /healthz 200 within 10 s — the served runtime did not start." >&2
+  exit 1
+fi
+wall_ms=$(((first - start) / 1000000))
+
+# Settle, then read the served runtime's resident set.
+sleep 0.5
+vm_rss_kib="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")"
+vm_hwm_kib="$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status")"
+
+if [ "$wall_ms" -ge "$target_ms" ]; then
+  echo "✗ startup budget: wall_ms=$wall_ms >= target ${target_ms}ms (startup to serving < 1 s, runtime-constraints.md)." >&2
+  exit 1
+fi
+
+# Graceful drain is a contract (≤ 5 s, exit 0): a case must fail on a
+# server that cannot be shut down cleanly.
+kill -TERM "$pid"
+wait "$pid"
+drain_status=$?
+pid=""
+if [ "$drain_status" -ne 0 ]; then
+  echo "✗ startup: served runtime did not drain on SIGTERM (exit $drain_status; contract: ≤ 5 s, exit 0)." >&2
+  exit 1
+fi
+
+printf '{"probe":"startup","signal":"served runtime: cold start to first /healthz 200","wall_ms":%s,"vm_rss_kib":%s,"vm_hwm_kib":%s,"target_wall_ms":%s}\n' \
+  "$wall_ms" "$vm_rss_kib" "$vm_hwm_kib" "$target_ms"

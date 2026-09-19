@@ -9,7 +9,7 @@
 //!
 //! Ingestion deliberately exposes its pipeline, not its wire types (the
 //! prost-generated `otlp` module and its fixtures are `pub(crate)`), so
-//! these probes carry a small writer for exactly the two export requests
+//! these probes carry a small writer for exactly the three export requests
 //! they emit. Field numbers are pinned by the vendored `.proto` sources,
 //! and the semantic tests run every payload shape through the real
 //! pipeline and count what came back, because "it decoded" is not the
@@ -30,6 +30,11 @@
 //!   attributes). Log records have no natural identity, so every record is
 //!   a fresh admission — the record kind the retention ceilings alone
 //!   bound.
+//! - **trace export** — one trace per export: a parentless root span
+//!   followed by its children, each span carrying a distinct id and
+//!   timestamp so no delivery collapses, under the same attribute-heavy
+//!   resource. This is the served-runtime probes' investigation subject,
+//!   and the workload the query-budget probe saturates a chain with.
 
 /// The wire type of a protobuf field, as the format states it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +291,10 @@ pub fn encode_log_export(
             record.message(6, &pair);
         }
         record.fixed64(11, shape.base_time_unix_nano + k);
+        if let Some(context) = shape.trace_context {
+            record.bytes(9, &context.trace_id);
+            record.bytes(10, &context.span_id);
+        }
         scope_logs.message(2, &record);
     }
 
@@ -301,10 +310,83 @@ pub fn encode_log_export(
     assert_within_ceilings(request.len(), 0);
     request
 }
+/// Encodes one trace export as an `ExportTraceServiceRequest`:
+/// `shape.span_count` spans under one resource and scope.
+///
+/// The span of record `k` of export `export_index` is minted by
+/// `shape.span`; its attributes by `span_attribute`, so every span
+/// identity is distinct and every delivery is a fresh admission, never a
+/// collapse.
+///
+/// # Panics
+///
+/// As [`encode_gauge_export`] when the result would not be a legal export.
+pub fn encode_trace_export(
+    shape: &TraceShape,
+    export_index: u64,
+    span_attribute: impl Fn(u64, u64) -> Vec<(String, String)>,
+) -> Wire {
+    // ScopeSpans: scope = 1 (an InstrumentationScope message), spans = 2
+    // (repeated Span fields written straight into its body).
+    let mut scope_spans = Wire::new();
+    let mut scope = Wire::new();
+    encode_scope(&mut scope, &shape.scope_name);
+    scope_spans.message(1, &scope);
+    for k in 0..shape.span_count {
+        let k = u64::try_from(k).unwrap_or(u64::MAX);
+        let span = (shape.span)(export_index, k);
+        let mut record = Wire::new();
+        // Span: trace_id = 1, span_id = 2, parent_span_id = 4, name = 5,
+        // kind = 6, start = 7, end = 8, attributes = 9.
+        record.bytes(1, &span.trace_id);
+        record.bytes(2, &span.span_id);
+        if span.parent_span_id != [0; 8] {
+            record.bytes(4, &span.parent_span_id);
+        }
+        record.string(5, &span.name);
+        record.uint64(6, 1); // SPAN_KIND_INTERNAL
+        record.fixed64(7, span.start_time_unix_nano);
+        record.fixed64(8, span.end_time_unix_nano);
+        for (key, value) in span_attribute(export_index, k) {
+            let mut pair = Wire::new();
+            pair.string(1, &key);
+            let mut any = Wire::new();
+            any.string(1, &value);
+            pair.message(2, &any);
+            record.message(9, &pair);
+        }
+        scope_spans.message(2, &record);
+    }
+
+    let mut resource_spans = Wire::new();
+    let mut resource = Wire::new();
+    encode_resource(&mut resource, &shape.resource_attributes);
+    resource_spans.message(1, &resource);
+    resource_spans.message(2, &scope_spans);
+
+    let mut request = Wire::new();
+    request.message(1, &resource_spans);
+
+    assert_within_ceilings(request.len(), shape.span_count);
+    request
+}
 
 /// Mints the attribute list of one record: keyed by its export index and
 /// position, so identities stay distinct across a run.
 pub type AttributeMinter = Box<dyn Fn(u64, u64) -> Vec<(String, String)>>;
+
+/// The trace context a log record may carry: the OTLP log record's
+/// `trace_id` (field 9) and `span_id` (field 10), which make the record
+/// evidence of a specific span — the related-logs evidence the served
+/// runtime's investigations surface. Absent by default: the retention
+/// probe's records are deliberately context-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceContext {
+    /// The 16-byte trace id.
+    pub trace_id: [u8; 16],
+    /// The 8-byte span id.
+    pub span_id: [u8; 8],
+}
 
 /// The per-record payload shape of the log export.
 pub struct LogShape {
@@ -324,6 +406,10 @@ pub struct LogShape {
     pub record_attribute: AttributeMinter,
     /// The base admission-time-class timestamp records count up from.
     pub base_time_unix_nano: u64,
+    /// The trace context every record carries, when the workload's logs
+    /// belong to a traced span (absent for the context-free retention
+    /// records).
+    pub trace_context: Option<TraceContext>,
 }
 
 impl std::fmt::Debug for LogShape {
@@ -332,6 +418,7 @@ impl std::fmt::Debug for LogShape {
             .field("record_count", &self.record_count)
             .field("severity_number", &self.severity_number)
             .field("base_time_unix_nano", &self.base_time_unix_nano)
+            .field("trace_context", &self.trace_context)
             .finish_non_exhaustive()
     }
 }
@@ -356,6 +443,49 @@ impl std::fmt::Debug for GaugeShape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GaugeShape")
             .field("point_count", &self.point_count)
+            .field("base_time_unix_nano", &self.base_time_unix_nano)
+            .finish_non_exhaustive()
+    }
+}
+/// One generated span's fields, as [`encode_trace_export`] emits them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedSpan {
+    /// The 16-byte trace id (field 1) — every span of one trace carries
+    /// the same, so the exporter can spread one trace across exports.
+    pub trace_id: [u8; 16],
+    /// The 8-byte span id (field 2) — distinct per span.
+    pub span_id: [u8; 8],
+    /// The 8-byte parent span id (field 4); all-zero = no parent (the
+    /// trace's effective root).
+    pub parent_span_id: [u8; 8],
+    /// The span's name (field 5).
+    pub name: String,
+    /// `start_time_unix_nano` (field 7, fixed64).
+    pub start_time_unix_nano: u64,
+    /// `end_time_unix_nano` (field 8, fixed64).
+    pub end_time_unix_nano: u64,
+}
+
+/// The per-export payload shape of the trace export.
+pub struct TraceShape {
+    /// Resource attributes, shared by every span.
+    pub resource_attributes: Vec<(String, String)>,
+    /// The instrumentation scope's name.
+    pub scope_name: String,
+    /// Spans per export.
+    pub span_count: usize,
+    /// The span of record `k` of export `export_index`.
+    pub span: Box<dyn Fn(u64, u64) -> GeneratedSpan>,
+    /// Per-span attributes, minted per span.
+    pub span_attribute: AttributeMinter,
+    /// The base timestamp spans count up from.
+    pub base_time_unix_nano: u64,
+}
+
+impl std::fmt::Debug for TraceShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceShape")
+            .field("span_count", &self.span_count)
             .field("base_time_unix_nano", &self.base_time_unix_nano)
             .finish_non_exhaustive()
     }

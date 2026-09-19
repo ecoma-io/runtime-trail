@@ -55,6 +55,7 @@
 pub mod json;
 pub mod probes;
 pub mod rss;
+pub mod served;
 pub mod shapes;
 pub mod wire;
 

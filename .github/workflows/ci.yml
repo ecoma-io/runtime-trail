@@ -285,6 +285,34 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
+  # Phase 6's gate ([roadmap](docs/roadmap/phases.md)): the served-runtime
+  # cases — startup, workload-rss, query-budget — assert their own budgets
+  # and exit non-zero with target + measured when one breaks, so this job
+  # runs the harness and lets the cases speak. It needs no container and no
+  # web build: the cases build the release binaries they measure and read
+  # /proc/<pid>/status on the runner directly (github runners carry bash,
+  # curl and /proc).
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+      # Same key family as the checks job: the lockfile keys the cache, so a
+      # pull request's bench run reuses the target/ the checks job just
+      # warmed. The harness records every run under
+      # scripts/bench/results/raw/ (git-ignored); a case's own verdict is
+      # what fails this job.
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: ". -> target"
+      - name: Run the benchmark harness (cases assert their budgets)
+        run: scripts/bench/run-all.sh
+
   # The single fixed-name check for branch protection. A job named directly in
   # a ruleset pins its own name; gating on this aggregate instead keeps one
   # stable name while jobs above are added or renamed, and makes a job that is
@@ -298,7 +326,7 @@ jobs:
     needs: [checks, architecture, docs, docker, web-e2e]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    needs: [checks, architecture, docs, docker, bench]
     steps:
       # An ALLOW-list: name the one result that means "safe" and fail on
       # everything else. The deny-list shape this replaced (contains(...,
