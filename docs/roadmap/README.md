@@ -20,14 +20,17 @@ Three tiers, and the difference matters:
 
 ## Current status
 
-**Phase 1 (telemetry ingestion) is in progress.** The sanctioned slice has
-landed: the telemetry model and its admission ledger, OTLP/HTTP and
-OTLP/gRPC receivers with bounded queues and backpressure gates, the bounded
-memory driver, the composition root, and the memory-path measurements. What
-does **not** yet exist: query, correlation, investigation UI, MCP tools, and
-file-backed persistence. The status authority is [phases.md](phases.md); the
-phase acceptance (traces/logs/metrics queryable through the internal API) is
-met only when the Investigation‑runtime phase lands.
+**Phase 1 (telemetry ingestion) is `done`; Phase 2 (Investigation runtime)
+is in progress.** Ingested traces, logs and metrics flow through bounded
+queues into the memory driver — telemetry model with the admission ledger,
+OTLP/HTTP and OTLP/gRPC receivers, backpressure gates — and are
+**queryable through the Investigation API**: one compose flow returns the
+subject, related logs, surrounding metrics and correlated relations
+(issue #28), and the first Loom UI investigation surfaces are wired over
+HTTP (issue #30). What does **not** yet exist: MCP tools, file-backed
+persistence, and hardened distribution — those stay in their phases. The
+1.0 gate is machine-checkable in [1.0-checklist.md](1.0-checklist.md); the
+status authority is [phases.md](phases.md).
 
 ## 1.0 scope
 

@@ -16,7 +16,7 @@ Archkeep enforces the documented boundaries; the phase-1 routing document.
 Phase 0 shipped that; the OTLP ingestion capability it defined as _not yet
 existing_ has since landed with Phase 1.
 
-## Phase 1 — Telemetry ingestion — `in progress`
+## Phase 1 — Telemetry ingestion — `done`
 
 OTLP ingestion of traces, logs and metrics into the in-memory runtime:
 OTLP/gRPC and OTLP/HTTP receivers, bounded ingestion queues, backpressure
@@ -29,14 +29,18 @@ bounded queue/backpressure wire gates; bounded memory driver, composition
 root, and the memory-path measurements under
 [`docs/benchmarks/README.md`](../benchmarks/README.md).
 
-**Acceptance (open):** an OTLP SDK configured against a locally started
-`runtime-trail` has its traces/logs/metrics **queryable through the internal
-API**; overload produces backpressure instead of unbounded memory growth. The
-queryable-through-internal-API half is Phase 2's Investigation-runtime work;
-this phase closes when the full acceptance sketch is met. The
+**Acceptance — met (2026-09-19):** an OTLP SDK against a locally started
+`runtime-trail` delivers traces/logs/metrics **queryable through the
+internal API** — the Investigation API composes subject, related logs,
+surrounding metrics and correlated relations end to end (issue #28) — and
+overload produces backpressure instead of unbounded memory growth (bounded
+queue, the lone retryable `AdmissionSignal::QueueSaturated`). One contract
+refinement is tracked as issue #34 (export-atomic admission on retryable
+saturation); its acceptance gate is the regression test
+`tests::a_retryable_saturation_rejects_the_whole_export_atomically`. The
 [telemetry model](../architecture/telemetry-model.md) and
-[numeric-limit](../architecture/runtime-constraints.md) contracts are
-binding for this phase.
+[numeric-limit](../architecture/runtime-constraints.md) contracts remain
+binding.
 
 ## Phase 2 — Investigation runtime — `in progress`
 
