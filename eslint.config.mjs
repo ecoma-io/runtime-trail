@@ -103,8 +103,7 @@ export default tseslint.config(
   },
 
   {
-    // Tests may assert on things production code may not assume.
-    files: ["**/*.test.ts", "**/test-setup.ts"],
+    files: ["**/*.test.ts", "**/*.spec.ts", "**/test-setup.ts"],
     rules: {
       "@typescript-eslint/no-non-null-assertion": "off",
       "@typescript-eslint/no-unsafe-assignment": "off",
