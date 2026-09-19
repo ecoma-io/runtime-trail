@@ -5,7 +5,7 @@
 //! cursor would repeat the identical page forever, burning the chain.
 //!
 //! The store under test is a TEST-ONLY stub implementing the storage
-//! contract (the same pattern as trace_flow.rs) plus a deliberately
+//! contract (the same pattern as `trace_flow.rs`) plus a deliberately
 //! non-advancing span scanner.
 
 use std::collections::{BTreeMap, HashMap};
