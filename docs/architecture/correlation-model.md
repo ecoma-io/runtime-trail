@@ -172,13 +172,20 @@ reports the truncated traversal truthfully through the
 
 ## Status
 
-**Contracts pinned (M0), engine committed (issue #28).** The taxonomy,
+**Contracts pinned (M0), engine committed (issues #28, #37).** The taxonomy,
 evidence rules and invariants above are the contract the Phase 2
-Correlation Engine implements. The engine crate now ships the committed
-strategies — span identity, trace identity, temporal co-activity — wired
-into the Investigation API's trace flow under the caller's budget. The
-temporal strategy runs only under an explicit window the caller supplies
-through the Investigation; without one the runtime picks no window and
-the identity strategies run alone, the skip named in the coverage. The
-remaining taxonomy (parent/child, resource context, exemplar attachment,
-inferred) stays unstarted per [the roadmap](../roadmap/phases.md).
+Correlation Engine implements. The engine crate ships the full committed
+strategy set — span identity, trace identity, parent/child, resource
+context, exemplar attachment, temporal co-activity — wired into the
+Investigation API's trace flow under the caller's budget. Parent/child and
+exemplar attachment resolve their named endpoints in the resident set
+while generating (a parent or exemplar span that is not resident grounds
+no relation); resource context evidences every pair with the shared
+resource's own attributes; none of the three emits a relation without its
+evidence, and no strategy emits `Inferred` (zero instances). The committed
+set is exposed as `bounds::COMMITTED_STRATEGIES` under the single version
+token `bounds::STRATEGY_SET_VERSION`, the surface an Investigation pins per
+run. The temporal strategy runs only under an explicit window the caller
+supplies through the Investigation; without one the runtime picks no
+window and the identity strategies run alone, the skip named in the
+coverage.

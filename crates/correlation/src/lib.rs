@@ -17,12 +17,19 @@
 //!   span is resident; a trace named by a log but absent from the resident
 //!   set is accounted as completeness coverage, never invented into a
 //!   relation).
+//! * **`ParentChild`** — a span attaches to the span its `parent_span_id`
+//!   names, when that span is resident.
+//! * **`ResourceContext`** — records that share one resource identity,
+//!   evidenced by the shared resource's own attributes.
+//! * **`ExemplarAttachment`** — a metric data point attaches to the span
+//!   an exemplar's trace context names, when that span is resident.
 //! * **`TemporalCoActivity`** — the subject's spans and the data points
 //!   co-active in a caller-supplied window.
 //!
-//! The remaining taxonomy types (`ParentChild`, `ResourceContext`,
-//! `ExemplarAttachment`, `Inferred`) are pinned contract: not implemented,
-//! and never produced.
+//! The committed set is machine-readable ([`bounds::COMMITTED_STRATEGIES`])
+//! and versioned ([`bounds::STRATEGY_SET_VERSION`]) so the Investigation
+//! flow can pin the strategy set an investigation ran under. `Inferred`
+//! remains a reserved type with zero instances: no strategy emits it.
 
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

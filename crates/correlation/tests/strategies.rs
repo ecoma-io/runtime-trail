@@ -1,25 +1,29 @@
 //! Behavioral tests for the correlation engine's committed strategies:
 //! `SpanIdentity`, `TraceIdentity` (with suppression and completeness
-//! accounting) and `TemporalCoActivity`, plus the run's bounds, degradation
-//! and residency re-check.
+//! accounting), `ParentChild`, `ResourceContext`, `ExemplarAttachment`
+//! and `TemporalCoActivity`, plus the run's bounds, degradation, the
+//! residency re-check, and the machine-readable, versioned strategy set.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use runtime_trail_correlation::bounds::{
-    CorrelationBounds, CorrelationOutcome, StoppedAt, Strategy,
+    COMMITTED_STRATEGIES, CorrelationBounds, CorrelationOutcome, STRATEGY_SET_VERSION, StoppedAt,
+    Strategy, committed_versions,
 };
 use runtime_trail_correlation::engine;
-use runtime_trail_correlation::relations::{Relation, RelationType, SignalKind, SignalRef, Window};
+use runtime_trail_correlation::relations::{
+    Relation, RelationType, SignalKind, SignalRef, Tier, Window,
+};
 use runtime_trail_storage::{
     AdmissionKey, KeepOutcome, PointView, ScanItem, ScanPage, StoreStats, TelemetryStore,
 };
 use runtime_trail_telemetry_model::{
-    AdmissionTime, Admitted, AssignedId, Attributes, EmitterDroppedCounts, EntityId,
-    InstrumentationScope, LogRecord, MetricNumber, MetricPoint, NumberPoint, Resource, Span,
-    SpanId, SpanKind, SpanStatus, SpanStatusCode, StreamIdentity, StreamKind, TraceContext,
-    TraceFlags, TraceId, TraceState, Value,
+    AdmissionTime, Admitted, AssignedId, Attributes, EmitterDroppedCounts, EntityId, Exemplar,
+    InstrumentationScope, KeyValueList, LogRecord, MetricNumber, MetricPoint, NumberPoint,
+    Resource, Span, SpanId, SpanKind, SpanStatus, SpanStatusCode, StreamIdentity, StreamKind,
+    TraceContext, TraceFlags, TraceId, TraceState, Value,
 };
 
 const TRACE: u8 = 1;
@@ -133,6 +137,72 @@ fn fixture_stream(name: &str) -> StreamIdentity {
     }
 }
 
+fn stream_on(name: &str, resource: Resource) -> StreamIdentity {
+    let mut stream = fixture_stream(name);
+    stream.resource = resource;
+    stream
+}
+
+fn resource_with(pairs: &[(&str, i64)]) -> Resource {
+    Resource {
+        attributes: Attributes::from_pairs(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), Value::Int(*value)))
+                .collect(),
+        )
+        .expect("fixture attribute keys are unique"),
+        schema_url: None,
+        dropped_attributes_count: 0,
+    }
+}
+
+fn fixture_log_with(
+    trace: Option<u8>,
+    span_byte: Option<u8>,
+    name: &str,
+    resource: Resource,
+) -> LogRecord {
+    let mut log = fixture_log(trace, span_byte, name);
+    log.resource = Arc::new(resource);
+    log
+}
+
+/// A span whose parent field and resource the fixture controls, so the
+/// taxonomy strategies see realistic shapes.
+fn taxonomy_span(
+    trace: u8,
+    span_byte: u8,
+    name: &str,
+    start: u64,
+    parent: Option<u8>,
+    resource: Resource,
+) -> Span {
+    let mut span = fixture_span(trace, span_byte, name, start);
+    span.parent_span_id = parent.map(span_id_of);
+    span.resource = Arc::new(resource);
+    span
+}
+
+fn fixture_exemplar(trace: Option<u8>, span: Option<u8>) -> Exemplar {
+    Exemplar {
+        value: MetricNumber::int(3),
+        time_unix_nano: 12,
+        filtered_attributes: Attributes::default(),
+        trace_id: trace.map(trace_id_of),
+        span_id: span.map(span_id_of),
+    }
+}
+
+fn fixture_point_with_exemplars(time: u64, exemplars: Vec<Exemplar>) -> MetricPoint {
+    MetricPoint::Number(NumberPoint::measurement(
+        time,
+        MetricNumber::int(1),
+        Attributes::default(),
+        exemplars,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The fixture store: a contract-conforming stub over residency-order maps,
 // holding the same Arc payloads across every call.
@@ -243,6 +313,23 @@ impl FixtureStore {
                 record: Arc::new(point),
             },
             Arc::new(fixture_stream("requests")),
+        );
+    }
+
+    fn admit_point_on(
+        &mut self,
+        nano: u64,
+        entity: EntityId,
+        point: MetricPoint,
+        stream: StreamIdentity,
+    ) {
+        let _ = self.keep_metric_point(
+            Admitted {
+                entity,
+                admitted_at: at(nano),
+                record: Arc::new(point),
+            },
+            Arc::new(stream),
         );
     }
 }
@@ -481,6 +568,420 @@ fn default_bounds() -> CorrelationBounds {
 
 fn run(store: &dyn TelemetryStore, bounds: &CorrelationBounds) -> CorrelationOutcome {
     engine::correlate(store, bounds)
+}
+
+// ---------------------------------------------------------------------------
+// The taxonomy fixture: the committed set's coverage store — a
+// root/child/grandchild chain sharing one resource, an exact log, a
+// trace-only log, an other-trace log, and two points inside the window,
+// one of them carrying an exemplar that names the child span.
+// ---------------------------------------------------------------------------
+
+fn taxonomy_store() -> FixtureStore {
+    let mut store = FixtureStore::empty();
+    let shared = resource_with(&[("service.name", 1), ("deployment", 2)]);
+    let solo = resource_with(&[("service.name", 3)]);
+    let solo2 = resource_with(&[("service.name", 4)]);
+    let point_a = resource_with(&[("service.name", 5)]);
+    let point_b = resource_with(&[("service.name", 6)]);
+    store.admit_span(
+        100,
+        span_entity(TRACE, 1),
+        taxonomy_span(TRACE, 1, "root", 10, None, shared.clone()),
+    );
+    store.admit_span(
+        200,
+        span_entity(TRACE, 2),
+        taxonomy_span(TRACE, 2, "child", 20, Some(1), shared.clone()),
+    );
+    store.admit_span(
+        300,
+        span_entity(TRACE, 3),
+        taxonomy_span(TRACE, 3, "grandchild", 30, Some(2), shared.clone()),
+    );
+    store.admit_log(
+        400,
+        assigned(1),
+        fixture_log_with(Some(TRACE), Some(1), "exact", shared),
+    );
+    store.admit_log(
+        500,
+        assigned(2),
+        fixture_log_with(Some(TRACE), None, "trace-only", solo),
+    );
+    store.admit_log(
+        600,
+        assigned(3),
+        fixture_log_with(Some(2), None, "other-trace", solo2),
+    );
+    store.admit_point_on(
+        700,
+        assigned(10),
+        fixture_point_with_exemplars(15, vec![fixture_exemplar(Some(TRACE), Some(2))]),
+        stream_on("requests", point_a),
+    );
+    store.admit_point_on(
+        800,
+        assigned(11),
+        fixture_point_with_exemplars(25, Vec::new()),
+        stream_on("requests", point_b),
+    );
+    store
+}
+
+fn taxonomy_bounds() -> CorrelationBounds {
+    CorrelationBounds {
+        strategies: vec![
+            Strategy::SpanIdentity,
+            Strategy::TraceIdentity,
+            Strategy::ParentChild,
+            Strategy::ResourceContext,
+            Strategy::ExemplarAttachment,
+            Strategy::TemporalCoActivity,
+        ],
+        window: Some(Window::new(10, 40)),
+        max_relations: 1_000,
+        max_hops: 2,
+        max_scan: 1_000,
+        subject_trace: Some(trace_id_of(TRACE)),
+    }
+}
+
+/// One span chain plus the malformed shapes the generation guards refuse:
+/// a root, a child, a grandchild, a span naming an absent parent, a span
+/// carrying the emitter's absent-parent marker (the zero parent), and a
+/// span naming itself as its parent.
+fn parent_child_store() -> FixtureStore {
+    let mut store = FixtureStore::empty();
+    store.admit_span(
+        100,
+        span_entity(TRACE, 1),
+        taxonomy_span(
+            TRACE,
+            1,
+            "root",
+            10,
+            None,
+            resource_with(&[("service.name", 1)]),
+        ),
+    );
+    store.admit_span(
+        200,
+        span_entity(TRACE, 2),
+        taxonomy_span(
+            TRACE,
+            2,
+            "child",
+            20,
+            Some(1),
+            resource_with(&[("service.name", 2)]),
+        ),
+    );
+    store.admit_span(
+        300,
+        span_entity(TRACE, 3),
+        taxonomy_span(
+            TRACE,
+            3,
+            "grandchild",
+            30,
+            Some(2),
+            resource_with(&[("service.name", 3)]),
+        ),
+    );
+    store.admit_span(
+        400,
+        span_entity(TRACE, 4),
+        taxonomy_span(
+            TRACE,
+            4,
+            "absent-parent",
+            40,
+            Some(9),
+            resource_with(&[("service.name", 4)]),
+        ),
+    );
+    store.admit_span(
+        500,
+        span_entity(TRACE, 5),
+        taxonomy_span(
+            TRACE,
+            5,
+            "zero-parent",
+            50,
+            Some(0),
+            resource_with(&[("service.name", 5)]),
+        ),
+    );
+    store.admit_span(
+        600,
+        span_entity(TRACE, 6),
+        taxonomy_span(
+            TRACE,
+            6,
+            "self-parent",
+            60,
+            Some(6),
+            resource_with(&[("service.name", 6)]),
+        ),
+    );
+    store
+}
+
+fn parent_child_bounds() -> CorrelationBounds {
+    CorrelationBounds {
+        strategies: vec![Strategy::ParentChild],
+        window: None,
+        max_relations: 1_000,
+        max_hops: 2,
+        max_scan: 1_000,
+        subject_trace: None,
+    }
+}
+
+/// Records across five resources: a group of four (two spans, one log) on
+/// `a`, a span-and-point pair on `b`, a pair sharing the empty identity on
+/// `c`, and singletons that must ground nothing.
+fn resource_context_store() -> FixtureStore {
+    let mut store = FixtureStore::empty();
+    let a = resource_with(&[("service.name", 1), ("deployment", 2)]);
+    let b = resource_with(&[("service.name", 3)]);
+    store.admit_span(
+        100,
+        span_entity(TRACE, 1),
+        taxonomy_span(TRACE, 1, "a1", 10, None, a.clone()),
+    );
+    store.admit_span(
+        200,
+        span_entity(TRACE, 2),
+        taxonomy_span(TRACE, 2, "a2", 20, None, a.clone()),
+    );
+    store.admit_log(
+        300,
+        assigned(1),
+        fixture_log_with(Some(TRACE), None, "a-log", a),
+    );
+    store.admit_span(
+        400,
+        span_entity(TRACE, 3),
+        taxonomy_span(TRACE, 3, "b1", 30, None, b.clone()),
+    );
+    store.admit_point_on(
+        500,
+        assigned(10),
+        fixture_point(35),
+        stream_on("requests", b),
+    );
+    store.admit_span(
+        600,
+        span_entity(TRACE, 4),
+        taxonomy_span(TRACE, 4, "c1", 40, None, fixture_resource()),
+    );
+    store.admit_log(
+        700,
+        assigned(2),
+        fixture_log_with(Some(TRACE), None, "c-log", fixture_resource()),
+    );
+    store.admit_span(
+        800,
+        span_entity(TRACE, 5),
+        taxonomy_span(
+            TRACE,
+            5,
+            "solo",
+            50,
+            None,
+            resource_with(&[("service.name", 9)]),
+        ),
+    );
+    store
+}
+
+fn resource_context_bounds() -> CorrelationBounds {
+    CorrelationBounds {
+        strategies: vec![Strategy::ResourceContext],
+        window: None,
+        max_relations: 1_000,
+        max_hops: 2,
+        max_scan: 1_000,
+        subject_trace: None,
+    }
+}
+
+/// One resident target span and four points whose exemplars cover the
+/// resolvable case and every refusal: a non-resident span, a trace id
+/// without a span id, and a span id without a trace id.
+fn exemplar_store() -> FixtureStore {
+    let mut store = FixtureStore::empty();
+    let r = resource_with(&[("service.name", 1)]);
+    store.admit_span(
+        100,
+        span_entity(TRACE, 2),
+        taxonomy_span(TRACE, 2, "target", 10, None, r.clone()),
+    );
+    store.admit_point_on(
+        200,
+        assigned(10),
+        fixture_point_with_exemplars(15, vec![fixture_exemplar(Some(TRACE), Some(2))]),
+        stream_on("m", r.clone()),
+    );
+    store.admit_point_on(
+        300,
+        assigned(11),
+        fixture_point_with_exemplars(25, vec![fixture_exemplar(Some(9), Some(9))]),
+        stream_on("m", r.clone()),
+    );
+    store.admit_point_on(
+        400,
+        assigned(12),
+        fixture_point_with_exemplars(35, vec![fixture_exemplar(Some(TRACE), None)]),
+        stream_on("m", r.clone()),
+    );
+    store.admit_point_on(
+        500,
+        assigned(13),
+        fixture_point_with_exemplars(45, vec![fixture_exemplar(None, Some(2))]),
+        stream_on("m", r),
+    );
+    store
+}
+
+fn exemplar_bounds() -> CorrelationBounds {
+    CorrelationBounds {
+        strategies: vec![Strategy::ExemplarAttachment],
+        window: None,
+        max_relations: 1_000,
+        max_hops: 2,
+        max_scan: 1_000,
+        subject_trace: None,
+    }
+}
+
+/// The bounded-generation fixture, run under the three taxonomy-only
+/// strategies: the parent/exemplar guards refuse their malformed shapes
+/// while generating, and one intended resource pair survives.
+fn bounded_generation_store() -> FixtureStore {
+    let mut store = FixtureStore::empty();
+    let shared = resource_with(&[("service.name", 1), ("deployment", 2)]);
+    store.admit_span(
+        100,
+        span_entity(TRACE, 1),
+        taxonomy_span(TRACE, 1, "root", 10, None, shared.clone()),
+    );
+    store.admit_span(
+        200,
+        span_entity(TRACE, 2),
+        taxonomy_span(
+            TRACE,
+            2,
+            "child",
+            20,
+            Some(1),
+            resource_with(&[("service.name", 2)]),
+        ),
+    );
+    store.admit_span(
+        300,
+        span_entity(TRACE, 3),
+        taxonomy_span(
+            TRACE,
+            3,
+            "grandchild",
+            30,
+            Some(2),
+            resource_with(&[("service.name", 3)]),
+        ),
+    );
+    store.admit_span(
+        400,
+        span_entity(TRACE, 4),
+        taxonomy_span(
+            TRACE,
+            4,
+            "absent-parent",
+            40,
+            Some(9),
+            resource_with(&[("service.name", 4)]),
+        ),
+    );
+    store.admit_span(
+        500,
+        span_entity(TRACE, 5),
+        taxonomy_span(
+            TRACE,
+            5,
+            "zero-parent",
+            50,
+            Some(0),
+            resource_with(&[("service.name", 5)]),
+        ),
+    );
+    store.admit_span(
+        600,
+        span_entity(TRACE, 6),
+        taxonomy_span(
+            TRACE,
+            6,
+            "self-parent",
+            60,
+            Some(6),
+            resource_with(&[("service.name", 6)]),
+        ),
+    );
+    store.admit_log(
+        700,
+        assigned(1),
+        fixture_log_with(Some(TRACE), None, "shared", shared),
+    );
+    store.admit_point_on(
+        800,
+        assigned(10),
+        fixture_point_with_exemplars(15, vec![fixture_exemplar(Some(TRACE), Some(2))]),
+        stream_on("m", resource_with(&[("service.name", 7)])),
+    );
+    store.admit_point_on(
+        900,
+        assigned(11),
+        fixture_point_with_exemplars(25, vec![fixture_exemplar(Some(9), Some(9))]),
+        stream_on("m", resource_with(&[("service.name", 8)])),
+    );
+    store.admit_point_on(
+        1000,
+        assigned(12),
+        fixture_point_with_exemplars(35, vec![fixture_exemplar(Some(TRACE), None)]),
+        stream_on("m", resource_with(&[("service.name", 9)])),
+    );
+    store.admit_point_on(
+        1100,
+        assigned(13),
+        fixture_point_with_exemplars(45, vec![fixture_exemplar(None, Some(2))]),
+        stream_on("m", resource_with(&[("service.name", 10)])),
+    );
+    store
+}
+
+fn bounded_generation_bounds() -> CorrelationBounds {
+    CorrelationBounds {
+        strategies: vec![
+            Strategy::ParentChild,
+            Strategy::ResourceContext,
+            Strategy::ExemplarAttachment,
+        ],
+        window: None,
+        max_relations: 1_000,
+        max_hops: 2,
+        max_scan: 1_000,
+        subject_trace: None,
+    }
+}
+
+fn span_id_of_entity(entity: EntityId) -> SpanId {
+    match entity {
+        EntityId::Span { span_id, .. } => span_id,
+        EntityId::Assigned(other) => {
+            unreachable!("parent/child endpoints are spans, got {other:?}")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,12 +1248,15 @@ fn runs_are_deterministic_regardless_of_strategy_order() {
 
 #[test]
 fn every_relation_cites_resident_endpoints_and_no_self_loop() {
-    let store = identity_store();
-    let outcome = run(&store, &default_bounds());
+    let store = taxonomy_store();
+    let outcome = run(&store, &taxonomy_bounds());
 
     for relation in &outcome.relations {
         assert_ne!(relation.from, relation.to);
-        assert!(!relation.facts.is_empty());
+        assert!(
+            !relation.facts.is_empty(),
+            "every relation carries its evidence"
+        );
         let from_present = match relation.from.kind {
             SignalKind::Spans => store.span(relation.from.entity).is_some(),
             SignalKind::LogRecords => store.log_record(relation.from.entity).is_some(),
@@ -765,12 +1269,15 @@ fn every_relation_cites_resident_endpoints_and_no_self_loop() {
         };
         assert!(from_present, "from endpoint must be resident");
         assert!(to_present, "to endpoint must be resident");
-        // Only committed strategies produce relations: none of the pinned
-        // contract types, and nothing inferred.
+        // Only committed strategies produce relations: the six committed
+        // taxonomy types, never `Inferred`.
         assert!(matches!(
             relation.relation_type,
             RelationType::SpanIdentity
                 | RelationType::TraceIdentity
+                | RelationType::ParentChild
+                | RelationType::ResourceContext
+                | RelationType::ExemplarAttachment
                 | RelationType::TemporalCoActivity
         ));
     }
@@ -888,5 +1395,381 @@ fn evicted_endpoints_drop_their_relations_and_are_counted() {
     assert_eq!(
         spans,
         HashSet::from([span_entity(TRACE, 1), span_entity(TRACE, 3)])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Taxonomy completion (issue #37)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parent_child_relates_a_span_to_the_span_its_parent_span_id_names() {
+    let store = parent_child_store();
+    let outcome = run(&store, &parent_child_bounds());
+
+    let parent_child: Vec<&Relation<SignalRef>> = outcome
+        .relations
+        .iter()
+        .filter(|relation| relation.relation_type == RelationType::ParentChild)
+        .collect();
+    // child → root and grandchild → child: exactly the direct relations,
+    // never a second-order grandchild → root.
+    assert_eq!(parent_child.len(), 2);
+    let pairs: HashSet<(EntityId, EntityId)> = parent_child
+        .iter()
+        .map(|relation| (relation.from.entity, relation.to.entity))
+        .collect();
+    assert_eq!(
+        pairs,
+        HashSet::from([
+            (span_entity(TRACE, 2), span_entity(TRACE, 1)),
+            (span_entity(TRACE, 3), span_entity(TRACE, 2)),
+        ])
+    );
+    for relation in &parent_child {
+        assert_eq!(relation.from.kind, SignalKind::Spans);
+        assert_eq!(relation.to.kind, SignalKind::Spans);
+        assert_eq!(relation.window, None);
+        assert_eq!(relation.strategy.name, "parent_child");
+        assert_eq!(relation.strategy.version, "1.0.0");
+        assert_eq!(relation.tier(), Tier::Structural);
+        // The evidence is the parent id cited verbatim — it names the
+        // relation's own target.
+        assert_eq!(relation.facts.len(), 1);
+        assert_eq!(relation.facts[0].field, "parent_span_id");
+        assert_eq!(
+            relation.facts[0].value,
+            Value::Bytes(span_id_of_entity(relation.to.entity).as_bytes().to_vec())
+        );
+    }
+    // The generation guards held while generating: none of the malformed
+    // spans grounded a relation (bounded, never generate-then-drop).
+    let producers: HashSet<EntityId> = outcome
+        .relations
+        .iter()
+        .map(|relation| relation.from.entity)
+        .collect();
+    assert!(!producers.contains(&span_entity(TRACE, 4)));
+    assert!(!producers.contains(&span_entity(TRACE, 5)));
+    assert!(!producers.contains(&span_entity(TRACE, 6)));
+}
+
+#[test]
+fn resource_context_relates_every_pair_sharing_a_resource_evidenced_by_its_attributes() {
+    let store = resource_context_store();
+    let outcome = run(&store, &resource_context_bounds());
+
+    let resource_context: Vec<&Relation<SignalRef>> = outcome
+        .relations
+        .iter()
+        .filter(|relation| relation.relation_type == RelationType::ResourceContext)
+        .collect();
+    // Group `a` (two spans + one log): three pairs; group `b` (span +
+    // point): one pair; group `c` (the empty identity): one pair; the
+    // singleton grounds nothing. Five relations, none across resources.
+    assert_eq!(resource_context.len(), 5);
+    let pairs: HashSet<(EntityId, EntityId)> = resource_context
+        .iter()
+        .map(|relation| (relation.from.entity, relation.to.entity))
+        .collect();
+    assert_eq!(
+        pairs,
+        HashSet::from([
+            (span_entity(TRACE, 1), span_entity(TRACE, 2)),
+            (span_entity(TRACE, 1), assigned(1)),
+            (span_entity(TRACE, 2), assigned(1)),
+            (span_entity(TRACE, 3), assigned(10)),
+            (span_entity(TRACE, 4), assigned(2)),
+        ])
+    );
+    // The kinds mix across signals: the log and the point both attach.
+    let to_kinds: HashSet<SignalKind> = resource_context
+        .iter()
+        .map(|relation| relation.to.kind)
+        .collect();
+    assert_eq!(
+        to_kinds,
+        HashSet::from([
+            SignalKind::Spans,
+            SignalKind::LogRecords,
+            SignalKind::MetricPoints
+        ])
+    );
+    for relation in &resource_context {
+        assert_eq!(relation.window, None);
+        assert_eq!(relation.strategy.name, "resource_context");
+        assert_eq!(relation.strategy.version, "1.0.0");
+        assert_eq!(relation.tier(), Tier::Structural);
+    }
+    // The evidence is the shared resource's own attributes, verbatim —
+    // a map, so the facts come in the attributes' own (sorted) order.
+    let facts_of = |from: EntityId, to: EntityId| -> HashMap<&str, &Value> {
+        resource_context
+            .iter()
+            .find(|relation| relation.from.entity == from && relation.to.entity == to)
+            .map(|relation| {
+                relation
+                    .facts
+                    .iter()
+                    .map(|fact| (fact.field.as_str(), &fact.value))
+                    .collect()
+            })
+            .expect("the pair exists in the fixture")
+    };
+    let a_facts = facts_of(span_entity(TRACE, 1), span_entity(TRACE, 2));
+    assert_eq!(a_facts.len(), 2);
+    assert_eq!(a_facts.get("service.name"), Some(&&Value::Int(1)));
+    assert_eq!(a_facts.get("deployment"), Some(&&Value::Int(2)));
+    let b_facts = facts_of(span_entity(TRACE, 3), assigned(10));
+    assert_eq!(b_facts.get("service.name"), Some(&&Value::Int(3)));
+    // The empty identity is evidenced by itself: one fact naming an empty
+    // attribute list, so no relation is ever left without its evidence.
+    let c_facts = facts_of(span_entity(TRACE, 4), assigned(2));
+    assert_eq!(c_facts.len(), 1);
+    assert_eq!(
+        c_facts.get("resource"),
+        Some(&&Value::KvList(
+            KeyValueList::new(Vec::new()).expect("an empty list cannot duplicate keys")
+        ))
+    );
+    match c_facts.get("resource").copied() {
+        Some(Value::KvList(list)) => assert!(list.is_empty()),
+        other => panic!("expected an empty attribute list, got {other:?}"),
+    }
+    // A singleton resource shares nothing: it grounds no relation.
+    assert!(!resource_context.iter().any(|relation| {
+        relation.from.entity == span_entity(TRACE, 5) || relation.to.entity == span_entity(TRACE, 5)
+    }));
+}
+
+#[test]
+fn exemplar_attachment_relates_a_point_to_the_span_its_exemplar_names() {
+    let store = exemplar_store();
+    let outcome = run(&store, &exemplar_bounds());
+
+    let exemplar_attachment: Vec<&Relation<SignalRef>> = outcome
+        .relations
+        .iter()
+        .filter(|relation| relation.relation_type == RelationType::ExemplarAttachment)
+        .collect();
+    // Only the point whose exemplar named the resident span 2 attached.
+    assert_eq!(exemplar_attachment.len(), 1);
+    let relation = exemplar_attachment[0];
+    assert_eq!(relation.from.kind, SignalKind::MetricPoints);
+    assert_eq!(relation.from.entity, assigned(10));
+    assert_eq!(relation.to.kind, SignalKind::Spans);
+    assert_eq!(relation.to.entity, span_entity(TRACE, 2));
+    assert_eq!(relation.window, None);
+    assert_eq!(relation.strategy.name, "exemplar_attachment");
+    assert_eq!(relation.strategy.version, "1.0.0");
+    assert_eq!(relation.tier(), Tier::Attachment);
+    // The exemplar's own ids, cited verbatim.
+    assert_eq!(relation.facts.len(), 2);
+    let fields: Vec<(String, &Value)> = relation
+        .facts
+        .iter()
+        .map(|fact| (fact.field.clone(), &fact.value))
+        .collect();
+    assert!(fields.contains(&(
+        "exemplar.trace_id".to_owned(),
+        &Value::Bytes(vec![TRACE; 16])
+    )));
+    assert!(fields.contains(&("exemplar.span_id".to_owned(), &Value::Bytes(vec![2; 8]))));
+    // The refusals, held while generating: a non-resident span, a trace id
+    // alone, a span id alone — none fabricated, no relation to an absent
+    // record.
+    let producers: HashSet<EntityId> = outcome
+        .relations
+        .iter()
+        .map(|relation| relation.from.entity)
+        .collect();
+    assert!(!producers.contains(&assigned(11)));
+    assert!(!producers.contains(&assigned(12)));
+    assert!(!producers.contains(&assigned(13)));
+}
+
+#[test]
+fn the_committed_strategy_set_is_machine_readable_and_fully_covered() {
+    let store = taxonomy_store();
+    let outcome = run(&store, &taxonomy_bounds());
+
+    // The expectations are exhaustive over the strategy enum: a strategy
+    // added to the set must earn a match arm here (a compile-time failure
+    // otherwise) and must produce relations of its type in the fixture.
+    let expectation = |strategy: &Strategy| -> usize {
+        match strategy {
+            Strategy::SpanIdentity | Strategy::ExemplarAttachment => 1, // the exact log / the point whose exemplar names span 2
+            Strategy::TraceIdentity => 3, // the trace-only log × three spans
+            Strategy::ParentChild => 2,   // child → root, grandchild → child
+            Strategy::ResourceContext | Strategy::TemporalCoActivity => 6, // every shared-resource pair / three spans × two in-window points
+        }
+    };
+    let mut by_type: HashMap<RelationType, usize> = HashMap::new();
+    for relation in &outcome.relations {
+        *by_type.entry(relation.relation_type).or_default() += 1;
+    }
+    // No strategy emits `Inferred`: its zero instances are invariant.
+    assert_eq!(
+        by_type.get(&RelationType::Inferred),
+        None,
+        "Inferred has zero instances"
+    );
+    let total: usize = COMMITTED_STRATEGIES
+        .iter()
+        .map(|strategy| {
+            let expected = expectation(strategy);
+            let observed = by_type
+                .get(&strategy.relation_type())
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(
+                observed,
+                expected,
+                "strategy {} is covered by its relations",
+                strategy.name()
+            );
+            observed
+        })
+        .sum();
+    assert_eq!(
+        total,
+        outcome.relations.len(),
+        "no relation type is unaccounted"
+    );
+    // The set is enumerable, complete (six entries, no duplicates), and
+    // versioned — the token the Investigation flow pins per investigation.
+    let named: HashSet<&'static str> = COMMITTED_STRATEGIES.iter().map(|s| s.name()).collect();
+    assert_eq!(named.len(), 6);
+    for strategy in COMMITTED_STRATEGIES {
+        assert!(named.contains(strategy.name()));
+    }
+    assert!(!STRATEGY_SET_VERSION.is_empty());
+    assert_eq!(committed_versions().len(), COMMITTED_STRATEGIES.len());
+    assert!(
+        committed_versions()
+            .iter()
+            .all(|version| !version.version.is_empty())
+    );
+}
+
+#[test]
+fn equal_inputs_produce_byte_equal_relation_sets() {
+    // Two independently built stores with identical admissions: the
+    // relation sets — their bytes, not merely their shapes — are equal.
+    let first_store = taxonomy_store();
+    let second_store = taxonomy_store();
+
+    let first = run(&first_store, &taxonomy_bounds());
+    let second = run(&second_store, &taxonomy_bounds());
+
+    assert_eq!(
+        format!("{:?}", first.relations),
+        format!("{:?}", second.relations),
+        "same ingestion yields byte-equal relation sets"
+    );
+    assert_eq!(first.truth, second.truth);
+    // Rerunning on the same store is byte-equal too: a run is an
+    // idempotent function of (store, bounds).
+    let rerun = run(&first_store, &taxonomy_bounds());
+    assert_eq!(
+        format!("{:?}", rerun.relations),
+        format!("{:?}", first.relations)
+    );
+}
+
+#[test]
+fn bounded_generation_never_forms_relations_to_absent_records_or_second_order() {
+    let store = bounded_generation_store();
+    let outcome = run(&store, &bounded_generation_bounds());
+
+    // Exactly the intended relations survive: the two direct parent links,
+    // the one shared-resource pair, and the one resolvable exemplar. The
+    // malformed shapes were refused while generating — the engine never
+    // forms a relation first and truncates it later.
+    let mut by_type: HashMap<RelationType, usize> = HashMap::new();
+    for relation in &outcome.relations {
+        *by_type.entry(relation.relation_type).or_default() += 1;
+    }
+    assert_eq!(
+        by_type
+            .get(&RelationType::ParentChild)
+            .copied()
+            .unwrap_or_default(),
+        2
+    );
+    assert_eq!(
+        by_type
+            .get(&RelationType::ResourceContext)
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+    assert_eq!(
+        by_type
+            .get(&RelationType::ExemplarAttachment)
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+    assert_eq!(
+        by_type.len(),
+        3,
+        "only the taxonomy strategies produced relations"
+    );
+
+    for relation in &outcome.relations {
+        assert_ne!(relation.from, relation.to);
+        assert!(
+            !relation.facts.is_empty(),
+            "every relation carries its evidence"
+        );
+        // Every endpoint is a resident record: no relation formed to an
+        // absent parent or an exemplar's absent span.
+        let from_present = match relation.from.kind {
+            SignalKind::Spans => store.span(relation.from.entity).is_some(),
+            SignalKind::LogRecords => store.log_record(relation.from.entity).is_some(),
+            SignalKind::MetricPoints => store.metric_point(relation.from.entity).is_some(),
+        };
+        let to_present = match relation.to.kind {
+            SignalKind::Spans => store.span(relation.to.entity).is_some(),
+            SignalKind::LogRecords => store.log_record(relation.to.entity).is_some(),
+            SignalKind::MetricPoints => store.metric_point(relation.to.entity).is_some(),
+        };
+        assert!(from_present, "from endpoint resident");
+        assert!(to_present, "to endpoint resident");
+    }
+
+    // The refusals: no absent-parent, zero-parent, or self-parent span
+    // produced a relation, and no point with a non-resident or partial
+    // exemplar attached.
+    let producers: HashSet<EntityId> = outcome.relations.iter().map(|r| r.from.entity).collect();
+    for refused in [
+        span_entity(TRACE, 4),
+        span_entity(TRACE, 5),
+        span_entity(TRACE, 6),
+        assigned(11),
+        assigned(12),
+        assigned(13),
+    ] {
+        assert!(
+            !producers.contains(&refused),
+            "{refused:?} grounded nothing"
+        );
+    }
+    // The strategy versions reported are the ones in effect — the surface
+    // an Investigation pins per run — never invented.
+    let versions: Vec<(&str, &str)> = outcome
+        .truth
+        .strategy_versions
+        .iter()
+        .map(|version| (version.name.as_str(), version.version.as_str()))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![
+            ("parent_child", "1.0.0"),
+            ("resource_context", "1.0.0"),
+            ("exemplar_attachment", "1.0.0"),
+        ]
     );
 }
