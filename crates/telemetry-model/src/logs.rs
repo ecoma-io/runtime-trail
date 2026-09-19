@@ -16,6 +16,7 @@
 use crate::context::{SpanId, TraceFlags, TraceId};
 use crate::resources::{InstrumentationScope, Resource};
 use crate::values::{Attributes, Value};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use std::sync::Arc;
 /// Values outside 1–24 are outside the model's domain and are rejected at
 /// construction, never coerced. The mapped display name of a severity is a
 /// view concern; nothing here maps or derives one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SeverityNumber(u8);
 
 impl SeverityNumber {
@@ -79,7 +80,7 @@ impl std::error::Error for SeverityOutOfRange {}
 /// log-record identity, so admission never collapses one onto another (see
 /// `docs/architecture/telemetry-model.md`, "Record identity and duplicate
 /// delivery").
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogRecord {
     /// Event time, in nanoseconds on the emitter's clock; `None` when the
     /// emitter sent none. Never synthesised from

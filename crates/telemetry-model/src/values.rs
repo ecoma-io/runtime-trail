@@ -25,6 +25,7 @@
 //! refuses it) cannot overflow the stack. See [`Value::exceeds_nesting`]
 //! and `crate::size`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -48,6 +49,23 @@ use std::hash::{Hash, Hasher};
 /// the bits read as `u64`.
 #[derive(Clone, Copy, Debug)]
 pub struct Float(f64);
+impl Serialize for Float {
+    /// The persistence encoding is the IEEE-754 bit pattern of the double:
+    /// JSON cannot carry NaN or the infinities, and the model preserves a
+    /// double verbatim, so the wire form is the bits as an unsigned
+    /// integer. Decoding reverses the exact bits — a serialized double is
+    /// bit-identical when it comes back, sign bit and NaN payload included.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.0.to_bits())
+    }
+}
+
+impl<'de> Deserialize<'de> for Float {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u64::deserialize(deserializer)?;
+        Ok(Self::new(f64::from_bits(bits)))
+    }
+}
 
 impl Float {
     /// Wraps a raw `f64` verbatim — no normalisation, no canonicalisation.
@@ -174,7 +192,7 @@ impl std::error::Error for MixedKindArray {}
 /// arrays of key-value lists are common structured-log bodies). An empty
 /// array is a value: it is distinct from the key being absent, and it
 /// carries no kind.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HomogeneousArray {
     items: Vec<Value>,
 }
@@ -279,7 +297,7 @@ fn drop_values(values: Vec<Value>) {
 ///
 /// Dropping a deeply nested list is iterative (see [`Self::drop`]), so a
 /// value the depth gate refused cannot overflow the stack on its way out.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct KeyValueList {
     entries: Vec<(String, Value)>,
 }
@@ -368,7 +386,7 @@ impl<'a> IntoIterator for &'a KeyValueList {
 /// total order consistent with the map equality above: reordered but
 /// equal maps compare `Equal`. This is what lets identity content carry
 /// into ordered — never hashed — maps (ADR 0008).
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Attributes {
     entries: BTreeMap<String, Value>,
 }
@@ -451,7 +469,7 @@ impl<'a> IntoIterator for &'a Attributes {
 /// [`PartialEq`] (variant order first, then fields, [`Float`] by bit
 /// pattern) — the order identity keys need for ordered maps, never a
 /// numeric or semantic ranking of values.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {
     String(String),
     Bool(bool),

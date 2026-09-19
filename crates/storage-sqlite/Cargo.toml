@@ -11,6 +11,13 @@ publish = false
 [dependencies]
 runtime-trail-storage = { workspace = true }
 runtime-trail-telemetry-model = { workspace = true }
+serde = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
