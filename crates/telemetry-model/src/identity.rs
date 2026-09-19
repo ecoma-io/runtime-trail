@@ -12,6 +12,7 @@
 pub use crate::budgets::BudgetRejection;
 use crate::context::{SpanId, TraceId};
 use crate::metrics::StreamShapeError;
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
 
 /// An admission-assigned, opaque entity id.
@@ -20,7 +21,7 @@ use std::num::NonZeroU64;
 /// persisted: a reopened file-backed session reassigns them, and no handle
 /// built on them survives a restart. Cursors, relation endpoints and
 /// investigation references name entity ids — nothing else does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityId {
     /// The natural wire identity of a span whose trace id and span id are
     /// both valid: the same `(trace_id, span_id)` the emitter sent. This
@@ -53,7 +54,7 @@ impl EntityId {
 /// The derived [`Ord`] is serial order — admission order within the
 /// session — the total order the ledger's assigned-id index needs for its
 /// ordered map. Opacity is about *meaning*, not orderability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AssignedId {
     pub(crate) serial: NonZeroU64,
 }

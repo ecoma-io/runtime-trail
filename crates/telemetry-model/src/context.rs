@@ -5,6 +5,7 @@
 //! sent, a 32-bit flags field of which only the sampled bit is interpreted,
 //! and an ordered tracestate whose entries are never merged, deduplicated
 //! or sorted.
+use serde::{Deserialize, Serialize};
 
 /// A 16-byte trace id, preserved verbatim as the emitter sent it.
 ///
@@ -12,7 +13,7 @@
 /// hashed into something else, or coerced — it is preserved as what the
 /// emitter sent, and a span carrying one is admitted under an
 /// admission-assigned entity id rather than its natural identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TraceId([u8; Self::LENGTH]);
 
 impl TraceId {
@@ -49,7 +50,7 @@ impl TraceId {
 ///
 /// The all-zero encoding is invalid; see [`TraceId`] for what preservation
 /// of an invalid value means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SpanId([u8; Self::LENGTH]);
 
 impl SpanId {
@@ -91,7 +92,7 @@ impl SpanId {
 /// round trip; readers MUST NOT assume bits 10–31 are zero. Every bit is
 /// carried exactly as sent and none but the sampled bit is ever read as
 /// meaning.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceFlags(u32);
 
 impl TraceFlags {
@@ -119,7 +120,7 @@ impl TraceFlags {
 }
 
 /// One tracestate entry: a vendor key and its opaque value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceStateEntry {
     /// The vendor key, as sent.
     pub vendor: String,
@@ -131,7 +132,7 @@ pub struct TraceStateEntry {
 ///
 /// Entries are never merged, deduplicated or sorted — a repeated vendor key
 /// is two entries, and reversing the order is a different tracestate.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceState {
     entries: Vec<TraceStateEntry>,
 }
@@ -175,7 +176,7 @@ impl<'a> IntoIterator for &'a TraceState {
 /// exemplars carry only the fields OTLP defines for them — see
 /// [`crate::logs::LogRecord`] and [`crate::metrics::Exemplar`] — which is
 /// why this struct exists only where the whole of it is on the wire.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceContext {
     /// The 16-byte trace id, as sent.
     pub trace_id: TraceId,

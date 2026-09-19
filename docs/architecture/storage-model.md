@@ -146,7 +146,48 @@ engine is what makes "copy one file, reopen the session" possible.
 
 ## Status
 
-**Phase 1 implements the abstraction and memory mode** — the retention
+**Phase 1 implemented the abstraction and memory mode** — the retention
 contract above has a real trait surface and an in-memory driver enforced
-against it. File-backed mode lands with Phase 3 per
-[../roadmap/phases.md](../roadmap/phases.md).
+against it. **Phase 3 lands file-backed mode**
+([../roadmap/phases.md](../roadmap/phases.md)): `crates/storage-sqlite`
+is now a real embedded `SQLite` store rather than a declared stub.
+
+## File-backed semantics
+
+**Memory stays the default** ([ADR 0003](../decisions/0003-storage-strategy.md)):
+the composition root's wiring is untouched; a session only touches a file
+when the user chooses file-backed mode. No startup creates or migrates a
+database otherwise.
+
+**Memory-authoritative, write-through durability.** The store keeps its
+residency in memory on the caller's thread — the same shelf, series-table
+and counter work the memory driver does — and mirrors every residency
+change (each keep, each retention pass) to the `SQLite` file in **one
+transaction** per keep/pass, committed only after the store's own state
+has settled and before any hook delivery runs. On-disk and in-memory
+residency therefore never disagree by half a keep; a panicking hook can
+never leave the file ahead of (or behind) the truth. A crash between
+committed transactions loses nothing that was committed: the write-ahead
+log survives the process, and a graceful `Drop` checkpoints it, leaving
+exactly one file to copy and reopen.
+
+**Durability, not a source of truth.** The database is a write-through
+log of residency, never a data source the hot path re-reads. Reopening
+the file rehydrates the shelves, re-interns stream identities by content
+(one stream's rehydrated points share one identity `Arc`), rebuilds the
+series table and identity byte charge from the rehydrated points — and
+the reopened session is **bounded the moment it opens**: rehydrated
+residency is measured against the ceilings _now_ and evicted down to
+fit, the same pass retention runs (without the admission window — the
+store owns no clock, and window expiry waits for the composition root's
+first `enforce_retention` reading). Session counters start at zero on
+reopen, like memory mode's, and open-time evictions are reported through
+the hook like any other.
+
+**Parity by construction.** Both drivers compile and run one shared test
+suite (`crates/storage/tests/shared/`), so the memory and file-backed
+drivers are exercised by the same contract, retention and series tests —
+the on-disk driver additionally proves its own durability stories
+(reopen, crash survival, corrupt-file refusal) that memory mode has no
+analogue for. The drivers never import each other; the boundary law
+holds (`layer-storage-driver` knows `layer-storage` and the model only).

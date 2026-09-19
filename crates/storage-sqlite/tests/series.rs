@@ -1,4 +1,4 @@
-//! The memory driver's run of the shared series suite.
+//! The file-backed driver's run of the shared series suite.
 
 mod common;
 

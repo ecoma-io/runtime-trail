@@ -16,10 +16,11 @@
 use crate::context::{SpanId, TraceContext, TraceId};
 use crate::resources::{InstrumentationScope, Resource};
 use crate::values::Attributes;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// The span kind — all six OTLP values, distinct, never collapsed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SpanKind {
     Unspecified,
     Internal,
@@ -31,7 +32,7 @@ pub enum SpanKind {
 
 /// The status code: unset, ok, or error. Never derived from the kind or
 /// the events.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum SpanStatusCode {
     #[default]
     Unset,
@@ -40,7 +41,7 @@ pub enum SpanStatusCode {
 }
 
 /// The two status fields, both preserved — even when the code is unset.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanStatus {
     /// The code as sent.
     pub code: SpanStatusCode,
@@ -53,7 +54,7 @@ pub struct SpanStatus {
 /// These counts are part of faithfulness and part of eviction
 /// observability: emitter-side loss is visible through them, runtime-side
 /// refusal through budget rejections.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EmitterDroppedCounts {
     /// `dropped_attributes_count` as the emitter sent it.
     pub attributes: u32,
@@ -65,7 +66,7 @@ pub struct EmitterDroppedCounts {
 
 /// One span event, at the position in the emitter's order where it was
 /// sent.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanEvent {
     /// The event's own timestamp in nanoseconds on the emitter's clock;
     /// `None` when the emitter sent none.
@@ -79,7 +80,7 @@ pub struct SpanEvent {
 }
 
 /// One span link: the linked trace context and its attributes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanLink {
     /// The linked trace context, including flags and, where sent,
     /// tracestate.
@@ -99,7 +100,7 @@ pub struct SpanLink {
 /// `t == start_time_unix_nano` (a valid zero-length span). The runtime's
 /// own admission time is never stored here — it is separate metadata on the
 /// admitted record, and never substitutes for an emitter timestamp.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     /// The span's own trace context: trace id, span id, flags, tracestate.
     pub context: TraceContext,

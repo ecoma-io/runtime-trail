@@ -47,13 +47,22 @@ runtime-trail-telemetry-ingestion = { path = "crates/telemetry-ingestion" }
 runtime-trail-mcp = { path = "crates/mcp" }
 runtime-trail-server = { path = "crates/server" }
 
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Phase 3 (persistence). `rusqlite` (with the bundled SQLite engine) is the
+# embedded storage engine the file-backed mode runs on (ADR 0003): the
+# engine compiles in, so the workspace never depends on an ambient SQLite
+# installation (ADR 0001's ambient-toolchain rule). `tempfile` is
+# test-scratch only — driver parity and durability tests write a real
+# database file, in a directory they own.
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
 
 # Phase 1 (OTLP ingestion). `prost` is the protobuf runtime the OTLP wire
 # payloads are decoded with — OTLP is the only ingestion contract

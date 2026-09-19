@@ -17,12 +17,13 @@
 use crate::context::{SpanId, TraceId};
 use crate::resources::{InstrumentationScope, Resource};
 use crate::values::{Attributes, Float};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
 /// A metric number: 64-bit integer or 64-bit float, distinct and never
 /// interconverted. Doubles compare by bit pattern (see [`Float`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricNumber {
     Int(i64),
     Double(Float),
@@ -52,7 +53,7 @@ pub const DATA_POINT_FLAG_NO_RECORDED_VALUE: u32 = 1;
 ///
 /// No kind is collapsed into another; a sum's monotonicity flag is part of
 /// the kind and is never inferred.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StreamKind {
     Gauge,
     Sum {
@@ -100,7 +101,7 @@ pub enum PointShape {
 /// with the same name are different series — never merged, split, or
 /// converted. Conversion is a transformation pipeline, which the product's
 /// non-goals exclude.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Temporality {
     Delta,
     Cumulative,
@@ -113,7 +114,7 @@ pub enum Temporality {
 /// OTLP's exemplar carries `trace_id` and `span_id` as independently
 /// optional fields, and nothing else (no flags, no tracestate): so does
 /// this model. Neither id is ever fabricated when absent.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Exemplar {
     /// The exemplar's value, as sent.
     pub value: MetricNumber,
@@ -145,7 +146,7 @@ impl Exemplar {
 /// [`NumberPoint::measurement_with_start`] (start sent and preserved,
 /// outside gauge identity), and interval points with
 /// [`NumberPoint::interval`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NumberPoint {
     /// The point's attribute set.
     pub attributes: Attributes,
@@ -229,7 +230,7 @@ impl NumberPoint {
 }
 
 /// An explicit-bucket histogram data point, preserved exactly.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HistogramPoint {
     /// The point's attribute set.
     pub attributes: Attributes,
@@ -258,7 +259,7 @@ pub struct HistogramPoint {
 }
 
 /// One explicit-bucket layout of an exponential histogram, as sent.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExponentialBuckets {
     /// The bucket index of the first count, as sent.
     pub offset: i32,
@@ -268,7 +269,7 @@ pub struct ExponentialBuckets {
 
 /// An exponential histogram data point: scale, zero count, zero threshold
 /// and both bucket layouts preserved exactly.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExponentialHistogramPoint {
     /// The point's attribute set.
     pub attributes: Attributes,
@@ -303,7 +304,7 @@ pub struct ExponentialHistogramPoint {
 }
 
 /// One quantile of a summary, as sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QuantileValue {
     /// The quantile, as sent.
     pub quantile: Float,
@@ -312,7 +313,7 @@ pub struct QuantileValue {
 }
 
 /// A summary data point: quantiles, count and sum, as sent.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SummaryPoint {
     /// The point's attribute set.
     pub attributes: Attributes,
@@ -335,7 +336,7 @@ pub struct SummaryPoint {
 
 /// A data point — one of the four point shapes the five stream kinds
 /// carry.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricPoint {
     Number(NumberPoint),
     Histogram(HistogramPoint),
@@ -515,7 +516,7 @@ impl std::error::Error for StreamShapeError {}
 /// temporality — the total order identity keys need for ordered, never
 /// hashed, maps (ADR 0008). It is a comparison order over identity bytes,
 /// not a ranking of streams.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamIdentity {
     /// The stream's resource.
     pub resource: Resource,

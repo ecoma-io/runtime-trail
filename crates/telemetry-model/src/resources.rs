@@ -17,6 +17,7 @@
 //! struct.
 
 use crate::values::Attributes;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
@@ -26,7 +27,7 @@ use std::hash::{Hash, Hasher};
 /// Resource *identity* is the attribute map alone (see
 /// [`Resource::identity`]); `schema_url` and the emitter-reported
 /// dropped-attributes count are preserved as data next to it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Resource {
     /// The attribute map the emitter attached to the resource.
     pub attributes: Attributes,
@@ -106,7 +107,7 @@ impl Resource {
 /// emitter-reported dropped-attributes count is part of that full-field
 /// set at the scope level, again unlike the resource level, where it stays
 /// metadata.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InstrumentationScope {
     /// The scope name, as sent; the empty string is a valid name.
     pub name: String,
