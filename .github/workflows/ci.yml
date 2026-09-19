@@ -268,6 +268,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build the web app and the server
+        run: pnpm exec moon run web:build server:build
       # playwright is a devDependency of the web app, not of the workspace
       # root (pnpm's isolated layout does not hoist per-package bins), so
       # exec must run in the web project's context to find the binary.
