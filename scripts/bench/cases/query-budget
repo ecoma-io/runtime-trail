@@ -7,8 +7,10 @@
 # budgets (chain total_entities is 10,000; the probe residents 12,000
 # spans), warms the investigation surface (which must answer with the
 # truthful degraded envelope), reads the server's settled RSS, then storms
-# the surface and counts the truthful 200 answers (dimension/limit/spend
-# named — see docs/architecture/query-model.md). The case asserts both
+# the surface and requires every storm answer to be truthful — a refusal,
+# or a 200 whose envelope names the degradation (dimension/limit/spend —
+# see docs/architecture/query-model.md); any fabricated-complete 200
+# fails the case. The case asserts both
 # halves of "query memory bounded" (refuse-don't-grow,
 # runtime-constraints.md): the refusal was observed, and the server's RSS
 # did not grow beyond a small noise margin (< 5 MiB) across the storm.
@@ -36,14 +38,19 @@ output="$(target/release/probe-query-budget "$pid" "$served_port")"
 printf '%s\n' "$output"
 
 truthful="$(printf '%s' "$output" | sed -n 's/.*"truthful_answers":\([0-9][0-9]*\).*/\1/p')"
+fabricated="$(printf '%s' "$output" | sed -n 's/.*"fabricated_complete":\([0-9][0-9]*\).*/\1/p')"
 before="$(printf '%s' "$output" | sed -n 's/.*"server_rss_before_kib":\([0-9][0-9]*\).*/\1/p')"
 after="$(printf '%s' "$output" | sed -n 's/.*"server_rss_after_kib":\([0-9][0-9]*\).*/\1/p')"
-if [ -z "$truthful" ] || [ -z "$before" ] || [ -z "$after" ]; then
-  echo "✗ query-budget: probe-query-budget's record carried no truthful_answers/server_rss_before_kib/server_rss_after_kib." >&2
+if [ -z "$truthful" ] || [ -z "$fabricated" ] || [ -z "$before" ] || [ -z "$after" ]; then
+  echo "✗ query-budget: probe-query-budget's record carried no truthful_answers/fabricated_complete/server_rss_before_kib/server_rss_after_kib." >&2
   exit 1
 fi
 if [ "$truthful" -lt 1 ]; then
   echo "✗ query-budget: the storm produced no truthful budget refusal (truthful_answers=$truthful)." >&2
+  exit 1
+fi
+if [ "$fabricated" -ne 0 ]; then
+  echo "✗ query-budget: $fabricated storm answer(s) were fabricated-complete 200s (HTTP 200 with an envelope naming neither the budget degradation nor a refusal) — a truncated query answered as complete, violating refuse-don't-grow (query-model.md)." >&2
   exit 1
 fi
 growth=$((after > before ? after - before : 0))

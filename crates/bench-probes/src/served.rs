@@ -150,6 +150,46 @@ fn envelope_names_budget_pressure(body: &[u8]) -> bool {
     text.contains("\"kind\":\"degraded\"") && text.contains("\"dimension\":\"results\"")
 }
 
+/// Whether a served envelope names a truthful budget refusal: a refused
+/// outcome carrying the dimension, the limit and the observed spend
+/// (query-model.md invariant 6 — "A refused query names the dimension,
+/// the limit and the observed spend"). A refusal that names any fewer is
+/// not a refusal the contract recognizes.
+fn envelope_names_refusal(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    text.contains("\"kind\":\"refused\"")
+        && text.contains("\"dimension\":")
+        && text.contains("\"limit\":")
+        && text.contains("\"observed\":")
+}
+
+/// How the query-budget storm classified one investigation answer, under
+/// the refuse-or-degrade contract (query-model.md § refuse-or-degrade):
+/// every storm answer must be a truthful refusal or a truthful degraded
+/// envelope; a 200 that names neither fabricates completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StormAnswer {
+    /// Truthful under refuse-or-degrade: a degraded envelope naming the
+    /// budget pressure, or a refusal naming dimension/limit/spend.
+    Truthful,
+    /// HTTP 200 whose envelope names neither the degradation nor a
+    /// refusal — a truncated answer presented as complete.
+    FabricatedComplete,
+    /// An HTTP status outside the surface contract, with no truthful
+    /// refusal envelope to read.
+    Unexpected(u16),
+}
+
+fn classify_storm_answer(answer: &HttpAnswer) -> StormAnswer {
+    if envelope_names_budget_pressure(&answer.body) || envelope_names_refusal(&answer.body) {
+        StormAnswer::Truthful
+    } else if answer.status == 200 {
+        StormAnswer::FabricatedComplete
+    } else {
+        StormAnswer::Unexpected(answer.status)
+    }
+}
+
 /// The one investigation subject the cases use: the served trace's root
 /// span, as the investigation surface's request body requires it.
 #[must_use]
@@ -394,9 +434,14 @@ pub struct QueryBudgetReport {
     /// the budget pressure truthfully (the steady state the storm is
     /// measured from).
     pub warm_investigations: u32,
-    /// How many storm investigations answered 200 with a truthful
-    /// degraded envelope.
+    /// How many storm investigations answered truthfully under
+    /// refuse-or-degrade: a degraded envelope naming the budget
+    /// pressure, or a refusal naming dimension/limit/spend.
     pub truthful_answers: u32,
+    /// How many storm investigations answered HTTP 200 with an envelope
+    /// naming neither the degradation nor a refusal — a truncated
+    /// answer presented as complete. Any above zero fails the case.
+    pub fabricated_complete: u32,
     /// The server's RSS before the storm.
     pub server_rss_before_kib: u64,
     /// The server's RSS after the storm.
@@ -409,8 +454,9 @@ pub struct QueryBudgetReport {
 /// the investigation's chain budget, warms the surface to the refusal
 /// steady state (the first investigations fault in one-time chain state;
 /// the storm must measure the steady-state cost), then storms it with
-/// the same investigation and counts the truthful degraded answers. The
-/// server's RSS is read settled before the storm and settled after — the
+/// the same investigation and counts the truthful answers — degraded
+/// envelopes or refusals naming dimension, limit and spend — beside any
+/// fabricated-complete 200 (an answer that is neither fails the probe). The
 /// refuse-don't-grow half: the storm must not grow it.
 ///
 /// # Errors
@@ -472,22 +518,31 @@ pub fn run_query_budget(
     let before = crate::rss::sample_pid(pid)?;
 
     let mut truthful_answers = 0;
-    for _ in 0..config.storm_investigations {
+    let mut fabricated_complete = 0;
+    for storm in 0..config.storm_investigations {
         let answer = post(
             port,
             "/v1/investigations/traces",
             INVESTIGATION_CONTENT_TYPE,
             root_subject_json().as_bytes(),
         )?;
-        if answer.status != 200 {
-            return Err(ProbeError::new(format!(
-                "a budget-constrained investigation should still answer 200 with its truthful \
-                 envelope, got HTTP {}",
-                answer.status
-            )));
-        }
-        if envelope_names_budget_pressure(&answer.body) {
-            truthful_answers += 1;
+        match classify_storm_answer(&answer) {
+            StormAnswer::Truthful => truthful_answers += 1,
+            StormAnswer::FabricatedComplete => {
+                fabricated_complete += 1;
+                eprintln!(
+                    "✗ storm answer {storm}: HTTP 200 with an envelope naming neither the \
+                     budget degradation nor a refusal — a truncated answer presented as \
+                     complete (query-model.md § refuse-or-degrade)"
+                );
+            }
+            StormAnswer::Unexpected(status) => {
+                return Err(ProbeError::new(format!(
+                    "storm answer {storm}: HTTP {status} with an envelope naming neither the \
+                     budget degradation nor a refusal; the budget-constrained surface must \
+                     answer truthfully — degrade or refuse (query-model.md § refuse-or-degrade)"
+                )));
+            }
         }
     }
     std::thread::sleep(config.settle);
@@ -499,6 +554,7 @@ pub fn run_query_budget(
         otlp_payload_bytes: payload_bytes,
         warm_investigations: config.warm_investigations,
         truthful_answers,
+        fabricated_complete,
         server_rss_before_kib: before.vm_rss_kib,
         server_rss_after_kib: after.vm_rss_kib,
         wall_seconds: started.elapsed().as_secs_f64(),
@@ -576,6 +632,10 @@ pub fn query_budget_record(report: &QueryBudgetReport) -> JsonRecord {
         .field(
             "truthful_answers",
             JsonValue::U64(u64::from(report.truthful_answers)),
+        )
+        .field(
+            "fabricated_complete",
+            JsonValue::U64(u64::from(report.fabricated_complete)),
         )
         .field(
             "server_rss_before_kib",
@@ -662,5 +722,51 @@ mod tests {
         assert!(envelope_names_budget_pressure(degraded));
         let healthy = b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"kind\":\"complete\"}]}]}";
         assert!(!envelope_names_budget_pressure(healthy));
+    }
+
+    #[test]
+    fn the_refusal_check_requires_dimension_limit_and_spend() {
+        let refusal = b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"outcome\":{\"kind\":\"refused\",\"refusal\":{\"dimension\":\"results\",\"limit\":{\"units\":10},\"observed\":{\"units\":12}}}}]}]}";
+        assert!(envelope_names_refusal(refusal));
+        let partial = b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"outcome\":{\"kind\":\"refused\",\"refusal\":{\"dimension\":\"results\",\"limit\":{\"units\":10}}}}]}]}";
+        assert!(
+            !envelope_names_refusal(partial),
+            "a refusal without the observed spend names no spend"
+        );
+        let complete = b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"outcome\":{\"kind\":\"complete\"}}]}]}";
+        assert!(!envelope_names_refusal(complete));
+    }
+
+    #[test]
+    fn the_storm_classifies_every_answer_as_truthful_fabricated_or_unexpected() {
+        let degraded = HttpAnswer {
+            status: 200,
+            body: b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"kind\":\"degraded\",\"dimension\":\"results\"}]}]}"
+                .to_vec(),
+        };
+        let refused = HttpAnswer {
+            status: 507,
+            body: b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"outcome\":{\"kind\":\"refused\",\"refusal\":{\"dimension\":\"results\",\"limit\":{\"units\":10},\"observed\":{\"units\":12}}}}]}]}"
+                .to_vec(),
+        };
+        let fabricated = HttpAnswer {
+            status: 200,
+            body: b"{\"run_groups\":[{\"part\":\"spans\",\"runs\":[{\"outcome\":{\"kind\":\"complete\"}}]}]}"
+                .to_vec(),
+        };
+        let unexpected = HttpAnswer {
+            status: 500,
+            body: b"{\"error\":\"internal\"}".to_vec(),
+        };
+        assert_eq!(classify_storm_answer(&degraded), StormAnswer::Truthful);
+        assert_eq!(classify_storm_answer(&refused), StormAnswer::Truthful);
+        assert_eq!(
+            classify_storm_answer(&fabricated),
+            StormAnswer::FabricatedComplete
+        );
+        assert_eq!(
+            classify_storm_answer(&unexpected),
+            StormAnswer::Unexpected(500)
+        );
     }
 }
