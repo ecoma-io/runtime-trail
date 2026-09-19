@@ -36,10 +36,13 @@
 //!
 //! Every relation's endpoints are re-checked against the store after the
 //! run: a relation whose endpoint left residency mid-run is dropped and the
-//! drop is counted in the truth (`shrunken`). Relations are returned in a
-//! deterministic order (type, then endpoints), and the relation ceiling is
-//! applied after that ordering, so a capped answer is a stable prefix of
-//! the full one.
+//! drop is counted in the truth (`shrunken`). The relation ceiling engages
+//! during generation, never after: every push site checks it, keeps the
+//! first `max_relations` relations formed in deterministic scan order, and
+//! reports the stop through `stopped_at`, so a capped answer is the
+//! generation-order prefix and an under-cap answer is byte-identical to
+//! the unbound run over the same resident set. Relations are returned in a
+//! deterministic order (type, then endpoints).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -60,6 +63,50 @@ use crate::relations::{
 
 /// The page width of the engine's resident scans.
 const SCAN_PAGE: usize = 256;
+
+/// Appends formed relations under the run's ceiling: every push site
+/// checks `max_relations`, keeps the first `limit` relations formed in
+/// deterministic generation order, and records `StoppedAt::MaxRelations`
+/// exactly once. Pushes past the ceiling are never materialized, so peak
+/// memory stays O(limit) instead of a strategy's full growth.
+struct RelationSink<'a> {
+    relations: &'a mut Vec<Relation<SignalRef>>,
+    /// The run's relation ceiling.
+    limit: u64,
+    /// Relations accepted so far — never exceeds `limit`.
+    kept: u64,
+    /// Where the run stopped; the ceiling is named here once, and only if
+    /// no earlier bound already stopped the run.
+    stopped_at: &'a mut Option<StoppedAt>,
+}
+
+impl RelationSink<'_> {
+    fn new<'a>(
+        relations: &'a mut Vec<Relation<SignalRef>>,
+        limit: u64,
+        stopped_at: &'a mut Option<StoppedAt>,
+    ) -> RelationSink<'a> {
+        RelationSink {
+            relations,
+            limit,
+            kept: 0,
+            stopped_at,
+        }
+    }
+
+    /// Accepts a formed relation unless the ceiling is exhausted; the stop
+    /// is named once, on the first push past the ceiling.
+    fn push(&mut self, relation: Relation<SignalRef>) {
+        if self.kept >= self.limit {
+            if self.stopped_at.is_none() {
+                *self.stopped_at = Some(StoppedAt::MaxRelations { count: self.limit });
+            }
+            return;
+        }
+        self.relations.push(relation);
+        self.kept += 1;
+    }
+}
 
 /// Runs the requested strategies over the store within the bounds, and
 /// returns the relations and the run's truth.
@@ -110,33 +157,36 @@ pub fn correlate(store: &dyn TelemetryStore, bounds: &CorrelationBounds) -> Corr
     let mut relations: Vec<Relation<SignalRef>> = Vec::new();
     let mut suppressions: Vec<Suppression> = Vec::new();
     let mut absent_traces: Vec<AbsentTrace> = Vec::new();
+    {
+        let mut sink = RelationSink::new(&mut relations, bounds.max_relations, &mut stopped_at);
 
-    for strategy in &bounds.strategies {
-        match strategy {
-            Strategy::SpanIdentity => {
-                span_identity(bounds.subject_trace, &members, &logs, &mut relations);
-            }
-            Strategy::TraceIdentity => {
-                trace_identity(
-                    bounds.subject_trace,
-                    &members,
-                    &logs,
-                    &mut relations,
-                    &mut suppressions,
-                    &mut absent_traces,
-                );
-            }
-            Strategy::ParentChild => {
-                parent_child(&spans, &mut relations);
-            }
-            Strategy::ResourceContext => {
-                resource_context(&spans, &logs, &points, &mut relations);
-            }
-            Strategy::ExemplarAttachment => {
-                exemplar_attachment(&points, &spans, &mut relations);
-            }
-            Strategy::TemporalCoActivity => {
-                temporal_co_activity(&members, &points, bounds.window, &mut relations);
+        for strategy in &bounds.strategies {
+            match strategy {
+                Strategy::SpanIdentity => {
+                    span_identity(bounds.subject_trace, &members, &logs, &mut sink);
+                }
+                Strategy::TraceIdentity => {
+                    trace_identity(
+                        bounds.subject_trace,
+                        &members,
+                        &logs,
+                        &mut sink,
+                        &mut suppressions,
+                        &mut absent_traces,
+                    );
+                }
+                Strategy::ParentChild => {
+                    parent_child(&spans, &mut sink);
+                }
+                Strategy::ResourceContext => {
+                    resource_context(&spans, &logs, &points, &mut sink);
+                }
+                Strategy::ExemplarAttachment => {
+                    exemplar_attachment(&points, &spans, &mut sink);
+                }
+                Strategy::TemporalCoActivity => {
+                    temporal_co_activity(&members, &points, bounds.window, &mut sink);
+                }
             }
         }
     }
@@ -147,16 +197,9 @@ pub fn correlate(store: &dyn TelemetryStore, bounds: &CorrelationBounds) -> Corr
     relations.retain(|relation| endpoints_resident(store, relation));
     let shrunken = u64::try_from(before - relations.len()).unwrap_or(u64::MAX);
 
-    // Deterministic order, then the relation ceiling as a stable prefix.
+    // Deterministic order over the kept set: the ceiling engaged during
+    // generation, so the set holds at most `max_relations` already.
     relations.sort_by(relation_order);
-    let total = u64::try_from(relations.len()).unwrap_or(u64::MAX);
-    if total > bounds.max_relations {
-        let count = bounds.max_relations;
-        relations.truncate(usize::try_from(count).unwrap_or(usize::MAX));
-        if stopped_at.is_none() {
-            stopped_at = Some(StoppedAt::MaxRelations { count });
-        }
-    }
 
     CorrelationOutcome {
         relations,
@@ -195,7 +238,7 @@ fn span_identity(
     subject: Option<TraceId>,
     members: &[&(EntityId, Arc<Span>)],
     logs: &[(EntityId, Arc<LogRecord>)],
-    relations: &mut Vec<Relation<SignalRef>>,
+    sink: &mut RelationSink<'_>,
 ) {
     let Some(subject) = subject else {
         return;
@@ -214,7 +257,7 @@ fn span_identity(
         let Some(span_entity) = span_with_identity(members, trace, span_id) else {
             continue;
         };
-        relations.push(Relation::new(
+        sink.push(Relation::new(
             RelationType::SpanIdentity,
             SignalRef::new(SignalKind::LogRecords, *log_entity),
             SignalRef::new(SignalKind::Spans, span_entity),
@@ -234,7 +277,7 @@ fn trace_identity(
     subject: Option<TraceId>,
     members: &[&(EntityId, Arc<Span>)],
     logs: &[(EntityId, Arc<LogRecord>)],
-    relations: &mut Vec<Relation<SignalRef>>,
+    sink: &mut RelationSink<'_>,
     suppressions: &mut Vec<Suppression>,
     absent_traces: &mut Vec<AbsentTrace>,
 ) {
@@ -276,7 +319,7 @@ fn trace_identity(
                     absent_traces.push(AbsentTrace { log: *log_entity });
                 } else {
                     for (span_entity, _) in members {
-                        relations.push(Relation::new(
+                        sink.push(Relation::new(
                             RelationType::TraceIdentity,
                             SignalRef::new(SignalKind::LogRecords, *log_entity),
                             SignalRef::new(SignalKind::Spans, *span_entity),
@@ -297,7 +340,7 @@ fn temporal_co_activity(
     members: &[&(EntityId, Arc<Span>)],
     points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
     window: Option<Window>,
-    relations: &mut Vec<Relation<SignalRef>>,
+    sink: &mut RelationSink<'_>,
 ) {
     let Some(window) = window else {
         return;
@@ -347,7 +390,7 @@ fn temporal_co_activity(
                     clock_value(end),
                 ));
             }
-            relations.push(Relation::new(
+            sink.push(Relation::new(
                 RelationType::TemporalCoActivity,
                 SignalRef::new(SignalKind::Spans, *span_entity),
                 SignalRef::new(SignalKind::MetricPoints, *point_entity),
@@ -366,7 +409,7 @@ fn temporal_co_activity(
 /// the resident set, and a span naming itself are never grounded — the
 /// absent-endpoint and self-loop guards are applied while generating,
 /// never by dropping a formed relation.
-fn parent_child(spans: &[(EntityId, Arc<Span>)], relations: &mut Vec<Relation<SignalRef>>) {
+fn parent_child(spans: &[(EntityId, Arc<Span>)], sink: &mut RelationSink<'_>) {
     let version = StrategyVersion::new(
         Strategy::ParentChild.name().to_owned(),
         Strategy::ParentChild.version().to_owned(),
@@ -387,7 +430,7 @@ fn parent_child(spans: &[(EntityId, Arc<Span>)], relations: &mut Vec<Relation<Si
         if *child_entity == parent_entity {
             continue; // the no-self-loop guard
         }
-        relations.push(Relation::new(
+        sink.push(Relation::new(
             RelationType::ParentChild,
             SignalRef::new(SignalKind::Spans, *child_entity),
             SignalRef::new(SignalKind::Spans, parent_entity),
@@ -410,7 +453,7 @@ fn resource_context(
     spans: &[(EntityId, Arc<Span>)],
     logs: &[(EntityId, Arc<LogRecord>)],
     points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
-    relations: &mut Vec<Relation<SignalRef>>,
+    sink: &mut RelationSink<'_>,
 ) {
     let version = StrategyVersion::new(
         Strategy::ResourceContext.name().to_owned(),
@@ -447,7 +490,7 @@ fn resource_context(
         // relation seen backwards and adds no facts.
         for (index, from) in members.iter().enumerate() {
             for to in &members[index + 1..] {
-                relations.push(Relation::new(
+                sink.push(Relation::new(
                     RelationType::ResourceContext,
                     from.clone(),
                     to.clone(),
@@ -489,7 +532,7 @@ fn resource_facts(resource: &Resource) -> Vec<EvidenceFact> {
 fn exemplar_attachment(
     points: &[(EntityId, Arc<MetricPoint>, Arc<StreamIdentity>)],
     spans: &[(EntityId, Arc<Span>)],
-    relations: &mut Vec<Relation<SignalRef>>,
+    sink: &mut RelationSink<'_>,
 ) {
     let version = StrategyVersion::new(
         Strategy::ExemplarAttachment.name().to_owned(),
@@ -503,7 +546,7 @@ fn exemplar_attachment(
             let Some(span_entity) = resident_span_named(spans, trace, span_id) else {
                 continue; // the exemplar's span is not resident
             };
-            relations.push(Relation::new(
+            sink.push(Relation::new(
                 RelationType::ExemplarAttachment,
                 SignalRef::new(SignalKind::MetricPoints, *point_entity),
                 SignalRef::new(SignalKind::Spans, span_entity),
