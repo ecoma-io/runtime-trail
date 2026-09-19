@@ -102,7 +102,7 @@ Overload is a designed-for state, not later hardening:
 1. **Admission control** — ingestion bounds its in-flight work. The wire
    behaviour is contracted, not implied, and each signal names what kind of
    problem it is:
-   - saturated queue → **HTTP 429 + `Retry-After`** (gRPC
+   - saturated queue → **HTTP 429 + `Retry-After`** (gRPC `RESOURCE_EXHAUSTED`) — the one retryable admission signal, and it rejects the **whole export**: the pipeline measures the export's freshly admitted records against the queue's headroom before offering any of them, so a refused export admits nothing at all and the retry delivers each record exactly once (log records never collapse, so partial admission would have re-delivered their earlier copies as duplicates).
    - aggregate in-flight body budget exceeded → **HTTP 429 + `Retry-After`**
      (gRPC `RESOURCE_EXHAUSTED`) — the same retryable answer, for the
      transport edge ([ADR 0010](../decisions/0010-transport-edge-in-flight-body-budget.md)).

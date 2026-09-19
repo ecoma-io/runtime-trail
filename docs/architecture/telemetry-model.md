@@ -235,7 +235,13 @@ OTLP delivery is at-least-once in practice: SDKs retry on transport timeouts
 and transient saturation
 ([runtime-constraints.md](runtime-constraints.md) contracts exactly which
 admission signal is retryable).
-Idempotent admission is therefore a model requirement, not an optimisation.
+Because a retryable saturation rejects the **whole export** — the pipeline
+admits nothing of a refused export, atomically
+([runtime-constraints.md](runtime-constraints.md)) — a retry under capacity
+delivers each record exactly once across every attempt: no record of a
+partially-admitted export is left resident to be re-delivered as a second
+copy. Idempotent admission is therefore a model requirement, not an
+optimisation.
 
 - **Admission assigns every record an entity id** — an opaque, typed
   identifier, unique within the runtime's session (one process lifetime; ids
@@ -268,6 +274,10 @@ Idempotent admission is therefore a model requirement, not an optimisation.
   and this model refuses to invent a destructive one: two byte-identical log
   records are two admitted records — the emitter sent two. Duplicate
   suppression at the source is the emitter SDK's job, not admission's.
+  Saturation is export-atomic
+  ([runtime-constraints.md](runtime-constraints.md)): a refused export
+  admits nothing at all, so an emitter's retry can never find an earlier
+  partial admission to duplicate.
 - **Admitted data is immutable.** A delivery that conflicts with an
   already-admitted record under the same natural identity (a span re-sent
   with a different payload) does not overwrite it — the first admitted
