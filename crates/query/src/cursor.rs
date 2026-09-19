@@ -48,6 +48,8 @@ use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, EntityId, SpanId,
 use std::fmt;
 use std::num::NonZeroU64;
 
+use crate::lease::SnapshotLease;
+
 /// Bytes before the entity tag: position and fingerprint.
 const HEADER_LEN: usize = 2 * std::mem::size_of::<u64>();
 
@@ -125,6 +127,28 @@ fn push_entity(bytes: &mut Vec<u8>, entity: EntityId) {
             bytes.extend_from_slice(&assigned.serial().get().to_le_bytes());
         }
     }
+}
+
+/// Appends one snapshot boundary's canonical bytes to `bytes`: the
+/// admission time in little-endian unix nanoseconds, then the tagged
+/// entity — the snapshot half of the cursor encoding, shared with
+/// [`boundary_bytes`] so a lease's fingerprint is minted over exactly the
+/// bytes a cursor embeds.
+fn push_boundary(bytes: &mut Vec<u8>, boundary: AdmissionKey) {
+    bytes.extend_from_slice(&boundary.admitted_at().as_unix_nano().to_le_bytes());
+    push_entity(bytes, boundary.entity());
+}
+
+/// The canonical bytes of one snapshot boundary: admission time then
+/// tagged entity, exactly the snapshot half of the cursor encoding.
+/// The snapshot fingerprint a lease binds is over these bytes, so lease
+/// and cursor speak one boundary format
+/// (["Snapshot leases" in query-model.md](../../docs/architecture/query-model.md)).
+#[must_use]
+pub(crate) fn boundary_bytes(boundary: AdmissionKey) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SNAPSHOT_TIME_LEN + 1 + id_region_len(boundary.entity()));
+    push_boundary(&mut bytes, boundary);
+    bytes
 }
 
 /// Parses one tagged entity id at the front of `bytes`; returns the entity
@@ -221,8 +245,7 @@ impl CursorPayload {
         bytes.extend_from_slice(&self.position.to_le_bytes());
         bytes.extend_from_slice(&self.fingerprint.to_le_bytes());
         push_entity(&mut bytes, self.last_entity);
-        bytes.extend_from_slice(&self.snapshot.admitted_at().as_unix_nano().to_le_bytes());
-        push_entity(&mut bytes, self.snapshot.entity());
+        push_boundary(&mut bytes, self.snapshot);
         bytes
     }
 
@@ -295,6 +318,26 @@ impl CursorPayload {
             Err(CursorError::FingerprintMismatch)
         }
     }
+
+    /// Checks the cursor against the snapshot lease it is presented
+    /// under
+    /// (["Snapshot leases" in query-model.md](../../docs/architecture/query-model.md)):
+    /// a leased page continues only within the leased snapshot — a lease
+    /// from one investigation can never page another investigation's
+    /// snapshot, because the lease's fingerprint must be the fingerprint
+    /// of the snapshot this cursor continues within.
+    ///
+    /// # Errors
+    ///
+    /// [`CursorError::LeaseMismatch`] when the cursor's snapshot
+    /// fingerprint differs from the lease's.
+    pub fn verify_lease(&self, lease: &SnapshotLease) -> Result<(), CursorError> {
+        if lease.governs(self.snapshot) {
+            Ok(())
+        } else {
+            Err(CursorError::LeaseMismatch)
+        }
+    }
 }
 
 /// Why a cursor failed.
@@ -306,6 +349,11 @@ pub enum CursorError {
     /// The cursor's fingerprint differs from the query it was presented
     /// under — a cursor is valid only for its own query (invariant 3).
     FingerprintMismatch,
+    /// The cursor continues a snapshot the presented lease does not
+    /// govern: the lease's fingerprint differs from this cursor's
+    /// snapshot
+    /// (["Snapshot leases" in query-model.md](../../docs/architecture/query-model.md)).
+    LeaseMismatch,
 }
 
 impl fmt::Display for CursorError {
@@ -318,6 +366,10 @@ impl fmt::Display for CursorError {
                     "cursor belongs to a different query (fingerprint mismatch)"
                 )
             }
+            Self::LeaseMismatch => write!(
+                f,
+                "cursor continues a snapshot the presented lease does not govern (lease mismatch)"
+            ),
         }
     }
 }
@@ -360,6 +412,7 @@ mod tests {
     use runtime_trail_telemetry_model::{AdmissionTime, AssignedId, SpanId, TraceId};
     use std::num::NonZeroU64;
 
+    use crate::lease::{InvestigationId, SnapshotLease};
     use crate::order::sort_deterministically;
     use crate::result::{
         Coverage, Dimension, Execution, Page, PartOutcome, Truncation, TruncationPoint,
@@ -378,6 +431,10 @@ mod tests {
             trace_id: TraceId::from_bytes(trace),
             span_id: SpanId::from_bytes(span),
         }
+    }
+
+    fn investigation(serial: u64) -> InvestigationId {
+        InvestigationId::new(NonZeroU64::new(serial).expect("fixture investigations are nonzero"))
     }
 
     fn span_payload() -> CursorPayload {
@@ -565,6 +622,35 @@ mod tests {
             Err(CursorError::FingerprintMismatch),
             "a foreign query's fingerprint is rejected after a decode too"
         );
+    }
+
+    /// Kills a no-op `verify_lease`, and a lease check that compares
+    /// anything but the snapshot boundary: a cursor pages under the lease
+    /// minted from its own boundary and is refused under any other — a
+    /// later snapshot, a different entity, another investigation's pin.
+    #[test]
+    fn verify_lease_accepts_its_own_boundary_and_rejects_foreign_boundaries() {
+        let payload = span_span_payload();
+        let own = SnapshotLease::for_boundary(investigation(1), payload.snapshot());
+        assert_eq!(payload.verify_lease(&own), Ok(()));
+
+        for foreign in [
+            AdmissionKey::new(
+                AdmissionTime::from_unix_nano(301),
+                span_entity([2; 16], [2; 8]),
+            ),
+            AdmissionKey::new(
+                AdmissionTime::from_unix_nano(300),
+                span_entity([2; 16], [3; 8]),
+            ),
+        ] {
+            let foreign_lease = SnapshotLease::for_boundary(investigation(2), foreign);
+            assert_eq!(
+                payload.verify_lease(&foreign_lease),
+                Err(CursorError::LeaseMismatch),
+                "a lease over another boundary cannot page this cursor"
+            );
+        }
     }
 
     /// Kills a constant-returning no-op, a wrong offset basis or prime,
