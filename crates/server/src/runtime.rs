@@ -38,14 +38,16 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use runtime_trail_storage::{EvictionHook, KeepOutcome, StoreStats, TelemetryStore};
+use runtime_trail_storage::{
+    AdmissionKey, EvictionHook, KeepOutcome, PointView, ScanPage, StoreStats, TelemetryStore,
+};
 use runtime_trail_storage_memory::{InMemoryStore, MemoryConfig};
 use runtime_trail_telemetry_ingestion::{
     BoundedQueue, LedgerReleaser, PIPELINE_QUEUE_NAME, Pipeline, PipelineConfigError, QueuedRecord,
     RecordSink, StoredRecord,
 };
 use runtime_trail_telemetry_model::{
-    AdmissionTime, Admitted, BudgetLimits, EntityId, StreamIdentity,
+    AdmissionTime, Admitted, BudgetLimits, EntityId, LogRecord, MetricPoint, Span, StreamIdentity,
 };
 
 use crate::DRAIN_DEADLINE;
@@ -672,6 +674,18 @@ impl CoreRuntime {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// A view of the store that takes the store lock per call, releasing
+    /// it between calls (issue #54): the investigation flow is served
+    /// through this view so the ingestion pump and the retention tick
+    /// interleave their keeps and evictions between the flow's store
+    /// calls instead of standing blocked for the flow's whole run.
+    #[must_use]
+    pub(crate) fn locked_store(&self) -> LockedStore {
+        LockedStore {
+            store: Arc::clone(&self.store),
+        }
+    }
+
     /// Takes the store's lock — the seam that lets tests freeze the pump
     /// (its keeps block here) while they fill the queue or observe a drain.
     #[cfg(test)]
@@ -691,6 +705,91 @@ impl CoreRuntime {
     }
 }
 
+/// A per-call view of the runtime's store: every [`TelemetryStore`]
+/// method locks the store, calls through, and releases before returning.
+///
+/// The investigation flow runs against this view (issue #54). Holding the
+/// store lock across a whole flow would stall the ingestion pump's keeps
+/// and the retention tick for the flow's full run — tens of seconds for a
+/// long bounded chain — saturating the bounded queue and answering every
+/// concurrent OTLP export with the queue-saturation refusal. Locking per
+/// call instead lets the pump and the retention tick interleave keeps and
+/// evictions between the flow's store calls. Soundness of the flow's
+/// pagination across the releases is the query model's snapshot lease:
+/// continuations are bound to the snapshot boundary the first page
+/// minted, and a foreign continuation is rejected before any budget work
+/// (docs/architecture/query-model.md, "Snapshot leases").
+#[derive(Clone)]
+pub(crate) struct LockedStore {
+    store: Arc<Mutex<Box<dyn TelemetryStore>>>,
+}
+
+impl LockedStore {
+    fn guard(&self) -> MutexGuard<'_, Box<dyn TelemetryStore>> {
+        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl TelemetryStore for LockedStore {
+    fn keep_span(&mut self, admitted: Admitted<Arc<Span>>) -> KeepOutcome {
+        self.guard().keep_span(admitted)
+    }
+
+    fn keep_log_record(&mut self, admitted: Admitted<Arc<LogRecord>>) -> KeepOutcome {
+        self.guard().keep_log_record(admitted)
+    }
+
+    fn keep_metric_point(
+        &mut self,
+        admitted: Admitted<Arc<MetricPoint>>,
+        stream: Arc<StreamIdentity>,
+    ) -> KeepOutcome {
+        self.guard().keep_metric_point(admitted, stream)
+    }
+
+    fn span(&self, entity: EntityId) -> Option<Arc<Span>> {
+        self.guard().span(entity)
+    }
+
+    fn log_record(&self, entity: EntityId) -> Option<Arc<LogRecord>> {
+        self.guard().log_record(entity)
+    }
+
+    fn metric_point(&self, entity: EntityId) -> Option<PointView> {
+        self.guard().metric_point(entity)
+    }
+
+    fn scan_spans(&self, after: Option<AdmissionKey>, limit: usize) -> ScanPage<Arc<Span>> {
+        self.guard().scan_spans(after, limit)
+    }
+
+    fn scan_log_records(
+        &self,
+        after: Option<AdmissionKey>,
+        limit: usize,
+    ) -> ScanPage<Arc<LogRecord>> {
+        self.guard().scan_log_records(after, limit)
+    }
+
+    fn scan_metric_points(&self, after: Option<AdmissionKey>, limit: usize) -> ScanPage<PointView> {
+        self.guard().scan_metric_points(after, limit)
+    }
+
+    fn enforce_retention(&mut self, now: AdmissionTime) -> u64 {
+        self.guard().enforce_retention(now)
+    }
+    fn observe_admission_anomalies(&mut self, total: u64) {
+        self.guard().observe_admission_anomalies(total);
+    }
+
+    fn stats(&self) -> StoreStats {
+        self.guard().stats()
+    }
+
+    fn mode_name(&self) -> &'static str {
+        self.guard().mode_name()
+    }
+}
 impl std::fmt::Debug for CoreRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreRuntime")

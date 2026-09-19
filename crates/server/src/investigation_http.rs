@@ -29,10 +29,25 @@
 //! Answers: **200** with the envelope, **400** for a malformed or
 //! unparsable subject, **404** for a well-formed subject with no resident
 //! record, **413** for a declared over-ceiling body, **408** when the
-//! body never arrives within the read deadline, and **500** when the flow
-//! itself fails on an internal contract (a rejected cursor, an engine
-//! contract violation) — each refusal a JSON error naming the reason,
-//! never a fabricated envelope.
+//! body never arrives within the read deadline, **503** when the runtime
+//! is draining (the closing signal, answered before the body is read),
+//! and **500** when the flow itself fails on an internal contract (a
+//! rejected cursor, an engine contract violation, a panicked flow) —
+//! each refusal a JSON error naming the reason, never a fabricated
+//! envelope.
+//! The flow is executed on the blocking pool against a per-call view of
+//! the store ([`LockedStore`], in runtime.rs): no store lock is held
+//! across the flow — the pump and the retention tick interleave between
+//! the flow's store calls (issue #54) — and the flow's synchronous,
+//! bounded scanning never occupies a tokio worker. Continuation
+//! soundness across the releases is the query model's snapshot lease
+//! (docs/architecture/query-model.md, "Snapshot leases").
+//!
+//! A draining runtime answers **503** (the closing signal, checked
+//! before the body is read) — the sibling of the OTLP/HTTP closing
+//! answer: a drain deadline must not be spent admitting a long
+//! investigation.
+//!
 //!
 //! [ADR 0010]: ../../docs/decisions/0010-transport-edge-in-flight-body-budget.md
 
@@ -116,6 +131,16 @@ pub(crate) async fn investigate_trace_http(
     State(runtime): State<Arc<CoreRuntime>>,
     request: Request,
 ) -> Response {
+    // The closing gate answers before the body is read — the sibling of
+    // the OTLP/HTTP 503: a draining runtime admits no new investigation
+    // work, and a drain deadline must not be spent admitting a long flow.
+    if runtime.is_draining() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the runtime is draining and admits no new investigations; \
+             re-delivery after restart will be admitted fresh",
+        );
+    }
     let ceiling_bytes = runtime.payload_ceiling_bytes();
     // The one over-ceiling refusal the handler makes before reading — the
     // sibling of the OTLP/HTTP 413, answering before any byte is buffered.
@@ -157,14 +182,22 @@ pub(crate) async fn investigate_trace_http(
     };
     let budget = admitted_budget(ceiling_bytes);
     let chain = admitted_chain();
-    let store = runtime.lock_store();
-    match investigate_trace_bounded(
-        &**store,
-        &TraceInvestigationRequest::new(root_span, budget, None),
-        chain,
-    ) {
-        Ok(envelope) => Json(render_investigation(&envelope)).into_response(),
-        Err(FlowError::SubjectUnresolved { requested }) => json_error(
+    // The flow runs on the blocking pool against a per-call view of the
+    // store ([`LockedStore`], issue #54): holding the store lock across
+    // the whole flow would stall the pump's keeps and the retention tick
+    // for the flow's full run, traffic to the pipeline's queue saturation
+    // and answering every concurrent export with the saturation refusal.
+    // With a lock per store call the pump and the retention tick
+    // interleave between the flow's calls (each ≤ the engine's 64-record
+    // batch or the recovery's 256-record slice); page continuation
+    // soundness across the releases is the query model's snapshot lease.
+    let store = runtime.locked_store();
+    let request = TraceInvestigationRequest::new(root_span, budget, None);
+    match tokio::task::spawn_blocking(move || investigate_trace_bounded(&store, &request, chain))
+        .await
+    {
+        Ok(Ok(envelope)) => Json(render_investigation(&envelope)).into_response(),
+        Ok(Err(FlowError::SubjectUnresolved { requested })) => json_error(
             StatusCode::NOT_FOUND,
             format!(
                 "no resident record carries the requested subject \
@@ -172,15 +205,20 @@ pub(crate) async fn investigate_trace_http(
                 entity_text(&requested),
             ),
         ),
-        Err(FlowError::CursorRejected) => json_error(
+        Ok(Err(FlowError::CursorRejected)) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the flow rejected an engine continuation cursor — an internal \
              contract violation; nothing was fabricated",
         ),
-        Err(FlowError::EngineContract) => json_error(
+        Ok(Err(FlowError::EngineContract)) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the engine returned an answer the envelope contract cannot hold — \
              an internal contract violation; nothing was fabricated",
+        ),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the investigation flow panicked — an internal contract violation; \
+             nothing was fabricated",
         ),
     }
 }
@@ -745,6 +783,10 @@ mod tests {
     use crate::runtime::CoreRuntime;
     use crate::test_support;
     use crate::{ServerConfig, build_router};
+    use runtime_trail_storage::{
+        AdmissionKey, KeepOutcome, PointView, ScanPage, StoreStats, TelemetryStore,
+    };
+    use runtime_trail_telemetry_model::{AdmissionTime, Admitted};
 
     /// T1's trace id and S1's span id as they appear on the wire.
     const TRACE_ID_HEX: &str = "01010101010101010101010101010101";
@@ -865,6 +907,158 @@ mod tests {
                 vec![fx::scope_logs(None, records)],
             )]))
         }};
+    }
+
+    /// A logs export with `count` subject-related records (all T1/S1).
+    fn related_logs_export(count: usize) -> Vec<u8> {
+        let records: Vec<_> = (0..count)
+            .map(|_| {
+                let mut log = fx::log_record();
+                log.trace_id = fx::T1.to_vec();
+                log.span_id = fx::S1.to_vec();
+                log.body = Some(fx::str_value("related"));
+                log
+            })
+            .collect();
+        fx::encode(&fx::logs_request(vec![fx::resource_logs(
+            None,
+            vec![fx::scope_logs(None, records)],
+        )]))
+    }
+
+    /// The encoded traces export carrying one fresh span (T2/S2) — an
+    /// identity the seed never admitted, so its keep must raise residency.
+    fn one_fresh_span_export() -> Vec<u8> {
+        fx::encode(&fx::traces_request(vec![fx::resource_spans(
+            None,
+            vec![fx::scope_spans(
+                None,
+                vec![fx::trace_span("op", fx::T2, fx::S2)],
+            )],
+        )]))
+    }
+
+    /// A store that delegates to the real store but sleeps in every scan
+    /// call, counting it: the determinism device that makes an
+    /// investigation flow last seconds instead of milliseconds. The swap
+    /// happens through `lock_store_for_test()` with the seed already
+    /// resident, so the reads the flow makes under this store still find
+    /// the seed — just slowly.
+    struct SlowStore {
+        inner: Option<Box<dyn TelemetryStore>>,
+        scan_sleep: Duration,
+        scan_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SlowStore {
+        /// The empty placeholder a swap puts in the guard while it takes
+        /// the real store out.
+        fn empty() -> Self {
+            SlowStore {
+                inner: None,
+                scan_sleep: Duration::ZERO,
+                scan_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn new(
+            inner: Box<dyn TelemetryStore>,
+            scan_sleep: Duration,
+            scan_calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            SlowStore {
+                inner: Some(inner),
+                scan_sleep,
+                scan_calls,
+            }
+        }
+
+        fn store(&self) -> &dyn TelemetryStore {
+            self.inner
+                .as_deref()
+                .expect("the real store is swapped in before use")
+        }
+
+        fn store_mut(&mut self) -> &mut dyn TelemetryStore {
+            self.inner
+                .as_deref_mut()
+                .expect("the real store is swapped in before use")
+        }
+
+        fn slowed_scan(&self) {
+            self.scan_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(self.scan_sleep);
+        }
+    }
+
+    impl TelemetryStore for SlowStore {
+        fn keep_span(&mut self, admitted: Admitted<Arc<Span>>) -> KeepOutcome {
+            self.store_mut().keep_span(admitted)
+        }
+
+        fn keep_log_record(&mut self, admitted: Admitted<Arc<LogRecord>>) -> KeepOutcome {
+            self.store_mut().keep_log_record(admitted)
+        }
+
+        fn keep_metric_point(
+            &mut self,
+            admitted: Admitted<Arc<MetricPoint>>,
+            stream: Arc<StreamIdentity>,
+        ) -> KeepOutcome {
+            self.store_mut().keep_metric_point(admitted, stream)
+        }
+
+        fn span(&self, entity: EntityId) -> Option<Arc<Span>> {
+            self.store().span(entity)
+        }
+
+        fn log_record(&self, entity: EntityId) -> Option<Arc<LogRecord>> {
+            self.store().log_record(entity)
+        }
+
+        fn metric_point(&self, entity: EntityId) -> Option<PointView> {
+            self.store().metric_point(entity)
+        }
+
+        fn scan_spans(&self, after: Option<AdmissionKey>, limit: usize) -> ScanPage<Arc<Span>> {
+            self.slowed_scan();
+            self.store().scan_spans(after, limit)
+        }
+
+        fn scan_log_records(
+            &self,
+            after: Option<AdmissionKey>,
+            limit: usize,
+        ) -> ScanPage<Arc<LogRecord>> {
+            self.slowed_scan();
+            self.store().scan_log_records(after, limit)
+        }
+
+        fn scan_metric_points(
+            &self,
+            after: Option<AdmissionKey>,
+            limit: usize,
+        ) -> ScanPage<PointView> {
+            self.slowed_scan();
+            self.store().scan_metric_points(after, limit)
+        }
+
+        fn enforce_retention(&mut self, now: AdmissionTime) -> u64 {
+            self.store_mut().enforce_retention(now)
+        }
+
+        fn observe_admission_anomalies(&mut self, total: u64) {
+            self.store_mut().observe_admission_anomalies(total);
+        }
+
+        fn stats(&self) -> StoreStats {
+            self.store().stats()
+        }
+
+        fn mode_name(&self) -> &'static str {
+            self.store().mode_name()
+        }
     }
 
     #[tokio::test]
@@ -1149,5 +1343,123 @@ mod tests {
             }
         }
         runtime.shutdown();
+    }
+
+    /// Issue #54: an in-flight investigation must never stall ingestion
+    /// or drain. The handler reads the store through a per-call-locking
+    /// view ([`crate::runtime::LockedStore`]) and runs the flow on the
+    /// blocking pool (`spawn_blocking`), so the pump's keeps and the
+    /// retention tick interleave between the flow's store calls — even
+    /// when the flow lasts seconds. Pre-fix the handler held the store
+    /// guard across the whole flow: the pump's keep stood blocked for
+    /// the flow's duration, so this test's bounded keep wait failed;
+    /// post-fix the keep lands promptly and shutdown never waits out a
+    /// mid-flight investigation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingestion_keeps_records_while_an_investigation_is_in_flight() {
+        // Seed several thousand subject-related logs so the flow needs
+        // many scan calls, then make each scan slow: the flow now lasts
+        // seconds with a deterministic scan count to synchronize on.
+        let logs = related_logs_export(3_000);
+        let runtime = seeded_runtime_with_logs(&logs, 3_003);
+
+        let scan_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut guard = runtime.lock_store_for_test();
+            let inner = std::mem::replace(&mut *guard, Box::new(SlowStore::empty()));
+            *guard = Box::new(SlowStore::new(
+                inner,
+                Duration::from_millis(30),
+                Arc::clone(&scan_calls),
+            ));
+        }
+
+        let investigation_router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let export_router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let body = format!(
+            r#"{{"root_span": {{"span": {{"trace_id": "{TRACE_ID_HEX}", "span_id": "{SPAN_ID_HEX}"}}}}}}"#
+        );
+
+        // The investigation runs on the blocking pool. Wait until the
+        // flow has entered the store — its first scan call — so the
+        // export below races a mid-flight flow.
+        let investigation = tokio::spawn(async move {
+            post(investigation_router, INVESTIGATION_TRACES_PATH, &body).await
+        });
+        let entered = std::time::Instant::now() + Duration::from_secs(5);
+        while scan_calls.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < entered,
+                "the investigation never entered the store"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let entered_calls = scan_calls.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Export one fresh span while the flow is in mid-flight: it must
+        // answer 200, and its keep must land promptly.
+        let kept_before = runtime.counters().kept;
+        let export = export_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/traces")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(one_fresh_span_export()))
+                    .expect("a static request builds"),
+            )
+            .await
+            .expect("the router answers every request");
+        assert_eq!(
+            export.status(),
+            StatusCode::OK,
+            "an OTLP export answers 200 while an investigation is in flight"
+        );
+
+        // The keep deadline is bounded: a pre-fix runtime, whose flow
+        // held the store lock for its whole run, fails here instead of
+        // hanging the test.
+        let keep_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while runtime.counters().kept == kept_before {
+            assert!(
+                std::time::Instant::now() < keep_deadline,
+                "ingestion stalled while an investigation was in flight (issue #54): \
+                 the keep never landed within 1 s (the flow had made {entered_calls} scans)"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The drain arm: shutdown while the flow is still mid-flight must
+        // never wait out the flow — the pump's join ends on the drain
+        // window alone (keeps interleave with the flow, so the queue is
+        // empty; a pre-fix runtime held the store lock across the flow, so
+        // the pump's join stood blocked behind it for the flow's whole
+        // run). The window is anchored short — the test seam the drain
+        // tests use — and the flow still has seconds of scanning left, so
+        // a shutdown that waited for the flow would blow the bound.
+        runtime.begin_drain_deadline(std::time::Instant::now() + Duration::from_millis(200));
+        let drained_at = std::time::Instant::now();
+        runtime.shutdown();
+        let drain_elapsed = drained_at.elapsed();
+        assert!(
+            drain_elapsed < Duration::from_secs(2),
+            "shutdown must not wait out an in-flight investigation (issue #54): \
+             it took {drain_elapsed:?}"
+        );
+        assert!(
+            !investigation.is_finished(),
+            "the flow was still mid-flight when shutdown returned"
+        );
+
+        // The flow itself still completes honestly on the blocking pool:
+        // the subject was resident when it started.
+        let (status, json) = investigation
+            .await
+            .expect("the investigation task ran to completion");
+        assert_eq!(status, StatusCode::OK, "the flow completes: {json}");
+        assert!(
+            json.get("error").is_none(),
+            "a complete envelope, not a refusal: {json}"
+        );
     }
 }
