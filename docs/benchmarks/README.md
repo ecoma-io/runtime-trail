@@ -90,23 +90,24 @@ gate rather than a report.
   subject request read back. Records the server's `VmRSS` during the pump
   and after settle. Asserts the typical-workload RSS target (< 100 MiB).
 - `query-budget` — an investigation forced past its chain budget: the
-  served surface must refuse truthfully (a degraded envelope naming the
-  dimension and the limit) and keep answering, and the server's RSS must
-  not grow under the refusal storm. Asserts a truthful refusal on every
-  storm request and no RSS growth beyond a small noise margin.
+  served surface must answer truthfully (a refusal, or a degraded 200
+  naming the dimension and the limit) and keep answering, and the server's
+  RSS must not grow under the storm. Asserts a truthful answer on every
+  storm request, zero fabricated-complete 200s, and no RSS growth beyond a
+  small noise margin.
 
 ### Records, machine-attached
 
 Measured locally with `scripts/bench/run-all.sh` on the tree of commit
-`de93be9`, machine `Linux x86_64, Debian GNU/Linux forky/sid` (kernel
+`c6a9d26`, machine `Linux x86_64, Debian GNU/Linux forky/sid` (kernel
 `7.1.8+deb14-amd64`, Intel Core i7-10700K). Every raw run records its own
 commit and machine in its header; the table quotes that one named run.
 
-| case           | measured                                                                        | budget (runtime-constraints.md) |
-| -------------- | ------------------------------------------------------------------------------- | ------------------------------- |
-| `startup`      | 12 ms to first 200 `/healthz`; settled `VmRSS` 6,396 KiB                        | < 1 s to serving                |
-| `workload-rss` | settled `VmRSS` 8,100 KiB (HWM 9,480 KiB) under 250 spans, 50 logs, 16 points   | < 100 MiB typical session       |
-| `query-budget` | `VmRSS` 35,344 → 35,376 KiB across the storm (+32 KiB); 20/20 truthful refusals | bounded: refuse-don't-grow      |
+| case           | measured                                                                                      | budget (runtime-constraints.md) |
+| -------------- | --------------------------------------------------------------------------------------------- | ------------------------------- |
+| `startup`      | 46 ms to first 200 `/healthz`; settled `VmRSS` 6,252 KiB                                      | < 1 s to serving                |
+| `workload-rss` | settled `VmRSS` 8,188 KiB (HWM 9,232 KiB) under 250 spans, 50 logs, 16 points                 | < 100 MiB typical session       |
+| `query-budget` | `VmRSS` 35,164 → 35,200 KiB across the storm (+36 KiB); 20/20 truthful, 0 fabricated-complete | bounded: refuse-don't-grow      |
 
 ## What CI does with benchmarks
 
