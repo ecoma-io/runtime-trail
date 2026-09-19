@@ -100,6 +100,10 @@ The process shuts down honestly:
 - **SIGTERM** → stop admitting immediately: emitters get the
   [draining wire signal](runtime-constraints.md) (HTTP 503 / gRPC
   `UNAVAILABLE`) from that moment.
+- **The desktop shell's close is the same closing**: its close hook fires
+  the core's own shutdown trigger, so stopping a desktop session stops
+  admitting immediately, drains within the same deadline and surfaces the
+  same `RunSummary` — the shell adds no second shutdown implementation.
 - In-flight admitted work drains to the store up to the
   [drain deadline](runtime-constraints.md); past the deadline, remaining
   in-flight work is dropped **observably** (surfaced, not silent).
