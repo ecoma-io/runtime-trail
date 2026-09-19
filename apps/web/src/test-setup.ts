@@ -18,4 +18,18 @@ function stubMatchMedia(query: string): MediaQueryList {
 
 window.matchMedia = (query) => stubMatchMedia(query);
 
+// Loom's `Table` (used by RelatedLogs and CorrelatedRelations) observes
+// its cells' size in a post-flush hook.
+class StubResizeObserver implements ResizeObserver {
+  // The real observer reports layout size changes the tests never drive.
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  observe(): void {}
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  unobserve(): void {}
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  disconnect(): void {}
+}
+
+window.ResizeObserver = StubResizeObserver;
+
 export {};

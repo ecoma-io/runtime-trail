@@ -28,7 +28,13 @@ const sortedLogs = computed(() =>
 function bodyText(body: LogView["log"]["body"]): string {
   if (body === undefined || body === null) return "";
   if (typeof body === "string") return body;
-  return String(body);
+  if (typeof body === "number" || typeof body === "boolean") {
+    return String(body);
+  }
+  // Structured values (arrays and key-value lists) render as JSON, so an
+  // empty array or object stays visible as `[]` / `{}` — never confused
+  // with an absent body, which renders as "".
+  return JSON.stringify(body);
 }
 </script>
 

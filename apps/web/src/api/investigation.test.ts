@@ -230,6 +230,44 @@ describe("investigateTrace", () => {
       ),
     ).toBe(0);
   });
+  it("parses absent, empty-array and empty-object bodies as distinct values", async () => {
+    // Issue #39: structured model values (arrays, key-value lists) arrive
+    // as real JSON arrays/objects over the HTTP surface — the reviver must
+    // keep them, and a genuinely absent body must stay null, so "absent"
+    // and "structured but empty" never collapse into one another.
+    const body = JSON.parse(fixtureEnvelope) as {
+      evidence: { logs: { log: { body: unknown } }[] };
+    };
+    body.evidence.logs = [
+      { log: { body: ["alpha", "beta"] } },
+      { log: { body: {} } },
+      { log: { body: [] } },
+      { log: { body: null } },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: () => JSON.stringify(body),
+      }),
+    );
+
+    const envelope = await investigateTrace({
+      root_span: {
+        span: {
+          trace_id: "11111111111111111111111111111111",
+          span_id: "2222222222222222",
+        },
+      },
+    });
+    const bodies = envelope.evidence.logs.map((log) => log.log.body);
+
+    expect(bodies[0]).toEqual(["alpha", "beta"]);
+    expect(bodies[1]).toEqual({});
+    expect(bodies[2]).toEqual([]);
+    expect(bodies[3]).toBeNull();
+  });
 
   it("converts a unix-nano timestamp to milliseconds", () => {
     expect(nanoToMs("1755200000000000000")).toBe(1755200000000);

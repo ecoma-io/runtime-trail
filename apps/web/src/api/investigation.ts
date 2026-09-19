@@ -45,8 +45,21 @@ export interface SpanView {
   };
 }
 
-/** A model `Value` as the HTTP surface renders it (arrays/maps become null). */
-export type ModelScalar = string | number | boolean | null;
+/** One model `Value` as the HTTP surface renders it: scalars pass through
+ * as JSON scalars, arrays and key-value lists render as JSON arrays and
+ * objects, and bytes as hex strings. `null` is the absent marker and is
+ * never a structured value — an empty array or key-value list renders as
+ * `[]` or `{}`, so absent and structured-but-empty stay distinguishable.
+ */
+export type ModelScalarValue =
+  | string
+  | number
+  | boolean
+  | ModelScalarValue[]
+  | { [key: string]: ModelScalarValue };
+
+/** A model value slot on the wire: a present value, or `null` = absent. */
+export type ModelScalar = ModelScalarValue | null;
 
 export interface LogView {
   entity?: EntityId | null;

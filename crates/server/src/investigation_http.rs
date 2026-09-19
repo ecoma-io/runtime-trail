@@ -669,20 +669,27 @@ fn render_chain_basis(basis: &ChainBasis) -> &'static str {
     }
 }
 
-/// Renders a model `Value` as JSON: primitive values pass through as JSON
-/// scalars; arrays and maps render as null on this surface (the envelope
-/// itself carries the record verbatim).
+/// Renders a model `Value` as JSON, verbatim: scalars pass through as
+/// JSON scalars, arrays and key-value lists render recursively as JSON
+/// arrays and objects, and bytes render as hex (the deliberate wire
+/// encoding for this surface). Nothing is truncated here — the model's
+/// admission gates are the one budget that bounds a value's depth and
+/// size, applied once at ingestion; this surface renders the admitted
+/// value whole.
 fn render_model_value(value: &Value) -> JsonValue {
     match value {
         Value::String(text) => JsonValue::String(text.clone()),
-        Value::Int(n) => JsonValue::from(*n),
-        Value::Double(d) => JsonValue::from(d.get()),
-        Value::Bool(b) => JsonValue::from(*b),
-        // Bytes render as hex on this surface (bounded, honest);
-        // arrays and kv-lists render as null — the envelope itself
-        // carries the record verbatim.
+        Value::Int(number) => JsonValue::from(*number),
+        Value::Double(double) => JsonValue::from(double.get()),
+        Value::Bool(flag) => JsonValue::from(*flag),
         Value::Bytes(bytes) => JsonValue::String(hex(bytes)),
-        Value::Array(_) | Value::KvList(_) => JsonValue::Null,
+        Value::Array(items) => JsonValue::Array(items.iter().map(render_model_value).collect()),
+        Value::KvList(entries) => JsonValue::Object(
+            entries
+                .iter()
+                .map(|(key, child)| (key.clone(), render_model_value(child)))
+                .collect(),
+        ),
     }
 }
 fn render_entity(entity: &EntityId) -> JsonValue {
@@ -820,6 +827,12 @@ mod tests {
     /// Ingests a two-span trace, one related log and one in-window point,
     /// waits for residency, and returns the runtime.
     fn seeded_runtime() -> Arc<CoreRuntime> {
+        seeded_runtime_with_logs(&one_related_log_payload(), 4)
+    }
+
+    /// Ingests the two-span trace, the in-window point, and `log_payload`,
+    /// waits for `expected` resident records, and returns the runtime.
+    fn seeded_runtime_with_logs(log_payload: &[u8], expected: u64) -> Arc<CoreRuntime> {
         let runtime = test_support::runtime();
         let pipeline = Arc::clone(runtime.pipeline());
         let now = runtime.now();
@@ -827,13 +840,31 @@ mod tests {
             .ingest_spans(now, &one_trace_payload())
             .expect("the trace ingests");
         pipeline
-            .ingest_logs(now, &one_related_log_payload())
-            .expect("the log ingests");
+            .ingest_logs(now, log_payload)
+            .expect("the logs ingest");
         pipeline
             .ingest_metrics(now, &one_point_payload())
             .expect("the point ingests");
-        wait_for_resident(&runtime, 4);
+        wait_for_resident(&runtime, expected);
         runtime
+    }
+
+    /// Builds a logs export whose records all belong to the subject trace
+    /// (T1, span S1), each carrying its body `$body` in order.
+    macro_rules! related_logs_payload {
+        ($($body:expr),* $(,)?) => {{
+            let records: Vec<_> = vec![$({
+                let mut log = fx::log_record();
+                log.trace_id = fx::T1.to_vec();
+                log.span_id = fx::S1.to_vec();
+                log.body = $body;
+                log
+            }),*];
+            fx::encode(&fx::logs_request(vec![fx::resource_logs(
+                None,
+                vec![fx::scope_logs(None, records)],
+            )]))
+        }};
     }
 
     #[tokio::test]
@@ -932,6 +963,191 @@ mod tests {
             "the error names the problem: {}",
             json["error"]
         );
+        runtime.shutdown();
+    }
+    #[tokio::test]
+    async fn structured_model_values_round_trip_over_http() {
+        let log_payload = related_logs_payload![
+            Some(fx::array_value(vec![
+                fx::str_value("alpha"),
+                fx::str_value("beta"),
+                fx::str_value("gamma"),
+            ])),
+            Some(fx::kvlist_value(vec![
+                fx::attr("name", fx::str_value("e2e")),
+                fx::attr("attempts", fx::int_value(3)),
+                fx::attr(
+                    "tags",
+                    fx::array_value(vec![fx::str_value("x"), fx::str_value("y")]),
+                ),
+            ])),
+            Some(fx::array_value(vec![
+                fx::kvlist_value(vec![fx::attr("a", fx::int_value(1))]),
+                fx::kvlist_value(vec![fx::attr("b", fx::str_value("two"))]),
+            ])),
+            Some(fx::bytes_value(vec![0xde, 0xad, 0xbe, 0xef])),
+            Some(fx::str_value(&"x".repeat(600))),
+            Some(fx::int_value(i64::MAX)),
+            Some(fx::double_value(3.5)),
+        ];
+        let runtime = seeded_runtime_with_logs(&log_payload, 10);
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let body = format!(
+            r#"{{"root_span": {{"span": {{"trace_id": "{TRACE_ID_HEX}", "span_id": "{SPAN_ID_HEX}"}}}}}}"#
+        );
+
+        let (status, json) = post(router, INVESTIGATION_TRACES_PATH, &body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let logs = json["evidence"]["logs"].as_array().expect("log views");
+        assert_eq!(logs.len(), 7, "every related log is evidence: {json}");
+        let bodies: Vec<&Value> = logs.iter().map(|log| &log["log"]["body"]).collect();
+        assert!(
+            bodies.contains(&&json!(["alpha", "beta", "gamma"])),
+            "an array body renders as the full JSON array: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!({ "name": "e2e", "attempts": 3, "tags": ["x", "y"] })),
+            "a key-value-list body renders as the full JSON object: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!([{ "a": 1 }, { "b": "two" }])),
+            "nesting through arrays of key-value lists renders intact: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!("deadbeef")),
+            "bytes render as hex, deliberately: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!(i64::MAX)),
+            "a 64-bit integer renders untruncated: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!(3.5)),
+            "a double renders untruncated: {json}"
+        );
+        let long_scalar = bodies
+            .iter()
+            .filter_map(|body| body.as_str())
+            .max_by_key(|text| text.len())
+            .expect("a scalar string body is present");
+        assert_eq!(
+            long_scalar.len(),
+            600,
+            "a long scalar body renders whole, never truncated: {json}"
+        );
+        assert!(
+            long_scalar.chars().all(|char| char == 'x'),
+            "the long scalar content is intact: {json}"
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn absent_and_structured_empty_values_are_distinct_on_the_wire() {
+        let runtime = seeded_runtime_with_logs(
+            &related_logs_payload![
+                None,
+                Some(fx::array_value(vec![])),
+                Some(fx::kvlist_value(vec![]))
+            ],
+            6,
+        );
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let body = format!(
+            r#"{{"root_span": {{"span": {{"trace_id": "{TRACE_ID_HEX}", "span_id": "{SPAN_ID_HEX}"}}}}}}"#
+        );
+
+        let (status, json) = post(router, INVESTIGATION_TRACES_PATH, &body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let logs = json["evidence"]["logs"].as_array().expect("log views");
+        assert_eq!(logs.len(), 3, "every related log is evidence: {json}");
+        let bodies: Vec<&Value> = logs.iter().map(|log| &log["log"]["body"]).collect();
+        // Absent stays absent (JSON null) and is distinguishable from a
+        // structured-but-empty value: `[]` and `{}` survive as themselves.
+        assert_eq!(
+            bodies.iter().filter(|body| body.is_null()).count(),
+            1,
+            "only the record with no body renders null: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!([])),
+            "an empty array stays an empty array, never null: {json}"
+        );
+        assert!(
+            bodies.contains(&&json!({})),
+            "an empty key-value list stays an empty object, never null: {json}"
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn every_envelope_reference_resolves_to_a_present_entity() {
+        let runtime = seeded_runtime();
+        let router = build_router(Arc::clone(&runtime), ServerConfig::default());
+        let body = format!(
+            r#"{{"root_span": {{"span": {{"trace_id": "{TRACE_ID_HEX}", "span_id": "{SPAN_ID_HEX}"}}}}}}"#
+        );
+
+        let (status, json) = post(router, INVESTIGATION_TRACES_PATH, &body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // Every record view carries the entity id it was named by
+        // (invariant 4): no view is emitted unkeyed.
+        let span_entities: Vec<&Value> = json["evidence"]["spans"]
+            .as_array()
+            .expect("span views")
+            .iter()
+            .map(|view| {
+                view.get("entity")
+                    .expect("a span view carries its entity id")
+            })
+            .collect();
+        let log_entities: Vec<&Value> = json["evidence"]["logs"]
+            .as_array()
+            .expect("log views")
+            .iter()
+            .map(|view| {
+                view.get("entity")
+                    .expect("a log view carries its entity id")
+            })
+            .collect();
+        let point_entities: Vec<&Value> = json["evidence"]["points"]
+            .as_array()
+            .expect("point views")
+            .iter()
+            .map(|view| {
+                view.get("entity")
+                    .expect("a point view carries its entity id")
+            })
+            .collect();
+        // Every reference in the correlated part resolves to a present
+        // evidence view (invariant 3): no dangling refs on the wire.
+        let relations = json["correlated"]["relations"]
+            .as_array()
+            .expect("relations");
+        assert!(
+            !relations.is_empty(),
+            "the seeded fixture yields relations to check: {json}"
+        );
+        for relation in relations {
+            for endpoint in ["from", "to"] {
+                let reference = &relation[endpoint];
+                let entities = match reference["kind"].as_str().expect("a ref kind") {
+                    "spans" => &span_entities,
+                    "log_records" => &log_entities,
+                    "metric_points" => &point_entities,
+                    other => panic!("an unrendered signal kind on the wire: {other}"),
+                };
+                assert!(
+                    entities
+                        .iter()
+                        .any(|entity| *entity == &reference["entity"]),
+                    "the {endpoint} reference resolves to a present entity: {relation}"
+                );
+            }
+        }
         runtime.shutdown();
     }
 }
