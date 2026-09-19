@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Table, TableHead, TableRow, TableCell, Badge } from "@ecoma-io/loom";
-import type { Relation, EntityId } from "../api/investigation";
+import type { EvidenceFact, Relation, EntityId } from "../api/investigation";
 
 defineProps<{
   relations: Relation[];
@@ -12,13 +12,15 @@ function entityText(entity: EntityId): string {
   return `#${entity.assigned}`;
 }
 
-function factText(fact: {
-  field: string;
-  value: string | number | boolean | null;
-}): string {
+function factText(fact: EvidenceFact): string {
   if (fact.value === null) return `${fact.field}=null`;
   if (typeof fact.value === "string") return `${fact.field}="${fact.value}"`;
-  return `${fact.field}=${String(fact.value)}`;
+  if (typeof fact.value === "number" || typeof fact.value === "boolean") {
+    return `${fact.field}=${String(fact.value)}`;
+  }
+  // Structured values (arrays and key-value lists) render as JSON, so
+  // they stay distinguishable from `field=null` (absent) on the wire.
+  return `${fact.field}=${JSON.stringify(fact.value)}`;
 }
 </script>
 
