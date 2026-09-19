@@ -70,6 +70,22 @@ impl std::fmt::Display for ProbeError {
     }
 }
 
+impl ProbeError {
+    /// Wraps a message into a probe error — the served-runtime probes
+    /// (which live in a sibling module and cannot name the private
+    /// field) build their failures through this constructor.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        ProbeError(message.into())
+    }
+}
+
+impl From<crate::rss::RssError> for ProbeError {
+    fn from(error: crate::rss::RssError) -> Self {
+        ProbeError(error.to_string())
+    }
+}
+
 impl std::error::Error for ProbeError {}
 
 /// The runtime's clock, as admission expects it: nanoseconds on the

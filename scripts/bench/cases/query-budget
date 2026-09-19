@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Case: query-budget (Phase 6) — a query forced past its budget, answered
+# truthfully, served memory holding the line — budget-gated.
+#
+# Launches the real server binary, then probe-query-budget ingests one
+# trace large enough that the investigation chain must blow its per-page
+# budgets (chain total_entities is 10,000; the probe residents 12,000
+# spans), warms the investigation surface (which must answer with the
+# truthful degraded envelope), reads the server's settled RSS, then storms
+# the surface and counts the truthful 200 answers (dimension/limit/spend
+# named — see docs/architecture/query-model.md). The case asserts both
+# halves of "query memory bounded" (refuse-don't-grow,
+# runtime-constraints.md): the refusal was observed, and the server's RSS
+# did not grow beyond a small noise margin (< 5 MiB) across the storm.
+# Fails non-zero with target + measured; the probe's record passes
+# through verbatim.
+set -euo pipefail
+cd "$(dirname "$0")/../../.."
+# shellcheck source=scripts/bench/served-common.sh
+source scripts/bench/served-common.sh
+
+noise_kib=$((5 * 1024)) # refuse-don't-grow: no growth beyond noise — runtime-constraints.md
+
+served_check_port
+served_build
+cargo build --release --locked -p runtime-trail-bench-probes --bin probe-query-budget 1>&2
+
+served_start
+pid="$served_pid"
+cleanup() {
+  [ -n "$pid" ] && { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; } || true
+}
+trap cleanup EXIT
+
+output="$(target/release/probe-query-budget "$pid" "$served_port")"
+printf '%s\n' "$output"
+
+truthful="$(printf '%s' "$output" | sed -n 's/.*"truthful_answers":\([0-9][0-9]*\).*/\1/p')"
+before="$(printf '%s' "$output" | sed -n 's/.*"server_rss_before_kib":\([0-9][0-9]*\).*/\1/p')"
+after="$(printf '%s' "$output" | sed -n 's/.*"server_rss_after_kib":\([0-9][0-9]*\).*/\1/p')"
+if [ -z "$truthful" ] || [ -z "$before" ] || [ -z "$after" ]; then
+  echo "✗ query-budget: probe-query-budget's record carried no truthful_answers/server_rss_before_kib/server_rss_after_kib." >&2
+  exit 1
+fi
+if [ "$truthful" -lt 1 ]; then
+  echo "✗ query-budget: the storm produced no truthful budget refusal (truthful_answers=$truthful)." >&2
+  exit 1
+fi
+growth=$((after > before ? after - before : 0))
+if [ "$growth" -ge "$noise_kib" ]; then
+  echo "✗ query-budget budget: server RSS grew ${growth} KiB across the refusal storm (>= noise margin ${noise_kib} KiB; query memory bounded — refuse, don't grow, runtime-constraints.md)." >&2
+  exit 1
+fi
+
+# Graceful drain is a contract (≤ 5 s, exit 0).
+kill -TERM "$pid"
+wait "$pid"
+drain_status=$?
+pid=""
+if [ "$drain_status" -ne 0 ]; then
+  echo "✗ query-budget: served runtime did not drain on SIGTERM (exit $drain_status; contract: ≤ 5 s, exit 0)." >&2
+  exit 1
+fi

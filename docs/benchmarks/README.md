@@ -12,9 +12,10 @@ retention/query memory). Nothing on this page is evidence that a target is
 met. A number only becomes a **result** when it is produced by a registered
 scenario below, on a named machine, at a named commit — and until then the
 only honest status is "not yet measured". A result becomes a **gated
-regression check** only from Phase 6 ([roadmap](../roadmap/phases.md));
-before that, per-phase case assertions are advisory evidence produced by the
-harness and checked by hand — never a CI gate.
+regression check** when the case asserts its budget: the Phase-6 scenarios
+below do, and CI runs the harness on every change
+([roadmap](../roadmap/phases.md)). The Phase-1 cases remain advisory
+evidence — they measure, they never assert.
 
 ## The harness
 
@@ -59,35 +60,64 @@ here.
   counters beside RSS.
 - `idle-rss` — the same composition, constructed and left alone: the
   settled resident set of queue + pipeline + store with no traffic. (The
-  composition mirrors the crates' own construction APIs until the server
-  wires the path in Phase 1 wave 3; the served runtime's idle RSS is this
-  case again once that wiring exists.)
+  composition mirrors the crates' own construction APIs; the served
+  runtime's idle RSS is the Phase-6 `startup` case, which leaves the real
+  server binary at rest and reads its settled `VmRSS`.)
 - `retention-bound` — the retention law alone: a small, stated store
   configuration filled past its ceilings, then held under continued load
   while RSS is sampled across the steady state. Plateau samples, eviction
   counters and residency are recorded; the spread of the plateau is the
   evidence, not a passed threshold.
 
+## Registered cases (Phase 6: the served runtime)
+
+Phase 6's scenarios ([roadmap](../roadmap/phases.md)) measure the **served
+runtime** — the real `runtime-trail-server` binary, launched by the case
+script on a loopback port, driven over OTLP/HTTP and the Investigation API,
+and read through `/proc/<pid>/status`. Budgets come from
+[runtime-constraints.md](../architecture/runtime-constraints.md) and are
+asserted by the case itself: a violation exits non-zero with the target and
+the measured value in the message, which is what makes the CI `bench` job a
+gate rather than a report.
+
+- `startup` — cold start of the real server binary to its first 200
+  `/healthz`: wall time from spawn to answer, then the settled `VmRSS`
+  once the health probe has been served. Asserts the startup target
+  (< 1 s).
+- `workload-rss` — a scripted investigation session against the served
+  runtime: an OTLP trace of a few hundred spans, its related logs and a
+  handful of metrics posted over HTTP, then the investigation surface's
+  subject request read back. Records the server's `VmRSS` during the pump
+  and after settle. Asserts the typical-workload RSS target (< 100 MiB).
+- `query-budget` — an investigation forced past its chain budget: the
+  served surface must refuse truthfully (a degraded envelope naming the
+  dimension and the limit) and keep answering, and the server's RSS must
+  not grow under the refusal storm. Asserts a truthful refusal on every
+  storm request and no RSS growth beyond a small noise margin.
+
+### Records, machine-attached
+
+Measured locally with `scripts/bench/run-all.sh` on the tree of commit
+`de93be9`, machine `Linux x86_64, Debian GNU/Linux forky/sid` (kernel
+`7.1.8+deb14-amd64`, Intel Core i7-10700K). Every raw run records its own
+commit and machine in its header; the table quotes that one named run.
+
+| case           | measured                                                                        | budget (runtime-constraints.md) |
+| -------------- | ------------------------------------------------------------------------------- | ------------------------------- |
+| `startup`      | 12 ms to first 200 `/healthz`; settled `VmRSS` 6,396 KiB                        | < 1 s to serving                |
+| `workload-rss` | settled `VmRSS` 8,100 KiB (HWM 9,480 KiB) under 250 spans, 50 logs, 16 points   | < 100 MiB typical session       |
+| `query-budget` | `VmRSS` 35,344 → 35,376 KiB across the storm (+32 KiB); 20/20 truthful refusals | bounded: refuse-don't-grow      |
+
 ## What CI does with benchmarks
 
-**Nothing yet, deliberately.** Benchmark gating arrives with Phase 6
-([roadmap](../roadmap/phases.md)) when the scenarios exist and the numbers
-are stable. Until then the harness is run by hand:
+CI runs the harness on every pull request and merge in the `bench` job
+(`.github/workflows/ci.yml`), which is part of the required `ci-gate`. The
+Phase-6 cases assert their budgets, so the job fails when a budget breaks:
 
 ```sh
-scripts/bench/run-all.sh   # runs the registered cases; no case asserts a budget
+scripts/bench/run-all.sh   # served-runtime cases assert; Phase-1 cases measure only
 ```
 
-## Planned scenarios (placeholders in name only — none exist)
-
-Registered by their phases, not before:
-
-- `startup` (Phase 1) — cold start to an answered health probe; measures
-  against the startup target.
-- `workload-rss` (Phase 2) — a scripted investigation session against a
-  generated OTLP stream; measures RSS against the workload target.
-- `query-budget` (Phase 2) — a query forced past its budget; asserts the
-  refuse-don't-grow contract.
-
-Adding a scenario before its phase's capability exists is a scope violation —
-it would measure nothing and report it anyway.
+The Phase-1 cases above still never assert — their records remain evidence
+produced by the harness and checked by hand. A budget stops being a target
+the day a scenario asserts it under this job.

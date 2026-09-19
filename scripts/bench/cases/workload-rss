@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Case: workload-rss (Phase 6) — the served runtime under a typical
+# investigation session, budget-gated.
+#
+# Launches the real server binary (target/release/runtime-trail-server),
+# then probe-workload drives the served surfaces the way a person would:
+# one trace of a few hundred spans plus its related logs and surrounding
+# metric points over the OTLP/HTTP receiver, then an investigation of the
+# trace's root (200) and of a well-formed foreign subject (404). The probe
+# reads the *server's* VmRSS from /proc/<pid>/status during the pump and
+# after settle. The case asserts the normative target — typical workload
+# RSS < 100 MiB (docs/architecture/runtime-constraints.md) — on the
+# settled reading, and fails non-zero with target + measured. The probe's
+# record passes through verbatim; the target lives only in
+# runtime-constraints.md and the failure message.
+set -euo pipefail
+cd "$(dirname "$0")/../../.."
+# shellcheck source=scripts/bench/served-common.sh
+source scripts/bench/served-common.sh
+
+target_kib=$((100 * 1024)) # < 100 MiB — runtime-constraints.md
+
+served_check_port
+served_build
+cargo build --release --locked -p runtime-trail-bench-probes --bin probe-workload 1>&2
+
+served_start
+pid="$served_pid"
+cleanup() {
+  [ -n "$pid" ] && { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; } || true
+}
+trap cleanup EXIT
+
+output="$(target/release/probe-workload "$pid" "$served_port")"
+printf '%s\n' "$output"
+
+settled="$(printf '%s' "$output" | sed -n 's/.*"server_rss_settled_kib":\([0-9][0-9]*\).*/\1/p')"
+if [ -z "$settled" ]; then
+  echo "✗ workload-rss: probe-workload's record carried no server_rss_settled_kib." >&2
+  exit 1
+fi
+if [ "$settled" -ge "$target_kib" ]; then
+  echo "✗ workload-rss budget: settled VmRSS ${settled} KiB >= target ${target_kib} KiB (typical workload RSS < 100 MiB, runtime-constraints.md)." >&2
+  exit 1
+fi
+
+# Graceful drain is a contract (≤ 5 s, exit 0).
+kill -TERM "$pid"
+wait "$pid"
+drain_status=$?
+pid=""
+if [ "$drain_status" -ne 0 ]; then
+  echo "✗ workload-rss: served runtime did not drain on SIGTERM (exit $drain_status; contract: ≤ 5 s, exit 0)." >&2
+  exit 1
+fi

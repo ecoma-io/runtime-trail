@@ -1,12 +1,14 @@
 //! Process memory readings, taken from the operating system.
 //!
-//! Every RSS number a probe reports is read from `/proc/self/status`
-//! (`VmRSS`, the resident set now; `VmHWM`, the resident-set high-water
-//! mark). Linux is the platform (`docs/decisions/0001-runtime-language.md`
-//! names it); a probe that cannot read the kernel's own accounting
-//! **fails loudly and exits non-zero** — it never prints a guessed or
-//! zero number, because a fabricated measurement is worse than no
-//! measurement (AGENTS.md, "Prohibited shortcuts").
+//! Every RSS number a probe reports is read from `/proc/self/status` — or,
+//! for the served-runtime probes, from `/proc/<pid>/status`, which reports
+//! the *server process* the probe measures from outside — (`VmRSS`, the
+//! resident set now; `VmHWM`, the resident-set high-water mark). Linux is
+//! the platform (`docs/decisions/0001-runtime-language.md` names it); a
+//! probe that cannot read the kernel's own accounting **fails loudly and
+//! exits non-zero** — it never prints a guessed or zero number, because a
+//! fabricated measurement is worse than no measurement (AGENTS.md,
+//! "Prohibited shortcuts").
 //!
 //! The numbers are the kernel's page-accounted view: resident pages of the
 //! whole process, in KiB exactly as `/proc` states them. That view includes
@@ -65,11 +67,44 @@ pub fn sample() -> Result<RssSample, RssError> {
     }
     let status = std::fs::read_to_string("/proc/self/status")
         .map_err(|error| RssError(format!("cannot read /proc/self/status: {error}")))?;
-    let vm_rss_kib = field_kib(&status, "VmRSS:").ok_or_else(|| {
-        RssError("/proc/self/status carried no VmRSS line — refusing to report".to_owned())
+    sample_from(&status)
+}
+
+/// Reads another process's current resident-set state — the served-runtime
+/// probes measure the server process, which is *not* the probe process, so
+/// their readings come from `/proc/<pid>/status` instead of
+/// `/proc/self/status`. Two probes sharing one server both read the same
+/// file, so their numbers are the same kernel facts.
+///
+/// # Errors
+///
+/// [`RssError`] off Linux; when `/proc/{pid}/status` cannot be read (the
+/// process vanished mid-measurement, or its accounting is unreadable); or
+/// when the body lacks the two fields every probe needs.
+pub fn sample_pid(pid: u32) -> Result<RssSample, RssError> {
+    if !platform_supported() {
+        return Err(RssError(
+            "RSS probes read /proc/self/status or /proc/<pid>/status, which exist on \
+             Linux only; this platform cannot be measured here, so the probe refuses \
+             to print numbers (AGENTS.md: a check that cannot run says so loudly)"
+                .to_owned(),
+        ));
+    }
+    let path = format!("/proc/{pid}/status");
+    let status = std::fs::read_to_string(&path)
+        .map_err(|error| RssError(format!("cannot read {path}: {error}")))?;
+    sample_from(&status)
+}
+
+/// Extracts the two fields every probe needs from a `/proc/<pid>/status`
+/// body — shared by the self and by-pid readers; a body without both
+/// fields is a refusal, never a guessed number.
+fn sample_from(status: &str) -> Result<RssSample, RssError> {
+    let vm_rss_kib = field_kib(status, "VmRSS:").ok_or_else(|| {
+        RssError("the /proc status body carried no VmRSS line — refusing to report".to_owned())
     })?;
-    let vm_hwm_kib = field_kib(&status, "VmHWM:").ok_or_else(|| {
-        RssError("/proc/self/status carried no VmHWM line — refusing to report".to_owned())
+    let vm_hwm_kib = field_kib(status, "VmHWM:").ok_or_else(|| {
+        RssError("the /proc status body carried no VmHWM line — refusing to report".to_owned())
     })?;
     Ok(RssSample {
         vm_rss_kib,
@@ -136,6 +171,41 @@ mod tests {
         assert!(
             reading.vm_hwm_kib >= reading.vm_rss_kib,
             "the high-water mark is never below the current set"
+        );
+    }
+
+    #[test]
+    fn parses_a_status_body_into_a_sample() {
+        assert_eq!(
+            sample_from(STATUS).expect("the fixture body is parseable"),
+            RssSample {
+                vm_rss_kib: 1234,
+                vm_hwm_kib: 5678,
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_another_process_by_pid_on_linux() {
+        let by_pid =
+            sample_pid(std::process::id()).expect("this test runs on Linux, where /proc exists");
+        assert!(
+            by_pid.vm_rss_kib > 0,
+            "a running process has a non-empty resident set"
+        );
+        assert!(
+            by_pid.vm_hwm_kib >= by_pid.vm_rss_kib,
+            "the high-water mark is never below the current set"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn refuses_to_report_other_processes_off_linux() {
+        assert!(
+            sample_pid(std::process::id()).is_err(),
+            "no /proc, no numbers"
         );
     }
 
