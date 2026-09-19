@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 runtime-trail-investigation = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

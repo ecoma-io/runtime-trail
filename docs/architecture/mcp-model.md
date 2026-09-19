@@ -55,6 +55,35 @@ to the human workflow, from one implementation.
 
 ## Status
 
-**Bootstrap.** No MCP capability exists; the crate is the declared boundary
-only. Tools land in Phase 4 ([../roadmap/phases.md](../roadmap/phases.md)),
-designed against this document and [../product/scope.md](../product/scope.md).
+**Implemented (issue #36).** Four JSON-RPC tools mirror the HTTP
+investigation surface, one committed flow:
+
+- `investigate_trace` — the HTTP surface's own request shape
+  (`root_span`), answered with the same envelope.
+- `investigate_log` — the same flow entered through a resident log
+  record: its span context resolves to the trace, and that trace is
+  investigated. A span descriptor is investigated as-is; an unresolvable
+  serial is the HTTP surface's 404 wording; a resident record without
+  span context is refused rather than fabricated.
+- `investigate_metric` — a span descriptor is investigated as-is. A
+  resident metric point carries no trace linkage in the committed model
+  (the strategy set's exemplar relation is pinned not-implemented) and is
+  refused cleanly — nothing is fabricated.
+- `continue_investigation` — re-investigates the named root span from a
+  reported continuation cursor under a fresh admitted budget; the answer
+  is the deterministic re-investigation.
+
+All four run `investigate_trace_bounded` under the HTTP adapter's admitted
+budget and chain constants (same page deadline/results/scan/aggregation
+memory, same chain ceilings, same coverage and limits field paths, cursor
+hex), so an MCP client observes exactly the envelope the HTTP surface
+produces for the same admission. `crates/mcp/tests/parity.rs` pins this:
+each tool's envelope equals the API's baseline result under identical
+constants, and the rendered JSON carries the field paths and values the
+server's own HTTP tests assert.
+
+The server is synchronous stdio JSON-RPC with Content-Length framing —
+hand-rolled in the crate because `layer-agent` may not depend on tokio or
+axum, and the MCP SDKs pull both in. The protocol (initialize, ping,
+tools/list, tools/call, JSON-RPC error codes) is fully unit-tested in
+`crates/mcp/src/protocol.rs`.

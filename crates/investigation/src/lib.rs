@@ -31,6 +31,19 @@
 /// This crate's version, as declared in its manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// The store facade the committed flow signatures name, and the telemetry
+// model vocabulary the contract is written in. Re-exported so a consumer of
+// this crate — the MCP surface — can name subjects and pass the store
+// through with only one dependency edge of its own (`layer-agent` →
+// `layer-api`, enforced by `module-boundaries.config.mjs`), never a storage,
+// query or model edge. The facade is owned by `runtime-trail-storage` and
+// re-exported here via the query crate's own re-export (ADR 0011); the model
+// is this crate's direct dependency (the API composes model-shaped answers).
+pub use runtime_trail_query::{
+    AdmissionKey, KeepOutcome, PointView, ScanItem, ScanPage, StoreStats, TelemetryStore,
+};
+pub use runtime_trail_telemetry_model as telemetry_model;
+
 pub mod correlated;
 pub mod envelope;
 pub mod evidence;
