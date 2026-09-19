@@ -35,6 +35,16 @@
 //! unchanged — the chain's snapshot is fixed by its first page, and a
 //! pulled tail past it never widens the view.
 //!
+//! An investigation pins its continuation with a **snapshot lease**
+//! ([`SnapshotLease`], "Snapshot leases" in
+//! [query-model.md](../../docs/architecture/query-model.md)): the compose
+//! flow mints the lease over the fingerprint of the boundary its first
+//! page minted and pages through [`records_leased`], which rejects any
+//! continuation whose snapshot fingerprint differs from the lease's —
+//! before any budget work. A lease from one investigation can never page
+//! another investigation's snapshot, and records admitted past the
+//! leased boundary stay outside the leased view.
+//!
 //! Filters are the walk's predicate layer
 //! ([`crate::filters`]): the query carries its kind's filter struct, and
 //! each examined record is matched against it after the scan charge and
@@ -56,6 +66,7 @@ use runtime_trail_telemetry_model::{
 use crate::budget::{BudgetSession, QueryBudget};
 use crate::cursor::{self, CursorError, CursorPayload};
 use crate::filters::{LogFilters, MetricFilters, RecordsFilters, SpanFilters};
+use crate::lease::SnapshotLease;
 use crate::result::{
     BudgetRefusal, Coverage, CoverageEntry, Dimension, Execution, Page, PartOutcome, Truncation,
     TruncationPoint,
@@ -707,6 +718,9 @@ impl Walk<'_> {
 /// (invariant 1). The result fails outright only on its continuation
 /// cursor (invariant 3); every budget expiry is an answer shape.
 ///
+/// This entry continues with no lease — an un-pinned continuation
+/// ([`records_leased`] is the per-investigation pin).
+///
 /// # Errors
 ///
 /// [`QueryError::Cursor`] when `continuation` is not a canonical cursor
@@ -717,12 +731,51 @@ pub fn records(
     budget: QueryBudget,
     continuation: Option<&[u8]>,
 ) -> Result<Page<RecordView>, QueryError> {
+    records_inner(store, query, budget, continuation, None)
+}
+
+/// Answers a records query within its budget, pinned to one
+/// investigation's snapshot by a lease
+/// (["Snapshot leases" in query-model.md](../../docs/architecture/query-model.md)).
+/// The continuation is checked against the lease when it is decoded —
+/// after the query fingerprint, before any budget work — so a mismatch is
+/// an error regardless of the budget, and a lease from one investigation
+/// can never page another investigation's snapshot (invariant 9).
+///
+/// # Errors
+///
+/// [`QueryError::Cursor`] when `continuation` is not a canonical cursor
+/// encoding, is a cursor minted under a different query (invariant 3), or
+/// continues a snapshot the presented lease does not govern.
+pub fn records_leased(
+    store: &dyn TelemetryStore,
+    query: &RecordsQuery,
+    budget: QueryBudget,
+    continuation: &[u8],
+    lease: &SnapshotLease,
+) -> Result<Page<RecordView>, QueryError> {
+    records_inner(store, query, budget, Some(continuation), Some(lease))
+}
+
+/// The shared walk behind [`records`] and [`records_leased`]: identical
+/// behavior, with the lease, when presented, applied as part of the
+/// continuation's validity test.
+fn records_inner(
+    store: &dyn TelemetryStore,
+    query: &RecordsQuery,
+    budget: QueryBudget,
+    continuation: Option<&[u8]>,
+    lease: Option<&SnapshotLease>,
+) -> Result<Page<RecordView>, QueryError> {
     let fingerprint = cursor::fingerprint(&query.canonical_bytes());
     let presented = match continuation {
         None => None,
         Some(bytes) => {
             let payload = CursorPayload::decode(bytes)?;
             payload.verify(fingerprint)?;
+            if let Some(lease) = lease {
+                payload.verify_lease(lease)?;
+            }
             Some(payload)
         }
     };
@@ -847,13 +900,17 @@ mod tests {
         StreamKind, TraceContext, TraceFlags, TraceId, TraceState, Value,
     };
 
-    use super::{QueryError, RecordView, RecordsQuery, SignalKind, records, walk_records};
+    use super::{
+        QueryError, RecordView, RecordsQuery, SignalKind, records, records_leased, walk_records,
+    };
     use crate::budget::QueryBudget;
     use crate::cursor::{CursorError, CursorPayload};
     use crate::filters::{
         LogFilters, MetricFilters, ScopeFilter, ServiceFilter, SeverityFilter, SpanFilters,
         TimeRangeFilter,
     };
+    use crate::lease::{InvestigationId, SnapshotLease};
+
     use crate::result::{
         CoverageEntry, Dimension, Magnitude, Page, PartOutcome, Truncation, TruncationPoint,
     };
@@ -868,6 +925,11 @@ mod tests {
         EntityId::Assigned(AssignedId::from_serial(
             NonZeroU64::new(serial).expect("fixture serials are nonzero"),
         ))
+    }
+
+    /// An investigation identity for a lease.
+    fn investigation(serial: u64) -> InvestigationId {
+        InvestigationId::new(NonZeroU64::new(serial).expect("fixture investigations are nonzero"))
     }
 
     /// A span's natural wire identity.
@@ -3909,5 +3971,205 @@ mod tests {
             "a one-page blip is not a stall"
         );
         assert!(page.next_cursor.is_none());
+    }
+
+    /// The lease is the per-investigation pin: X's lease pages X's
+    /// snapshot and is refused on another investigation's snapshot, and
+    /// the reverse holds — a cursor cannot be replayed under a foreign
+    /// lease, in either direction, whichever snapshot it continues
+    /// ("Snapshot leases").
+    ///
+    /// Kills the lease-ignoring no-op in the engine: a `records_leased`
+    /// that never checked the lease would page both stores happily.
+    #[test]
+    fn a_lease_from_one_investigation_cannot_page_another_investigations_snapshot() {
+        let store_a = five_spans();
+        let store_b = span_store(6);
+        let query = RecordsQuery::new(SignalKind::Spans);
+
+        let first_a = records(&store_a, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor_a = first_a.next_cursor.expect("a truncated page continues");
+        let boundary_a = CursorPayload::decode(&cursor_a)
+            .expect("the engine's own cursor")
+            .snapshot();
+        assert_eq!(boundary_a, AdmissionKey::new(at(500), span_entity(5, 5)));
+        let lease_x = SnapshotLease::for_boundary(investigation(7), boundary_a);
+
+        let first_b = records(&store_b, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor_b = first_b.next_cursor.expect("a truncated page continues");
+        let boundary_b = CursorPayload::decode(&cursor_b)
+            .expect("the engine's own cursor")
+            .snapshot();
+        assert_ne!(boundary_a, boundary_b, "the two snapshots differ");
+        let lease_y = SnapshotLease::for_boundary(investigation(11), boundary_b);
+
+        // Each investigation's own lease pages its own snapshot…
+        let within_x = records_leased(&store_a, &query, open_budget(), &cursor_a, &lease_x)
+            .expect("X's lease pages X's snapshot");
+        assert_eq!(within_x.execution.parts, vec![PartOutcome::Complete]);
+        let within_y = records_leased(&store_b, &query, open_budget(), &cursor_b, &lease_y)
+            .expect("Y's lease pages Y's snapshot");
+        assert_eq!(within_y.execution.parts, vec![PartOutcome::Complete]);
+
+        // …and neither lease reaches across, in either direction.
+        let foreign = records_leased(&store_b, &query, open_budget(), &cursor_b, &lease_x)
+            .expect_err("X's lease must not page Y's snapshot");
+        assert_eq!(foreign, QueryError::Cursor(CursorError::LeaseMismatch));
+        let foreign_back = records_leased(&store_a, &query, open_budget(), &cursor_a, &lease_y)
+            .expect_err("Y's lease must not page X's snapshot");
+        assert_eq!(foreign_back, QueryError::Cursor(CursorError::LeaseMismatch));
+    }
+
+    /// Drift after the lease is issued: records admitted past the leased
+    /// boundary stay outside the leased view — the continuation answers
+    /// exactly the snapshot it was leased over, and the boundary is named
+    /// in coverage. The lease keeps its force through the drift: no
+    /// re-mint widened the view.
+    ///
+    /// Kills the widened-snapshot mutation: a continuation that re-minted
+    /// its bound from a fresh pull (or a lease that silently re-anchored)
+    /// would let drifted records into the leased view.
+    #[test]
+    fn snapshot_drift_after_lease_issuance_stays_outside_the_leased_view() {
+        let mut store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+        let boundary = CursorPayload::decode(&cursor)
+            .expect("the engine's own cursor")
+            .snapshot();
+        assert_eq!(boundary, AdmissionKey::new(at(500), span_entity(5, 5)));
+        let lease = SnapshotLease::for_boundary(investigation(3), boundary);
+
+        // Records admitted after the lease was issued — the leased
+        // snapshot's frontier is fixed at the minting page's pulled tail,
+        // and the new records sit past the bound.
+        keep_span(
+            &mut store,
+            600,
+            span_entity(6, 6),
+            fixture_span(6, 6, "span-6"),
+        );
+        keep_span(
+            &mut store,
+            700,
+            span_entity(7, 7),
+            fixture_span(7, 7, "span-7"),
+        );
+
+        let second = records_leased(&store, &query, open_budget(), &cursor, &lease)
+            .expect("the leased continuation answers");
+        let entities: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            entities,
+            vec![span_entity(3, 3), span_entity(4, 4), span_entity(5, 5)],
+            "drifted-in records stay outside the leased snapshot"
+        );
+        assert_eq!(
+            second.execution.coverage.entries,
+            vec![CoverageEntry::SnapshotBoundary {
+                admission: boundary,
+            }],
+            "the leased view names its boundary"
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    /// A lease and a budget expiry cooperate on one continuation: the
+    /// page whose scan ceiling dies mid-batch stops cleanly and mints its
+    /// cursor at the last included record; the leased continuation resumes
+    /// exactly where the budget allowed — e3, not a re-walk of e1/e2 and
+    /// not a skip — and finishes the snapshot under the same lease.
+    ///
+    /// Kills the position-regression no-op: a continuation that restarted
+    /// from the kind's front would repeat returned records, and a
+    /// continuation that skipped past the anchor would lose them.
+    #[test]
+    fn exhaustion_mid_page_stops_cleanly_and_the_leased_continuation_resumes_where_budget_allowed()
+    {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+
+        // Scan ceiling 2 on the first page: e1 and e2 are examined and
+        // included, the charge for e3 is refused mid-batch (the whole kind
+        // arrived as one batch), and the minted cursor anchors at e2.
+        let first = records(&store, &query, budget_with(1_000, 1 << 40, 2), None)
+            .expect("the query answers");
+        let entities: Vec<EntityId> = first
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(entities, vec![span_entity(1, 1), span_entity(2, 2)]);
+        let truncation = degraded_of(&first);
+        assert_eq!(truncation.dimension, Dimension::Scan);
+        let cursor = first.next_cursor.expect("a degraded page mints a cursor");
+        let boundary = CursorPayload::decode(&cursor)
+            .expect("the engine's own cursor")
+            .snapshot();
+        let lease = SnapshotLease::for_boundary(investigation(5), boundary);
+
+        // The leased continuation starts exactly where the budget allowed:
+        // e3, not e2 again and not e1.
+        let second = records_leased(&store, &query, open_budget(), &cursor, &lease)
+            .expect("the leased continuation answers");
+        let resumed: Vec<EntityId> = second
+            .items
+            .iter()
+            .map(|view| span_entity_of(view).expect("a span page"))
+            .collect();
+        assert_eq!(
+            resumed,
+            vec![span_entity(3, 3), span_entity(4, 4), span_entity(5, 5)],
+            "the next page starts where the budget allowed"
+        );
+        assert_eq!(second.execution.parts, vec![PartOutcome::Complete]);
+        assert!(second.next_cursor.is_none());
+    }
+
+    /// The lease never weakens the cursor's own validity tests: under a
+    /// lease, bytes that decode to nothing are still
+    /// [`QueryError::Cursor`] (`Malformed`), and a cursor minted under a
+    /// different query still fails its fingerprint — the lease is checked
+    /// only after both pass.
+    ///
+    /// Kills the ordering no-op: a `records_leased` that skipped the
+    /// query fingerprint when a lease was present would accept a
+    /// foreign-query cursor under the lease.
+    #[test]
+    fn a_leased_cursor_still_rejects_a_foreign_query_fingerprint() {
+        let store = five_spans();
+        let query = RecordsQuery::new(SignalKind::Spans);
+        let first = records(&store, &query, budget_with(2, 1 << 40, 10_000), None)
+            .expect("the query answers");
+        let cursor = first.next_cursor.expect("a truncated page continues");
+        let boundary = CursorPayload::decode(&cursor)
+            .expect("the engine's own cursor")
+            .snapshot();
+        let lease = SnapshotLease::for_boundary(investigation(2), boundary);
+
+        let wrong_query = records_leased(
+            &store,
+            &RecordsQuery::new(SignalKind::LogRecords),
+            open_budget(),
+            &cursor,
+            &lease,
+        )
+        .expect_err("a foreign query must not continue the cursor, lease or no lease");
+        assert_eq!(
+            wrong_query,
+            QueryError::Cursor(CursorError::FingerprintMismatch)
+        );
+
+        let garbage = records_leased(&store, &query, open_budget(), &[9; 10], &lease)
+            .expect_err("bytes that decode to nothing are an error under a lease too");
+        assert_eq!(garbage, QueryError::Cursor(CursorError::Malformed));
     }
 }

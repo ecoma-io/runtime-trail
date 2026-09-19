@@ -66,6 +66,10 @@ binds no budget to a chain, and a page never inherits an earlier page's
 ceilings. Paging flows therefore pay per page and own their chain-level
 limits themselves — summing a paging flow's per-page budgets is the
 caller's arithmetic, never the engine's.
+**Admission consumes the budget**:
+the budget is spent exactly once, by value, into the session that enforces
+it — it cannot be duplicated, re-admitted, or defaulted, so a second
+execution is a second budget, explicitly declared.
 
 ## Scan work is driver-symmetric
 
@@ -155,6 +159,32 @@ exists so a violated storage contract is named, never silently spun on.
 Pagination never discards the order for speed; there is no
 "fast approximate page N".
 
+## Snapshot leases
+
+An investigation pins its pagination to **one snapshot** with a
+**snapshot lease**: a token naming the investigation and the fingerprint
+of the snapshot boundary its first page minted. The fingerprint is
+computed over the **canonical boundary** — the same bytes the cursor
+encodes as its snapshot half — never over the opaque cursor bytes, so the
+lease and the cursor speak identical truth. The compose flow presents the
+lease with every continuation page, and the engine rejects any page whose
+continuation's snapshot fingerprint differs from the lease's, before any
+budget work.
+
+A lease belongs to one investigation and one snapshot. It cannot be
+cloned or re-targeted: presentation is on the original token, so a lease
+from one investigation can never page another investigation's snapshot,
+and a cursor cannot be replayed under a foreign lease. Drift after
+issuance keeps its force: records admitted past the leased boundary stay
+outside the leased view — the continuation answers exactly the snapshot it
+was leased over, and the boundary is named in coverage.
+
+Like cursor bytes, a lease is not authenticated: the fingerprint is its
+only validity test, under the runtime's local-trust posture. What the
+lease adds is **separation**: two investigations paging the same store
+cannot trip over each other's continuations, because each page carries the
+lease of the investigation that minted it.
+
 ## Refuse or degrade
 
 Every budget expiry is one of exactly two honest outcomes:
@@ -222,6 +252,9 @@ degrades with a cursor, per the table.
    not promised (a driver may use an index — see scan accounting);
    cross-mode equality is the [envelope's shape](investigation-model.md),
    not page bytes.
+9. A cursor page presented under a snapshot lease continues only within
+   the leased snapshot; a lease from one investigation cannot page
+   another's.
 
 ## Status
 
@@ -234,3 +267,5 @@ remaining flows compose at the Investigation API in a later milestone of
 the phase per [the roadmap](../roadmap/phases.md); [the benchmarks
 README](../benchmarks/README.md) will hold the measurements that prove the
 ceilings honoured in practice.
+Continuations can be pinned per investigation with **snapshot leases**;
+the records flow implements the lease-checked entry.

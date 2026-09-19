@@ -28,9 +28,13 @@ pub mod budget;
 pub mod cursor;
 pub mod engine;
 pub mod filters;
+pub mod lease;
 pub mod order;
 pub mod result;
 pub mod spend;
+
+#[cfg(test)]
+mod probe;
 
 // The storage contract, re-exported as the facade (ADR 0011, decision 4):
 // this crate is the only reader of the storage contract among the core

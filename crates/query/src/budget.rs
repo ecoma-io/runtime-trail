@@ -282,6 +282,7 @@ impl BudgetSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::probe::assert_not_impl_any;
     use std::thread;
 
     use super::*;
@@ -429,5 +430,150 @@ mod tests {
         assert_eq!(granted, 0);
         assert_eq!(refusal.dimension, Dimension::Deadline);
         assert_eq!(expired.ledger().remaining_bytes(), 512);
+    }
+
+    /// The issue-26 pin at the type's heart: the budget is an authority
+    /// that cannot be duplicated, defaulted or re-admitted. Compile-time
+    /// ([`assert_not_impl_any`]) — a mutation that relaxes any of these
+    /// derives fails the build, not a later test.
+    ///
+    /// Kills the relaxation mutations: `#[derive(Clone, Copy, Default)]`
+    /// on `QueryBudget`, or `Clone`/`Copy` on `BudgetSession` (whose doc
+    /// says a copy would be a second, unaccounted spend of one budget).
+    #[test]
+    fn budget_authority_cannot_be_cloned_copied_or_defaulted() {
+        assert_not_impl_any!(QueryBudget: Clone, Copy, Default);
+        assert_not_impl_any!(BudgetSession: Clone, Copy);
+    }
+
+    /// Admission consumes the budget by value: a second session is a
+    /// second budget — the same ceilings declared again. Spending one
+    /// session never moves the other, and the budget a session lends is a
+    /// read-only handle to its ceilings (the ledger is crate-private), so
+    /// no spend path can be minted from a session.
+    ///
+    /// Kills the clone/re-admit no-op: a budget that could be admitted
+    /// twice (or a session that could be duplicated) would let one
+    /// declaration spend in two places.
+    #[test]
+    fn admission_consumes_the_budget_so_a_second_session_needs_a_second_budget() {
+        let admitted_at = Instant::now();
+
+        let mut first = budget().admit(admitted_at);
+        let mut second = budget().admit(admitted_at);
+
+        assert_eq!(
+            first.allow_results(admitted_at, 3),
+            TraversalAllowance::Exact(3)
+        );
+        assert_eq!(first.ledger().remaining_results(), 7);
+        // The second session is untouched: identical ceilings, a fresh
+        // spend of its own.
+        assert_eq!(second.ledger().remaining_results(), 10);
+        assert_eq!(
+            second.allow_results(admitted_at, 3),
+            TraversalAllowance::Exact(3)
+        );
+        assert_eq!(second.ledger().remaining_results(), 7);
+        // The budget a session lends is the same read-only handle; there
+        // is no second admission from inside a session.
+        assert_eq!(first.budget(), second.budget());
+    }
+
+    /// Every one of the five dimensions reports its own exhausted ceiling:
+    /// the ask that tips a dimension refuses with that dimension's limit
+    /// and observed spend, leaving every other dimension's ledger
+    /// untouched. Deterministic — synthetic monotonic readings, no
+    /// sleeps.
+    ///
+    /// Kills the no-op that checks only one dimension, or lets two
+    /// dimensions spend each other's ceiling.
+    #[test]
+    fn budget_exhaustion_accounts_across_all_five_dimensions() {
+        let now = Instant::now();
+        let late = now + Duration::from_millis(200);
+
+        // Results: 7 granted, the eighth tips the dimension.
+        let mut session =
+            QueryBudget::new(Duration::from_millis(100), 7, 1_000, 50, 4_096).admit(now);
+        assert_eq!(session.allow_results(now, 7), TraversalAllowance::Exact(7));
+        let TraversalAllowance::Partial { granted, refusal } = session.allow_results(now, 1) else {
+            panic!("an ask past the results ceiling must degrade");
+        };
+        assert_eq!(granted, 0);
+        assert_eq!(refusal.dimension, Dimension::Results);
+        assert_eq!(refusal.limit, Magnitude::Units(7));
+        assert_eq!(refusal.observed, Magnitude::Units(7));
+        assert_eq!(session.ledger().remaining_bytes(), 1_000);
+        assert_eq!(session.ledger().remaining_scan(), 50);
+        assert_eq!(session.ledger().remaining_aggregation_memory(), 4_096);
+
+        // Bytes: 1_000 granted, the next byte tips the dimension.
+        let mut session =
+            QueryBudget::new(Duration::from_millis(100), 7, 1_000, 50, 4_096).admit(now);
+        assert_eq!(
+            session.allow_bytes(now, 1_000),
+            TraversalAllowance::Exact(1_000)
+        );
+        let TraversalAllowance::Partial { granted, refusal } = session.allow_bytes(now, 1) else {
+            panic!("an ask past the byte ceiling must degrade");
+        };
+        assert_eq!(granted, 0);
+        assert_eq!(refusal.dimension, Dimension::Bytes);
+        assert_eq!(refusal.limit, Magnitude::Bytes(1_000));
+        assert_eq!(refusal.observed, Magnitude::Bytes(1_000));
+        assert_eq!(session.ledger().remaining_results(), 7);
+        assert_eq!(session.ledger().remaining_scan(), 50);
+        assert_eq!(session.ledger().remaining_aggregation_memory(), 4_096);
+
+        // Scan: 50 granted, the strict charge for one more tips it.
+        let mut session =
+            QueryBudget::new(Duration::from_millis(100), 7, 1_000, 50, 4_096).admit(now);
+        assert_eq!(session.allow_scan(now, 50), TraversalAllowance::Exact(50));
+        let Err(refusal) = session.charge_scan_strict(now, 1) else {
+            panic!("a strict charge past the scan ceiling must refuse");
+        };
+        assert_eq!(refusal.dimension, Dimension::Scan);
+        assert_eq!(refusal.limit, Magnitude::Units(50));
+        assert_eq!(refusal.observed, Magnitude::Units(50));
+        assert_eq!(session.ledger().remaining_results(), 7);
+        assert_eq!(session.ledger().remaining_bytes(), 1_000);
+        assert_eq!(session.ledger().remaining_aggregation_memory(), 4_096);
+
+        // Aggregation memory: 4_096 granted, one more byte tips it.
+        let mut session =
+            QueryBudget::new(Duration::from_millis(100), 7, 1_000, 50, 4_096).admit(now);
+        assert_eq!(session.charge_aggregation_memory(now, 4_096), Ok(()));
+        let Err(refusal) = session.charge_aggregation_memory(now, 1) else {
+            panic!("a charge past the memory ceiling must refuse");
+        };
+        assert_eq!(refusal.dimension, Dimension::AggregationMemory);
+        assert_eq!(refusal.limit, Magnitude::Bytes(4_096));
+        assert_eq!(refusal.observed, Magnitude::Bytes(4_096));
+        assert_eq!(session.ledger().remaining_results(), 7);
+        assert_eq!(session.ledger().remaining_bytes(), 1_000);
+        assert_eq!(session.ledger().remaining_scan(), 50);
+
+        // Deadline: 100 ms admitted, work at 200 ms refuses with the
+        // elapsed time while the ceilings sit untouched.
+        let mut session =
+            QueryBudget::new(Duration::from_millis(100), 7, 1_000, 50, 4_096).admit(now);
+        let TraversalAllowance::Partial { granted, refusal } = session.allow_scan(late, 1) else {
+            panic!("work past the deadline must degrade to nothing");
+        };
+        assert_eq!(granted, 0);
+        assert_eq!(refusal.dimension, Dimension::Deadline);
+        assert_eq!(
+            refusal.limit,
+            Magnitude::Duration(Duration::from_millis(100))
+        );
+        assert_eq!(
+            refusal.observed,
+            Magnitude::Duration(Duration::from_millis(200))
+        );
+        assert_eq!(session.ledger().remaining_results(), 7);
+        assert_eq!(session.ledger().remaining_bytes(), 1_000);
+        assert_eq!(session.ledger().remaining_scan(), 50);
+        assert_eq!(session.ledger().remaining_aggregation_memory(), 4_096);
     }
 }
