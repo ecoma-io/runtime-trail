@@ -978,7 +978,9 @@ fn bounded_generation_bounds() -> CorrelationBounds {
 fn span_id_of_entity(entity: EntityId) -> SpanId {
     match entity {
         EntityId::Span { span_id, .. } => span_id,
-        other => unreachable!("parent/child endpoints are spans, got {other:?}"),
+        EntityId::Assigned(other) => {
+            unreachable!("parent/child endpoints are spans, got {other:?}")
+        }
     }
 }
 
@@ -1596,12 +1598,10 @@ fn the_committed_strategy_set_is_machine_readable_and_fully_covered() {
     // otherwise) and must produce relations of its type in the fixture.
     let expectation = |strategy: &Strategy| -> usize {
         match strategy {
-            Strategy::SpanIdentity => 1,       // the exact log
-            Strategy::TraceIdentity => 3,      // the trace-only log × three spans
-            Strategy::ParentChild => 2,        // child → root, grandchild → child
-            Strategy::ResourceContext => 6,    // the four shared-resource records, every pair
-            Strategy::ExemplarAttachment => 1, // the point whose exemplar names span 2
-            Strategy::TemporalCoActivity => 6, // three spans × two in-window points
+            Strategy::SpanIdentity | Strategy::ExemplarAttachment => 1, // the exact log / the point whose exemplar names span 2
+            Strategy::TraceIdentity => 3, // the trace-only log × three spans
+            Strategy::ParentChild => 2,   // child → root, grandchild → child
+            Strategy::ResourceContext | Strategy::TemporalCoActivity => 6, // every shared-resource pair / three spans × two in-window points
         }
     };
     let mut by_type: HashMap<RelationType, usize> = HashMap::new();
