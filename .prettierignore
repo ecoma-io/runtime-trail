@@ -5,6 +5,11 @@ pnpm-lock.yaml
 **/coverage/
 node_modules/
 
+# Machine-written by release-please on every version bump: prettier's
+# prose rules would reformat the whole changelog on every release and
+# turn the release PR red for reasons release-please cannot absorb.
+CHANGELOG.md
+
 # Vendored, byte-identity-enforced: scripts/skills-manifest.json pins the
 # hashes of the arch-* skills against the archkeep release they were synced
 # from, so one prettier pass is indistinguishable from a hand-edit — both
