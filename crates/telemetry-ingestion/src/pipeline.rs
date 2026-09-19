@@ -49,26 +49,31 @@
 //!
 //! # Saturation is per export, and honest
 //!
-//! When the hand-off queue saturates mid-export, the call fails with
-//! [`AdmissionSignal::QueueSaturated`] — the one retryable signal — and
-//! every record admitted **before** saturation was already offered: its
-//! queue entry is resident, and the consumer will receive it whatever the
-//! producer does next. A retry re-delivers the whole export; spans and
-//! metric points collapse onto their standing records and so queue
-//! nothing (the entries already in flight are the delivery), while log
-//! records — no natural identity — are admitted and queued again.
+//! The hand-off queue is bounded in accounted bytes; its saturation is the
+//! one retryable admission signal ([`AdmissionSignal::QueueSaturated`]).
+//! Saturation is decided **per export, atomically** (#34): the whole
+//! export's records are translated and ledgered first, then their
+//! offer-set — the freshly admitted records only; a collapse is the record
+//! already admitted and a conflict left nothing to store, so neither ever
+//! queues — is measured against the queue's remaining headroom. If the
+//! offer-set does not fit, the call fails with
+//! [`AdmissionSignal::QueueSaturated`] and **nothing of the export is
+//! offered**: not a prefix of it, and the queue is untouched. A retryable
+//! rejection admits nothing, so the emitter retry a 429 invites delivers
+//! each record exactly once — a log record, with no natural identity to
+//! collapse onto, is admitted once, not once per attempt.
 //!
-//! The one record whose own offer the queue refused is **ended by this
-//! pipeline before the signal returns**: the ledger entry admission just
-//! created is forgotten — and the interned stream identity released when
-//! this very admission created it — by the same lifecycle ADR 0008 gives
-//! every other way a record fails to stay resident. No entry stands
-//! behind a delivery that never happened, so the retry the signal invites
-//! can actually deliver: the re-delivery of that record is admitted
-//! fresh, not collapsed onto a stranded identity. What the undo never
-//! touches is what an **earlier** delivery created — a collapse this
-//! export made queues nothing and must leave the standing record and its
-//! identity exactly as they are.
+//! A rejected export is also **ended by this pipeline before the signal
+//! returns**: everything the export's own admission created is undone —
+//! the ledger entries of its freshly admitted records are forgotten, and
+//! any stream this admission interned is released — by the same lifecycle
+//! ADR 0008 gives every other way a record fails to stay resident. No
+//! entry stands behind a delivery that never happened, so the retry the
+//! signal invites can actually deliver: the re-delivery is admitted fresh,
+//! not collapsed onto a stranded identity. What the undo never touches is
+//! what an **earlier** delivery created — a collapse this export made
+//! queues nothing and must leave the standing record and its identity
+//! exactly as they are.
 
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
@@ -77,8 +82,8 @@ use std::sync::{
 
 use prost::Message;
 use runtime_trail_telemetry_model::{
-    ATTRIBUTE_MAP_NODE_BYTES, AdmissionAnomalies, AdmissionLedger, AdmissionOutcome, AdmissionTime,
-    BudgetLimits, EntityId, Float, LogRecord, MetricPoint, QuantileValue, Resource,
+    ATTRIBUTE_MAP_NODE_BYTES, Accounted, AdmissionAnomalies, AdmissionLedger, AdmissionOutcome,
+    AdmissionTime, BudgetLimits, EntityId, Float, LogRecord, MetricPoint, QuantileValue, Resource,
     STRUCTURE_FIXED_BYTES, Span, StreamIdentity, budgets::OTLP_PAYLOAD_BYTES,
     budgets::check_export_point_count, budgets::check_export_record_count, slot_bytes,
 };
@@ -179,6 +184,25 @@ pub struct Pipeline {
     ledger: Arc<Mutex<AdmissionLedger>>,
     sink: Arc<dyn RecordSink>,
     draining: AtomicBool,
+}
+
+/// One record this export freshly admitted, awaiting its hand-off: the
+/// queue entry itself, and the ADR 0008 endings a whole-export refusal
+/// must perform before its signal returns.
+///
+/// Only **freshly admitted** records reach the hand-off — a collapse is
+/// the record already admitted (queuing its copy again would store the
+/// same record twice), and a conflict left nothing to store. A log
+/// record and an assigned-id span keep no ledger entry, so their `forget`
+/// is a no-op; a stream is released only when *this* admission created
+/// its intern — the single-record undo's boundary (ADR 0008), generalized
+/// to the whole export.
+struct PendingOffer {
+    queued: QueuedRecord,
+    /// The stream this admission interned, when it created the intern —
+    /// released on a whole-export refusal, never what an earlier delivery
+    /// still stands on.
+    fresh_intern_stream: Option<Arc<StreamIdentity>>,
 }
 
 impl Pipeline {
@@ -372,7 +396,10 @@ impl Pipeline {
     /// [`AdmissionSignal::ExportOverCap`] when the export carries more
     /// records than the per-export budget allows, and
     /// [`AdmissionSignal::QueueSaturated`] — the one retryable signal —
-    /// when the hand-off queue saturates mid-export.
+    /// when the whole export's offer-set does not fit the hand-off queue's
+    /// headroom. Saturation is export-atomic (#34): nothing of a rejected
+    /// export is admitted — see "Saturation is per export, and honest" in
+    /// the module docs.
     pub fn ingest_spans(
         &self,
         now: AdmissionTime,
@@ -393,6 +420,7 @@ impl Pipeline {
 
         let mut ledger = self.lock_ledger();
         let mut outcome = ExportOutcome::default();
+        let mut pending: Vec<PendingOffer> = Vec::new();
         for resource_spans in request.resource_spans {
             let resource = decode::resource(
                 resource_spans.resource.unwrap_or_default(),
@@ -408,19 +436,21 @@ impl Pipeline {
                 );
                 for proto in scope_spans.spans {
                     let recorded = match &envelope {
-                        Ok(envelope) => self.admit_span(
+                        Ok(envelope) => Self::admit_span(
                             &mut ledger,
                             now,
                             decode::span(proto, envelope, &self.limits),
+                            &mut pending,
                         ),
-                        Err(reason) => Ok(RecordOutcome::Rejected {
+                        Err(reason) => RecordOutcome::Rejected {
                             reason: reason.clone(),
-                        }),
+                        },
                     };
-                    outcome.records.push(recorded?);
+                    outcome.records.push(recorded);
                 }
             }
         }
+        self.offer_export(&mut ledger, pending)?;
         Ok(outcome)
     }
 
@@ -453,6 +483,7 @@ impl Pipeline {
 
         let mut ledger = self.lock_ledger();
         let mut outcome = ExportOutcome::default();
+        let mut pending: Vec<PendingOffer> = Vec::new();
         for resource_logs in request.resource_logs {
             let resource = decode::resource(
                 resource_logs.resource.unwrap_or_default(),
@@ -468,19 +499,21 @@ impl Pipeline {
                 );
                 for proto in scope_logs.log_records {
                     let recorded = match &envelope {
-                        Ok(envelope) => self.admit_log(
+                        Ok(envelope) => Self::admit_log(
                             &mut ledger,
                             now,
                             decode::log_record(proto, envelope, &self.limits),
+                            &mut pending,
                         ),
-                        Err(reason) => Ok(RecordOutcome::Rejected {
+                        Err(reason) => RecordOutcome::Rejected {
                             reason: reason.clone(),
-                        }),
+                        },
                     };
-                    outcome.records.push(recorded?);
+                    outcome.records.push(recorded);
                 }
             }
         }
+        self.offer_export(&mut ledger, pending)?;
         Ok(outcome)
     }
 
@@ -517,6 +550,7 @@ impl Pipeline {
 
         let mut ledger = self.lock_ledger();
         let mut outcome = ExportOutcome::default();
+        let mut pending: Vec<PendingOffer> = Vec::new();
         for resource_metrics in request.resource_metrics {
             let resource = decode::resource(
                 resource_metrics.resource.unwrap_or_default(),
@@ -546,16 +580,19 @@ impl Pipeline {
                         // its own reason inside `admit_point`, keeping its
                         // position.
                         let recorded = match &identity {
-                            Ok(identity) => self.admit_point(&mut ledger, now, identity, point),
-                            Err(reason) => Ok(RecordOutcome::Rejected {
+                            Ok(identity) => {
+                                Self::admit_point(&mut ledger, now, identity, point, &mut pending)
+                            }
+                            Err(reason) => RecordOutcome::Rejected {
                                 reason: reason.clone(),
-                            }),
+                            },
                         };
-                        outcome.records.push(recorded?);
+                        outcome.records.push(recorded);
                     }
                 }
             }
         }
+        self.offer_export(&mut ledger, pending)?;
         Ok(outcome)
     }
 
@@ -596,15 +633,18 @@ impl Pipeline {
         })
     }
 
+    /// The ledger arm of one span's admission. The hand-off is deferred:
+    /// a freshly admitted span is a candidate of the export's offer-set,
+    /// which the atomic hand-off queues as a whole or not at all (#34).
     fn admit_span(
-        &self,
         ledger: &mut AdmissionLedger,
         now: AdmissionTime,
         translated: Result<Span, RecordRejection>,
-    ) -> Result<RecordOutcome, AdmissionSignal> {
+        pending: &mut Vec<PendingOffer>,
+    ) -> RecordOutcome {
         let span = match translated {
             Ok(span) => span,
-            Err(reason) => return Ok(RecordOutcome::Rejected { reason }),
+            Err(reason) => return RecordOutcome::Rejected { reason },
         };
         let admission = ledger.admit_span(span);
         match admission.outcome {
@@ -612,93 +652,92 @@ impl Pipeline {
                 let record = admission
                     .record
                     .expect("an admitted span carries its ledger record");
-                let offer = self.sink.offer(QueuedRecord {
-                    entity,
-                    admitted_at: now,
-                    record: StoredRecord::Span(record),
+                // A span with assigned ids keeps no ledger entry, so the
+                // refusal's `forget` is a no-op there; the atomic undo
+                // applies it uniformly.
+                pending.push(PendingOffer {
+                    queued: QueuedRecord {
+                        entity,
+                        admitted_at: now,
+                        record: StoredRecord::Span(record),
+                    },
+                    fresh_intern_stream: None,
                 });
-                match offer {
-                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
-                    Err(signal) => {
-                        // The queue refused the record this very admission
-                        // admitted: its ledger entry must not outlive the
-                        // delivery it names. The signal is the one retryable
-                        // answer, and its promised retry can only deliver if
-                        // the re-delivery is admitted fresh — the same
-                        // lifecycle ADR 0008 gives a refused keep, applied
-                        // by the pipeline itself. (A span with assigned ids
-                        // keeps no entry, so `forget` is a no-op there.)
-                        ledger.forget(entity);
-                        Err(signal)
-                    }
-                }
+                RecordOutcome::Admitted { entity }
             }
             AdmissionOutcome::Collapsed { entity } => {
                 // The law the queue states and this pipeline keeps: a
                 // collapse is the record already admitted, never a new
-                // delivery. Its original queue entry — resident, or
-                // already consumed — is the whole story; offering it again
-                // would store a second copy of one natural identity and
-                // stamp this retry's admission time onto a record admitted
-                // earlier.
-                Ok(RecordOutcome::Collapsed { entity })
+                // delivery. It queues nothing this export — the offer-set
+                // is the freshly admitted records only — leaving the
+                // standing record's own queue entry, resident or already
+                // consumed, the whole story.
+                RecordOutcome::Collapsed { entity }
             }
-            AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
-            AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
+            AdmissionOutcome::Conflict { entity } => RecordOutcome::Conflict { entity },
+            AdmissionOutcome::Rejected { rejection } => RecordOutcome::Rejected {
                 reason: RecordRejection::Budget(rejection),
-            }),
-            AdmissionOutcome::Invalid { error } => Ok(RecordOutcome::Rejected {
+            },
+            AdmissionOutcome::Invalid { error } => RecordOutcome::Rejected {
                 reason: RecordRejection::Shape(error),
-            }),
+            },
         }
     }
 
+    /// The ledger arm of one log record's admission. Same deferral as
+    /// [`Pipeline::admit_span`].
     fn admit_log(
-        &self,
         ledger: &mut AdmissionLedger,
         now: AdmissionTime,
         translated: Result<LogRecord, RecordRejection>,
-    ) -> Result<RecordOutcome, AdmissionSignal> {
+        pending: &mut Vec<PendingOffer>,
+    ) -> RecordOutcome {
         let record = match translated {
             Ok(record) => record,
-            Err(reason) => return Ok(RecordOutcome::Rejected { reason }),
+            Err(reason) => return RecordOutcome::Rejected { reason },
         };
         let admission = ledger.admit_log_record(&record);
         match admission {
             AdmissionOutcome::Admitted { entity } => {
                 // A log record keeps no ledger entry — OTLP defines no
-                // log-record identity — so a refused offer has nothing to
-                // strand: the retry re-admits and re-queues it fresh by
-                // nature, no undo needed.
-                self.sink
-                    .offer(QueuedRecord {
+                // log-record identity — so a whole-export refusal has
+                // nothing of it to strand: its `forget` is a no-op, and
+                // the retry re-admits and re-queues it fresh by nature.
+                pending.push(PendingOffer {
+                    queued: QueuedRecord {
                         entity,
                         admitted_at: now,
                         record: StoredRecord::Log(Arc::new(record)),
-                    })
-                    .map(|()| RecordOutcome::Admitted { entity })
+                    },
+                    fresh_intern_stream: None,
+                });
+                RecordOutcome::Admitted { entity }
             }
-            AdmissionOutcome::Collapsed { entity } => Ok(RecordOutcome::Collapsed { entity }),
-            AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
-            AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
+            AdmissionOutcome::Collapsed { entity } => RecordOutcome::Collapsed { entity },
+            AdmissionOutcome::Conflict { entity } => RecordOutcome::Conflict { entity },
+            AdmissionOutcome::Rejected { rejection } => RecordOutcome::Rejected {
                 reason: RecordRejection::Budget(rejection),
-            }),
-            AdmissionOutcome::Invalid { error } => Ok(RecordOutcome::Rejected {
+            },
+            AdmissionOutcome::Invalid { error } => RecordOutcome::Rejected {
                 reason: RecordRejection::Shape(error),
-            }),
+            },
         }
     }
 
+    /// The ledger arm of one metric point's admission. Same deferral as
+    /// [`Pipeline::admit_span`]; a point also names the stream its offer
+    /// carries, and whether *this* admission created the intern — the
+    /// refusal boundary ADR 0008 draws.
     fn admit_point(
-        &self,
         ledger: &mut AdmissionLedger,
         now: AdmissionTime,
         identity: &StreamIdentity,
         translated: Result<MetricPoint, RecordRejection>,
-    ) -> Result<RecordOutcome, AdmissionSignal> {
+        pending: &mut Vec<PendingOffer>,
+    ) -> RecordOutcome {
         let point = match translated {
             Ok(point) => point,
-            Err(reason) => return Ok(RecordOutcome::Rejected { reason }),
+            Err(reason) => return RecordOutcome::Rejected { reason },
         };
         let admission = ledger.admit_metric_point(identity, point);
         match admission.outcome {
@@ -709,46 +748,87 @@ impl Pipeline {
                 let stream = admission
                     .stream
                     .expect("an admitted point carries its interned stream identity");
-                let offer = self.sink.offer(QueuedRecord {
-                    entity,
-                    admitted_at: now,
-                    record: StoredRecord::Point {
-                        stream: Arc::clone(&stream),
-                        point,
+                // The intern is undone only when *this* admission created
+                // it — an intern made for an earlier standing point of the
+                // same stream is that point's residency story, not this
+                // export's refusal.
+                let fresh_intern_stream = if admission.fresh_intern {
+                    Some(Arc::clone(&stream))
+                } else {
+                    None
+                };
+                pending.push(PendingOffer {
+                    queued: QueuedRecord {
+                        entity,
+                        admitted_at: now,
+                        record: StoredRecord::Point {
+                            stream: Arc::clone(&stream),
+                            point,
+                        },
                     },
+                    fresh_intern_stream,
                 });
-                match offer {
-                    Ok(()) => Ok(RecordOutcome::Admitted { entity }),
-                    Err(signal) => {
-                        // As with spans: the refused delivery's identity
-                        // ends here, by the pipeline that just created it.
-                        // The intern is undone only when *this* admission
-                        // created it — an intern made for an earlier
-                        // standing point of the same stream is that
-                        // point's residency story, not this refusal's.
-                        ledger.forget(entity);
-                        if admission.fresh_intern {
-                            ledger.release_stream(&stream);
-                        }
-                        Err(signal)
-                    }
-                }
+                RecordOutcome::Admitted { entity }
             }
             AdmissionOutcome::Collapsed { entity } => {
-                // As with spans: a collapse is the point already admitted.
-                // Its original queue entry is the whole story — offering
-                // it again would store a second copy of one point and
-                // stamp the retry's admission time onto it.
-                Ok(RecordOutcome::Collapsed { entity })
+                // As with spans: a collapse is the point already admitted
+                // and queues nothing this export.
+                RecordOutcome::Collapsed { entity }
             }
-            AdmissionOutcome::Conflict { entity } => Ok(RecordOutcome::Conflict { entity }),
-            AdmissionOutcome::Rejected { rejection } => Ok(RecordOutcome::Rejected {
+            AdmissionOutcome::Conflict { entity } => RecordOutcome::Conflict { entity },
+            AdmissionOutcome::Rejected { rejection } => RecordOutcome::Rejected {
                 reason: RecordRejection::Budget(rejection),
-            }),
-            AdmissionOutcome::Invalid { error } => Ok(RecordOutcome::Rejected {
+            },
+            AdmissionOutcome::Invalid { error } => RecordOutcome::Rejected {
                 reason: RecordRejection::Shape(error),
-            }),
+            },
         }
+    }
+
+    /// The export-atomic hand-off (#34): the whole export's offer-set
+    /// either fits the sink's remaining headroom or nothing of it is
+    /// offered.
+    ///
+    /// The fit is judged against the sink's *current* occupancy, not its
+    /// ceiling: a partially-filled queue leaves less headroom, which is
+    /// exactly what a mid-export saturation is — and a retryable
+    /// rejection must coincide with zero offers from the rejected export,
+    /// not with a prefix already resident.
+    ///
+    /// On a refusal, everything this export's admission created is undone
+    /// before the signal returns — the same ADR 0008 endings the
+    /// single-record undo performed, generalized to the whole offer-set —
+    /// so the queue and the ledger are exactly as if the export had never
+    /// arrived, and the retry the signal invites is admitted fresh.
+    fn offer_export(
+        &self,
+        ledger: &mut AdmissionLedger,
+        pending: Vec<PendingOffer>,
+    ) -> Result<(), AdmissionSignal> {
+        let offer_bytes: usize = pending
+            .iter()
+            .map(|offer| offer.queued.record.accounted_size())
+            .sum();
+        if offer_bytes.saturating_add(self.sink.accounted_bytes()) > self.sink.ceiling_bytes() {
+            for offer in &pending {
+                ledger.forget(offer.queued.entity);
+                if let Some(stream) = &offer.fresh_intern_stream {
+                    ledger.release_stream(stream);
+                }
+            }
+            return Err(AdmissionSignal::QueueSaturated {
+                queue: self.sink.name(),
+                ceiling_bytes: self.sink.ceiling_bytes(),
+                attempted_bytes: offer_bytes,
+            });
+        }
+        for offer in pending {
+            self.sink.offer(offer.queued).expect(
+                "the offer-set was measured against the sink's headroom \
+                 before offering: a compliant sink cannot refuse it",
+            );
+        }
+        Ok(())
     }
 
     fn lock_ledger(&self) -> std::sync::MutexGuard<'_, AdmissionLedger> {

@@ -127,6 +127,24 @@ impl Accounted for StoredRecord {
 /// this crate, and the dependency law (`layer-ingest → model, storage`)
 /// is honoured by construction.
 pub trait RecordSink: Send + Sync + 'static {
+    /// The recognized name of the sink's queue — the name
+    /// [`AdmissionSignal::QueueSaturated`](crate::signal::AdmissionSignal::QueueSaturated)
+    /// carries when the pipeline refuses an export itself
+    /// (`"ingestion"` for the bounded hand-off queue).
+    fn name(&self) -> &'static str;
+
+    /// The accounted bytes the sink currently holds — the occupancy the
+    /// ceiling bounds.
+    ///
+    /// With [`RecordSink::ceiling_bytes`] it gives the pipeline the
+    /// headroom an export-atomic hand-off needs: the whole export's
+    /// offer-set is measured against it **before** any of it is offered,
+    /// so a retryable rejection coincides with zero offers from the
+    /// rejected export (#34). A sink that buffers without a ceiling
+    /// reports 0 — with a [`usize::MAX`] ceiling there is always
+    /// headroom.
+    fn accounted_bytes(&self) -> usize;
+
     /// The accounted-byte ceiling this sink enforces on what it holds.
     ///
     /// [`Pipeline::with_config`](crate::pipeline::Pipeline::with_config)
@@ -326,6 +344,14 @@ impl BoundedQueue {
 }
 
 impl RecordSink for BoundedQueue {
+    fn name(&self) -> &'static str {
+        BoundedQueue::name(self)
+    }
+
+    fn accounted_bytes(&self) -> usize {
+        BoundedQueue::accounted_bytes(self)
+    }
+
     fn ceiling_bytes(&self) -> usize {
         self.ceiling_bytes
     }

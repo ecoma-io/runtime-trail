@@ -1568,7 +1568,7 @@ fn the_default_configuration_constructs() {
 }
 
 #[test]
-fn saturation_mid_export_keeps_records_already_admitted() {
+fn saturation_mid_export_rejects_the_whole_export_atomically() {
     // Shrunken budgets shrink the legal-record bound, so a queue at the
     // bound — one the construction gate accepts — can still overflow on a
     // multi-record export. How many of these spans fit is *derived* from
@@ -1599,15 +1599,17 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     );
     // The saturating export carries exactly one span too many.
     let offered = fits + 1;
-
     // A bound-sized queue: every single legal record fits, `fits` of these
-    // spans fit, `offered` does not.
+    // spans fit, `offered` does not. Every span shares the measured
+    // record's exact name and shape — only the id differs, and ids are a
+    // fixed width — so `measured` is their exact accounted size and the
+    // offer-set is `offered * measured`, not a guess.
     let (queue, pipeline) = pipeline_over(bound, limits);
     let spans: Vec<_> = (1..=offered)
         .map(|index| {
             let mut span_id = [0u8; 8];
             span_id[0] = u8::try_from(index).expect("a few spans");
-            sized_span(&format!("span-{index}"), span_id)
+            sized_span("sized", span_id)
         })
         .collect();
     let payload = encode(&traces_request(vec![resource_spans(
@@ -1615,6 +1617,26 @@ fn saturation_mid_export_keeps_records_already_admitted() {
         vec![scope_spans(Some(scope("test")), spans)],
     )]));
 
+    // #34 — the queue cannot take the export's whole offer-set: a
+    // retryable signal, and a whole-export refusal. Nothing of the export
+    // was handed off, and the admission it created was undone — the queue
+    // must be untouched by a rejection the retry is invited on.
+    let signal = pipeline
+        .ingest_spans(now(), &payload)
+        .expect_err("one span too many for a queue at the bound");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::QueueSaturated {
+            ceiling_bytes,
+            attempted_bytes,
+            ..
+        } if *ceiling_bytes == bound && *attempted_bytes == offered * measured
+    ));
+
+    // #34 — the queue cannot take the export's whole offer-set: a
+    // retryable signal, and a whole-export refusal. Nothing of the export
+    // was handed off, and the admission it created was undone — the queue
+    // must be untouched by a rejection the retry is invited on.
     let signal = pipeline
         .ingest_spans(now(), &payload)
         .expect_err("one span too many for a queue at the bound");
@@ -1625,62 +1647,59 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     assert!(signal.is_retryable(), "overflow rejects the producer");
     assert_eq!(
         queue.len(),
-        fits,
-        "the records offered before saturation stay handed off"
+        0,
+        "a retryable export rejection admits nothing: the whole export \
+         is refused, not a prefix of it"
     );
 
     // The producer retries the whole export while the queue is still
-    // saturated. The re-deliveries of the first `fits` spans collapse onto
-    // their standing records and queue nothing — but the refused span's
-    // identity was ENDED by the refusal, so its re-delivery admits fresh,
-    // offers, and is refused again: the same retryable signal, honestly,
-    // for exactly as long as the queue cannot take the record. (A collapse
-    // of the refused span here would have meant its entry stood behind a
-    // delivery that never happened.)
+    // saturated (empty — the first refusal admitted nothing). The span
+    // identities the refusal ended re-admit fresh, the offer-set again
+    // does not fit, and the same whole-export signal returns: honestly,
+    // for exactly as long as the queue cannot take the export.
     let signal = pipeline
         .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
-        .expect_err("the once-refused span re-admits fresh and saturates again");
+        .expect_err("the re-admitted spans saturate the same empty queue");
     assert!(matches!(
         &signal,
         AdmissionSignal::QueueSaturated { ceiling_bytes, .. } if *ceiling_bytes == bound
     ));
-    assert_eq!(queue.len(), fits, "the retry queued nothing new");
-    let drained = drain_queue(&queue);
-    assert_eq!(drained.len(), fits);
-    for record in &drained {
-        assert_eq!(
-            record.admitted_at,
-            now(),
-            "the standing entries keep their own admission times"
-        );
-    }
+    assert_eq!(queue.len(), 0, "a saturated retry still admits nothing");
 
-    // The consumer has drained everything. The re-deliveries of the first
-    // `fits` spans collapse onto their standing records — draining a queue
-    // entry is the consumer's half of the delivery, not the end of
-    // identity — while the refused span is admitted FRESH and queued: the
+    // Capacity arrives — the deterministic stand-in for a consumer that
+    // drained (a fresh pipeline whose ceiling holds the whole export).
+    // The identical retry admits every record exactly once: every span
+    // fresh (nothing stands behind the refusals), every copy queued — the
     // retry the signal invited actually delivers.
-    let outcome = pipeline
-        .ingest_spans(AdmissionTime::from_unix_nano(99), &payload)
-        .expect("the retry delivers what the refusal ended");
-    assert!(
-        outcome.records[..fits]
-            .iter()
-            .all(|record| matches!(record, RecordOutcome::Collapsed { .. })),
-        "the delivered spans still collapse onto their standing records: {outcome:?}"
-    );
-    assert!(
-        matches!(&outcome.records[fits], RecordOutcome::Admitted { .. }),
-        "the refused span is admitted fresh, not collapsed onto a \
-         stranded entry: {outcome:?}"
-    );
-    let delivered = drain_queue(&queue);
+    let (big_queue, big_pipeline) = pipeline_over(offered * measured, limits);
+    let outcome = big_pipeline
+        .ingest_spans(AdmissionTime::from_unix_nano(100), &payload)
+        .expect("with room for the whole export, the retry delivers");
+    let entities: Vec<_> = outcome
+        .records
+        .iter()
+        .map(|record| match record {
+            RecordOutcome::Admitted { entity } => entity,
+            other => panic!(
+                "nothing of the refused exports stands, so the retry admits \
+                 every span fresh: {other:?}"
+            ),
+        })
+        .collect();
+    let delivered = drain_queue(&big_queue);
     assert_eq!(
         delivered.len(),
-        1,
-        "exactly the once-refused span queues now"
+        offered,
+        "exactly one copy of every span reaches the store"
     );
-    assert_eq!(delivered[0].entity, standing_entity(&outcome, fits));
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|record| &record.entity)
+            .collect::<Vec<_>>(),
+        entities,
+        "the queued spans are exactly the fresh admissions, in order"
+    );
 }
 
 /// #34 — a retryable export rejection is export-atomic: the whole export

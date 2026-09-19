@@ -39,29 +39,34 @@ use runtime_trail_telemetry_model::{
 /// is the problem, and retrying cannot shrink it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionSignal {
-    /// A bounded hand-off queue is at its accounted-byte ceiling. The one
-    /// transient condition in admission, and therefore the one retryable
-    /// signal: space may free, so a retry can succeed. Overflow rejects the
-    /// producer — every record admitted *before* saturation was already
-    /// handed off, and its queue entry stays in flight whatever the
-    /// producer does next. A retry's re-deliveries of those records
-    /// collapse (spans, metric points) or re-admit (log records, which
-    /// have no natural identity) — a collapse never queues, so the retry
-    /// adds no second copy of what is already in flight.
+    /// A bounded hand-off queue cannot take a whole export's offer-set.
+    /// The one transient condition in admission, and therefore the one
+    /// retryable signal: space may free, so a retry can succeed.
     ///
-    /// The record whose own offer was refused is ended by the pipeline
-    /// before this signal returns: the ledger entry admission just created
-    /// is forgotten (and its freshly interned stream released), by the
-    /// same lifecycle ADR 0008 gives every other way a record fails to
-    /// stay resident. No entry stands behind a delivery that never
-    /// happened — so the retry this signal invites can deliver, and no
+    /// Saturation is **export-atomic** (#34): the pipeline measures the
+    /// export's freshly admitted records — its offer-set; a collapse is
+    /// the record already admitted and a conflict left nothing to store,
+    /// so neither ever queues — against the queue's headroom **before**
+    /// offering any of them, so this signal coincides with zero offers
+    /// from the rejected export: the queue is untouched by it, and the
+    /// retry the signal invites delivers each record exactly once (a log
+    /// record has no natural identity to collapse onto, so a partial
+    /// admission would have duplicated every one of them).
+    ///
+    /// Everything the rejected export's own admission created is ended by
+    /// the pipeline before this signal returns: the ledger entries of its
+    /// freshly admitted records are forgotten, and streams this admission
+    /// interned are released — by the same lifecycle ADR 0008 gives every
+    /// other way a record fails to stay resident. No entry stands behind
+    /// a delivery that never happened — so the retry can deliver, and no
     /// collapse onto a stranded identity silently swallows the record.
     QueueSaturated {
         /// The queue that refused, named for logs and metrics.
         queue: &'static str,
         /// The queue's accounted-byte ceiling.
         ceiling_bytes: usize,
-        /// The accounted size of the record that did not fit.
+        /// The accounted size of the rejected export's offer-set — the
+        /// whole export, not one record: the refusal is all-or-nothing.
         attempted_bytes: usize,
     },
     /// The export payload exceeded the OTLP payload ceiling, refused before
