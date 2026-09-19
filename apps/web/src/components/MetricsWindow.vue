@@ -54,12 +54,10 @@ function pointValue(value: PointView["point"]["value"]): string {
         </TableRow>
       </template>
     </Table>
-    <div
-      v-if="metricWindow !== undefined"
-      class="mt-2 rounded bg-muted/50 p-2 text-xs text-muted-foreground"
-    >
+    <div class="mt-2 rounded bg-muted/50 p-2 text-xs text-muted-foreground">
       <template
         v-if="
+          metricWindow !== undefined &&
           metricWindow.asked !== undefined &&
           metricWindow.resident !== undefined
         "
@@ -69,6 +67,10 @@ function pointValue(value: PointView["point"]["value"]): string {
         points span {{ metricWindow.resident.from }}–{{
           metricWindow.resident.to
         }}
+      </template>
+      <template v-else>
+        Metric window: un-bounded — the runtime did not state a window for these
+        points.
       </template>
     </div>
   </template>
