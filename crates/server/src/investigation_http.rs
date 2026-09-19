@@ -1348,7 +1348,7 @@ mod tests {
     /// Issue #54: an in-flight investigation must never stall ingestion
     /// or drain. The handler reads the store through a per-call-locking
     /// view ([`crate::runtime::LockedStore`]) and runs the flow on the
-    /// blocking pool (spawn_blocking), so the pump's keeps and the
+    /// blocking pool (`spawn_blocking`), so the pump's keeps and the
     /// retention tick interleave between the flow's store calls — even
     /// when the flow lasts seconds. Pre-fix the handler held the store
     /// guard across the whole flow: the pump's keep stood blocked for
