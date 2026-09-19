@@ -43,4 +43,34 @@ describe("RelatedLogs", () => {
     // Absent renders as empty text, distinguishable from "[]" and "{}".
     expect(text).not.toContain("null");
   });
+
+  it("emits select-log when the active row is activated with Enter", async () => {
+    const wrapper = mount(RelatedLogs, {
+      props: {
+        logs: [logView("first", 1), logView("second", 2)],
+        selectedLogSpanId: null,
+      },
+    });
+
+    // Enter on the row (the roving tab stop) activates the first row, whose
+    // detached log carries no span — select-log(null), the "—" case.
+    await wrapper
+      .get('[data-virtual-index="0"]')
+      .trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("select-log")).toEqual([[null]]);
+  });
+  it("emits select-log with the span id when a row is clicked", async () => {
+    const withSpan = logView("attached", 2);
+    withSpan.log.span_id = "bbbbbbbbbbbbbbbb";
+    const wrapper = mount(RelatedLogs, {
+      props: {
+        logs: [logView("first", 1), withSpan],
+        selectedLogSpanId: "bbbbbbbbbbbbbbbb",
+      },
+    });
+
+    // Timestamp order: "1" then "2" — the second row is the attached log.
+    await wrapper.findAll("button")[1]!.trigger("click");
+    expect(wrapper.emitted("select-log")).toEqual([["bbbbbbbbbbbbbbbb"]]);
+  });
 });

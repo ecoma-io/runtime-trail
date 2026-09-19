@@ -226,6 +226,64 @@ jobs:
       - name: Clean up the container
         if: always()
         run: docker rm --force --volumes smoke
+  # The browser lane: builds the web app and the server binary, then runs the
+  # two Playwright specs against the real Investigation API — the fixture
+  # ingestion flow end to end, plus the 50 000-span windowing contract in real
+  # Chromium (the bits jsdom cannot show: actual scroll physics, actual focus).
+  # Ordered after `checks` so a jsdom-free failure is found on top of the
+  # static gates, not instead of them.
+  web-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [checks]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Full history: the moon builds diff against the merge base to
+          # decide what to run (same rule the `checks` job documents).
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: ". -> target"
+      - name: Restore moon's toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.proto/tools
+            ~/.proto/plugins
+            ~/.proto/shims
+            ~/.proto/bin
+            ~/.moon/plugins
+          key: moon-toolchain-${{ runner.os }}-${{ hashFiles('.moon/toolchains.yml', 'pnpm-lock.yaml') }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build the web app and the server
+        run: pnpm exec moon run web:build server:build
+      # playwright is a devDependency of the web app, not of the workspace
+      # root (pnpm's isolated layout does not hoist per-package bins), so
+      # exec must run in the web project's context to find the binary.
+      - name: Install Playwright's Chromium
+        run: pnpm --filter @runtime-trail/web exec playwright install --with-deps chromium
+
+      - name: Run the browser specs
+        run: pnpm exec moon run web:e2e
+      - name: Upload the Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-results
+          path: apps/web/test-results/
+          retention-days: 7
 
   # The single fixed-name check for branch protection. A job named directly in
   # a ruleset pins its own name; gating on this aggregate instead keeps one
@@ -237,7 +295,7 @@ jobs:
   # exists to close.
   ci-gate:
     name: ci-gate
-    needs: [checks, architecture, docs, docker]
+    needs: [checks, architecture, docs, docker, web-e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

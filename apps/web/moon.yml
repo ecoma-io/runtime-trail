@@ -22,3 +22,7 @@ tasks:
     command: pnpm exec vite build
     options:
       cache: false
+  e2e:
+    command: pnpm exec playwright test
+    options:
+      cache: false
