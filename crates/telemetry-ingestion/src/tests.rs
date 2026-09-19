@@ -1683,6 +1683,104 @@ fn saturation_mid_export_keeps_records_already_admitted() {
     assert_eq!(delivered[0].entity, standing_entity(&outcome, fits));
 }
 
+/// #34 — a retryable export rejection is export-atomic: the whole export
+/// admits or none of it does.
+///
+/// Today a mid-export queue saturation leaves the records offered before
+/// the overflow admitted — the retryable signal (HTTP 429 +
+/// `Retry-After`) then invites the emitter to re-deliver the whole export,
+/// and because log records never collapse onto a natural identity, every
+/// earlier log record of the partial admission is admitted a second time.
+/// One logical export therefore produces duplicate deliveries as the side
+/// effect of a retryable rejection. Under the atomic contract the
+/// rejection admits nothing, and a retry with capacity delivers exactly
+/// one copy of every record.
+#[test]
+fn a_retryable_saturation_rejects_the_whole_export_atomically() {
+    // Shrunken budgets shrink the legal-record bound — the same
+    // derivation the span saturation fixture uses: `fits` of these sized
+    // log records fit a queue at the bound, `offered = fits + 1` do not.
+    let limits = shrunken_limits();
+    let bound = Pipeline::legal_record_bound_bytes(&limits);
+
+    let (measure_queue, measure_pipeline) = pipeline_over(bound, limits);
+    measure_pipeline
+        .ingest_logs(now(), &one_log_export(sized_log(0)))
+        .expect("one legal log record fits an empty queue at the bound");
+    let measured = measure_queue
+        .front()
+        .expect("one queued log record")
+        .record
+        .accounted_size();
+    let fits = bound / measured;
+    assert!(
+        fits >= 1,
+        "the fixture needs a multi-record export to overflow: bound \
+         {bound}, measured {measured}"
+    );
+    let offered = fits + 1;
+
+    // A bound-sized queue, and one export carrying exactly one log
+    // record too many.
+    let (queue, pipeline) = pipeline_over(bound, limits);
+    let records: Vec<_> = (0..offered).map(sized_log).collect();
+    let payload = encode(&logs_request(vec![resource_logs(
+        Some(resource(Vec::new())),
+        vec![scope_logs(Some(scope("test")), records)],
+    )]));
+
+    // Attempt 1: the queue saturates mid-export — a retryable signal.
+    let signal = pipeline
+        .ingest_logs(now(), &payload)
+        .expect_err("one log record too many for a queue at the bound");
+    assert!(matches!(
+        &signal,
+        AdmissionSignal::QueueSaturated { ceiling_bytes, .. } if *ceiling_bytes == bound
+    ));
+    assert!(signal.is_retryable(), "overflow rejects the producer");
+    assert_eq!(
+        queue.len(),
+        0,
+        "a retryable export rejection admits nothing: the whole export \
+         is refused, not a prefix of it"
+    );
+
+    // The emitter retries while the queue is still saturated: again a
+    // whole-export refusal, again nothing admitted.
+    let signal = pipeline
+        .ingest_logs(AdmissionTime::from_unix_nano(99), &payload)
+        .expect_err("the queue is still saturated");
+    assert!(matches!(signal, AdmissionSignal::QueueSaturated { .. }));
+    assert_eq!(queue.len(), 0, "a saturated retry still admits nothing");
+    assert_eq!(
+        drain_queue(&queue).len(),
+        0,
+        "nothing stands behind the refusals"
+    );
+
+    // Capacity arrives — the deterministic stand-in for a consumer that
+    // drained (a fresh pipeline whose ceiling holds the whole export).
+    // The identical retry admits every record exactly once: no duplicate
+    // log deliveries from the two earlier rejections.
+    let (big_queue, big_pipeline) = pipeline_over(offered * measured, limits);
+    let outcome = big_pipeline
+        .ingest_logs(AdmissionTime::from_unix_nano(100), &payload)
+        .expect("with room for the whole export, the retry delivers");
+    assert!(
+        outcome
+            .records
+            .iter()
+            .all(|record| matches!(record, RecordOutcome::Admitted { .. })),
+        "the retried export admits every record fresh: {outcome:?}"
+    );
+    let drained = drain_queue(&big_queue);
+    assert_eq!(
+        drained.len(),
+        offered,
+        "exactly one copy of every log record reaches the store"
+    );
+}
+
 /// A queue refusal ends the refused record's own identity — the same
 /// lifecycle ADR 0008 gives a refused keep, applied by the pipeline — so
 /// the retry the signal invites can actually deliver it.
@@ -2059,6 +2157,17 @@ fn sized_span(name: &str, span_id: [u8; 8]) -> trace::Span {
     let mut span = trace_span(name, T1, span_id);
     span.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
     span
+}
+
+/// A log record carrying one attribute at the per-entry cap, body
+/// distinct per index. Log records have no natural identity and never
+/// collapse on re-delivery — which is precisely why partial admission
+/// visibly duplicates them (#34).
+fn sized_log(index: usize) -> logs::LogRecord {
+    let mut record = log_record();
+    record.body = Some(str_value(&format!("log-{index}")));
+    record.attributes = vec![attr("k", str_value(&"a".repeat(95)))];
+    record
 }
 
 /// One single-point export of the named gauge stream, its only point at
