@@ -64,7 +64,7 @@ COPY apps/ apps/
 RUN cargo build --release --locked --package runtime-trail-server
 
 # --- Stage 3: the runtime image ---------------------------------------------
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # The image's own user: no entry in /etc/passwd means no home, no shell, and
 # no name an attacker can look up. UID 10001 avoids the low UID range that
